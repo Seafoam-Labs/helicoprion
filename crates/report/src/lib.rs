@@ -7,7 +7,7 @@ pub mod stats;
 pub mod svg;
 mod theme;
 
-pub use compare::{Comparison, MetricRow, Series};
+pub use compare::{Comparison, Delta, MetricRow, Options, Series};
 
 /// Escape text for XML/HTML content and attribute values.
 pub(crate) fn esc(s: &str) -> String {

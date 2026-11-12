@@ -547,7 +547,7 @@ fn population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Record
         }
     }
     if let Some(max) = rec.max() {
-        m.insert(format!("{name}_max"), Metric::lower(max as f64 / 1000.0, "us"));
+        m.insert(format!("{name}_max"), Metric::lower(max as f64 / 1000.0, "us").extreme());
     }
     quantile_grid().into_iter().filter(|q| n >= min_samples_for(*q)).map(|q| (q, us(q))).collect()
 }
@@ -591,7 +591,9 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
     if let Some(h) = hog {
         let secs = (h.t1 - h.t0).as_secs_f64();
         if secs > 0.0 {
-            m.insert("hog_work_per_s".into(), Metric::higher(h.units as f64 / secs, "units/s"));
+            // Informational: hogs and ping/pong threads compete for the same CPU
+            // time, so more hog work is not "better", just a different split.
+            m.insert("hog_work_per_s".into(), Metric::info(h.units as f64 / secs, "units/s"));
         }
         r.windows.insert("hog".into(), Window { start_s: offset(start, h.t0), end_s: offset(start, h.t1) });
     }

@@ -7,7 +7,7 @@ use helicoprion_core::Better;
 use crate::compare::{Comparison, Delta, MetricRow};
 use crate::esc;
 use crate::stats::MIN_RUNS_FOR_CI;
-use crate::svg::{delta_chart, fmt_value, pct, tail_chart};
+use crate::svg::{delta_chart, fmt_delta, fmt_value, pct, tail_chart};
 use crate::theme::{STYLE, series_var};
 
 const PAGE_CSS: &str = r#"
@@ -37,24 +37,39 @@ footer { color: var(--ink-muted); margin-top: 40px; font-size: 12px; }
 
 /// Text for a change cell: value, and a class that only marks a win/loss
 /// when the bootstrap interval excludes zero.
-fn delta_cell(d: &Delta) -> (String, &'static str) {
-    let cls = match d.ci {
-        Some(_) if d.ci_excludes_zero() && d.median > 0.0 => "good",
-        Some(_) if d.ci_excludes_zero() && d.median < 0.0 => "bad",
+/// Text for a change cell and its class. Coloured only when `highlight`:
+/// notable (interval excludes zero, magnitude ≥ min effect) and stable.
+fn delta_cell(d: &Delta, highlight: bool) -> (String, &'static str) {
+    let cls = match () {
+        _ if highlight && d.median > 0.0 => "good",
+        _ if highlight && d.median < 0.0 => "bad",
         _ => "m",
     };
     let text = match d.ci {
-        Some((lo, hi)) => format!("{} [{} … {}]", pct(d.median), pct(lo), pct(hi)),
-        None => format!("{} (n&lt;{MIN_RUNS_FOR_CI})", pct(d.median)),
+        Some((lo, hi)) => format!("{} [{} … {}]", fmt_delta(d), pct(lo), pct(hi)),
+        None => format!("{} (n&lt;{MIN_RUNS_FOR_CI})", fmt_delta(d)),
     };
     (text, cls)
 }
 
 fn row_suffix(r: &MetricRow) -> &'static str {
-    match r.better {
-        Better::Lower => "↓",
-        Better::Higher => "↑",
+    match (r.better, r.extreme) {
+        (Better::Neither, _) => "info",
+        (Better::Lower, false) => "↓",
+        (Better::Higher, false) => "↑",
+        (Better::Lower, true) => "↓ single sample",
+        (Better::Higher, true) => "↑ single sample",
     }
+}
+
+/// "1.3%" or "∞" (spread around a zero median).
+fn half_spread(rel_iqr_pct: f64) -> String {
+    if rel_iqr_pct.is_finite() { format!("{:.1}%", rel_iqr_pct / 2.0) } else { "∞".into() }
+}
+
+/// A row/cell combination whose change is coloured and starred.
+fn highlighted(c: &Comparison, r: &MetricRow, i: usize, d: &Delta) -> bool {
+    !r.extreme && !r.unstable_pair(c.baseline, i) && d.notable(c.opts.min_effect_pct)
 }
 
 pub fn report(c: &Comparison) -> String {
@@ -108,7 +123,9 @@ pub fn report(c: &Comparison) -> String {
     if let Some(svg) = delta_chart(c) {
         let _ = write!(
             h,
-            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). With few runs this is a rough guide, not a significance test.</p><figure>{svg}</figure>"
+            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, and cells whose run-to-run spread exceeds ±{us}% (marked unstable).</p><figure>{svg}</figure>",
+            me = c.opts.min_effect_pct,
+            us = c.opts.unstable_spread_pct
         );
     }
     let tails: Vec<_> = c.distributions.iter().filter_map(|d| tail_chart(c, d)).collect();
@@ -120,7 +137,12 @@ pub fn report(c: &Comparison) -> String {
     }
 
     // Table view: every number behind the charts.
-    h.push_str("<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Coloured only when the interval excludes zero.</p><table><tr><th>Workload · metric</th>");
+    let _ = write!(
+        h,
+        "<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%). <em>info</em> metrics have no better direction and are never scored.</p><table><tr><th>Workload · metric</th>",
+        me = c.opts.min_effect_pct,
+        us = c.opts.unstable_spread_pct
+    );
     for s in &c.series {
         let _ = write!(h, "<th>{}</th>", esc(&s.label));
     }
@@ -140,14 +162,21 @@ pub fn report(c: &Comparison) -> String {
                 continue;
             };
             let mut td = format!(
-                "{} <span class=m>±{:.1}%</span>",
+                "{} <span class=m>±{}</span>",
                 fmt_value(cell.spread.median),
-                cell.spread.rel_iqr_pct() / 2.0
+                half_spread(cell.spread.rel_iqr_pct())
             );
+            if cell.unstable {
+                let _ = write!(
+                    td,
+                    " <span class=bad title=\"run-to-run spread above ±{}%\">unstable</span>",
+                    c.opts.unstable_spread_pct
+                );
+            }
             if i != c.baseline {
                 match r.improvement(c.baseline, i) {
                     Some(d) => {
-                        let (text, cls) = delta_cell(&d);
+                        let (text, cls) = delta_cell(&d, highlighted(c, r, i, &d));
                         let _ = write!(td, "<br><span class={cls}>{text}</span>");
                     }
                     None if !cell.comparable => td.push_str("<br><span class=m>params differ</span>"),
@@ -239,11 +268,14 @@ pub fn text_table(c: &Comparison) -> String {
                 None => "—".into(),
                 Some(cell) => {
                     let mut s = fmt_value(cell.spread.median);
+                    if cell.unstable {
+                        s.push('~');
+                    }
                     if i != c.baseline {
                         match r.improvement(c.baseline, i) {
                             Some(d) => {
-                                let mark = if d.ci_excludes_zero() { "*" } else { "" };
-                                s.push_str(&format!(" ({}{mark})", pct(d.median)));
+                                let mark = if highlighted(c, r, i, &d) { "*" } else { "" };
+                                s.push_str(&format!(" ({}{mark})", fmt_delta(&d)));
                             }
                             None if !cell.comparable => s.push_str(" (params differ)"),
                             None => {}
@@ -276,6 +308,10 @@ pub fn text_table(c: &Comparison) -> String {
             out.push('\n');
         }
     }
-    out.push_str("* 95% bootstrap interval of the change excludes zero (needs ≥3 valid runs per side)\n");
+    let _ = writeln!(
+        out,
+        "* interval excludes zero and |change| ≥ {}% (needs ≥3 valid runs per side)\n~ unstable: run-to-run spread above ±{}%, never starred",
+        c.opts.min_effect_pct, c.opts.unstable_spread_pct
+    );
     out
 }

@@ -12,13 +12,20 @@ use crate::{Scheduler, SystemInfo};
 ///    cpufreq summaries over all policies.
 /// 3: latency histograms and quantile curves per population (e.g.
 ///    `rtt_blocked` / `rtt_fast`) instead of a single mixed distribution.
-pub const SCHEMA_VERSION: u32 = 3;
+/// 4: `Better::Neither` (informational metrics), `Metric::extreme`,
+///    `RunResult::visit`, `ResultFile::design`. Schema 3 files still read.
+pub const SCHEMA_VERSION: u32 = 4;
+/// Oldest schema `compare` can read.
+pub const MIN_READABLE_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Better {
     Lower,
     Higher,
+    /// Informational: no direction is "better" (e.g. how CPU time was split
+    /// between competing threads). Shown, never scored.
+    Neither,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,14 +33,26 @@ pub struct Metric {
     pub value: f64,
     pub unit: String,
     pub better: Better,
+    /// A single-sample extreme (e.g. max). Too noisy to chart or score;
+    /// kept in tables.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extreme: bool,
 }
 
 impl Metric {
     pub fn lower(value: f64, unit: &str) -> Self {
-        Metric { value, unit: unit.into(), better: Better::Lower }
+        Metric { value, unit: unit.into(), better: Better::Lower, extreme: false }
     }
     pub fn higher(value: f64, unit: &str) -> Self {
-        Metric { value, unit: unit.into(), better: Better::Higher }
+        Metric { value, unit: unit.into(), better: Better::Higher, extreme: false }
+    }
+    pub fn info(value: f64, unit: &str) -> Self {
+        Metric { value, unit: unit.into(), better: Better::Neither, extreme: false }
+    }
+    /// Mark as a single-sample extreme.
+    pub fn extreme(mut self) -> Self {
+        self.extreme = true;
+        self
     }
 }
 
@@ -49,6 +68,10 @@ pub struct RunResult {
     pub sched_before: Option<Scheduler>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sched_after: Option<Scheduler>,
+    /// Index of the scheduler visit this run belongs to in an interleaved
+    /// (`matrix`) session; absent for plain `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visit: Option<u32>,
     /// Length of the measurement window (excludes thread setup/teardown).
     pub duration_s: f64,
     /// Actual boundaries of each measurement window, in seconds relative
@@ -81,6 +104,19 @@ pub struct Window {
     pub end_s: f64,
 }
 
+/// An interleaved session: schedulers were switched between visits so that
+/// slow drift (thermal, background state) affects every scheduler alike.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Design {
+    /// e.g. `interleaved`
+    pub kind: String,
+    pub rounds: u32,
+    /// Every scheduler spec of the session, in first-round order.
+    pub schedulers: Vec<String>,
+    /// The spec this file holds results for.
+    pub spec: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadResult {
     pub name: String,
@@ -103,5 +139,8 @@ pub struct ResultFile {
     /// False when a restart of the same scheduler could go unnoticed
     /// (sched_ext without `enable_seq`).
     pub restart_detectable: bool,
+    /// How the session was run; absent means a plain `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<Design>,
     pub workloads: Vec<WorkloadResult>,
 }

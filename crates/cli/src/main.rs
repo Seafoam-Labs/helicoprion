@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use helicoprion_core::{ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
-use helicoprion_report::{Comparison, html, svg};
+use helicoprion_core::{MIN_READABLE_SCHEMA, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
+use helicoprion_report::{Comparison, Options, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use helicoprion_workloads::{SUITES, suite};
 
@@ -63,6 +63,8 @@ enum Cmd {
         /// Also write each chart as a standalone .svg into this directory.
         #[arg(long)]
         svg_dir: Option<PathBuf>,
+        #[command(flatten)]
+        thresholds: Thresholds,
     },
 }
 
@@ -72,7 +74,9 @@ fn main() -> Result<()> {
         Cmd::Run { suite, runs, warmup, duration, cooldown, label, output } => {
             run(&suite, runs, warmup, duration, cooldown, label, output)
         }
-        Cmd::Compare { files, baseline, output, svg_dir } => compare(&files, baseline, &output, svg_dir),
+        Cmd::Compare { files, baseline, output, svg_dir, thresholds } => {
+            compare(&files, baseline, &output, svg_dir, thresholds.options()?)
+        }
     }
 }
 
@@ -181,6 +185,7 @@ fn run(
         started_at,
         system: sys,
         restart_detectable: sched.restart_detectable(),
+        design: None,
         scheduler: sched,
         workloads: results,
     };
@@ -190,7 +195,13 @@ fn run(
     Ok(())
 }
 
-fn compare(files: &[PathBuf], baseline: Option<String>, output: &PathBuf, svg_dir: Option<PathBuf>) -> Result<()> {
+fn compare(
+    files: &[PathBuf],
+    baseline: Option<String>,
+    output: &PathBuf,
+    svg_dir: Option<PathBuf>,
+    opts: Options,
+) -> Result<()> {
     const MAX: usize = 8;
     if files.len() > MAX {
         bail!("at most {MAX} result files per report (got {}); split into several reports", files.len());
@@ -200,8 +211,12 @@ fn compare(files: &[PathBuf], baseline: Option<String>, output: &PathBuf, svg_di
         .map(|p| {
             let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
             let f: ResultFile = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
-            if f.schema != SCHEMA_VERSION {
-                bail!("{}: schema {} not supported (expected {SCHEMA_VERSION})", p.display(), f.schema);
+            if !(MIN_READABLE_SCHEMA..=SCHEMA_VERSION).contains(&f.schema) {
+                bail!(
+                    "{}: schema {} not supported (this build reads {MIN_READABLE_SCHEMA}..={SCHEMA_VERSION})",
+                    p.display(),
+                    f.schema
+                );
             }
             Ok(f)
         })
@@ -218,7 +233,7 @@ fn compare(files: &[PathBuf], baseline: Option<String>, output: &PathBuf, svg_di
         },
     };
 
-    let c = Comparison::build(parsed, base);
+    let c = Comparison::build_with(parsed, base, opts);
     print!("{}", html::text_table(&c));
     for w in &c.warnings {
         eprintln!("warning: {w}");
@@ -248,6 +263,32 @@ fn compare(files: &[PathBuf], baseline: Option<String>, output: &PathBuf, svg_di
         }
     }
     Ok(())
+}
+
+/// What a report highlights; shared by `compare` and `matrix`.
+#[derive(clap::Args, Clone, Copy)]
+struct Thresholds {
+    /// Smallest change (in %) that is highlighted. Calibrate with an A/A run
+    /// (the same scheduler twice): between-session drift is invisible to the
+    /// per-session bootstrap.
+    #[arg(long, default_value_t = 5.0)]
+    min_effect: f64,
+    /// Run-to-run spread (± half the relative IQR, in %) above which a cell
+    /// is marked unstable and kept off the chart.
+    #[arg(long, default_value_t = 10.0)]
+    unstable_spread: f64,
+}
+
+impl Thresholds {
+    fn options(self) -> Result<Options> {
+        if !(self.min_effect.is_finite() && self.min_effect >= 0.0) {
+            bail!("--min-effect must be >= 0");
+        }
+        if !(self.unstable_spread.is_finite() && self.unstable_spread > 0.0) {
+            bail!("--unstable-spread must be > 0");
+        }
+        Ok(Options { min_effect_pct: self.min_effect, unstable_spread_pct: self.unstable_spread })
+    }
 }
 
 fn sanitize(s: &str) -> String {

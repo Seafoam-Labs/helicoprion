@@ -19,8 +19,11 @@ impl Spread {
     }
 
     /// Interquartile range relative to the median, in percent.
+    /// Relative to a zero median any spread is unbounded: `[0, 0, 0, 100,
+    /// 100]` must not look stable. Zero spread around zero stays 0.
     pub fn rel_iqr_pct(&self) -> f64 {
-        if self.median == 0.0 { 0.0 } else { (self.q3 - self.q1) / self.median.abs() * 100.0 }
+        let iqr = self.q3 - self.q1;
+        if self.median == 0.0 { if iqr == 0.0 { 0.0 } else { f64::INFINITY } } else { iqr / self.median.abs() * 100.0 }
     }
 }
 
@@ -102,6 +105,14 @@ mod tests {
         // Same distribution: interval straddles zero.
         let (lo, hi) = bootstrap_ci(&base, &base, ratio).unwrap();
         assert!(lo <= 0.0 && hi >= 0.0);
+    }
+
+    #[test]
+    fn zero_median_with_spread_is_unbounded() {
+        let s = Spread::of(&[0.0, 0.0, 0.0, 100.0, 100.0]).unwrap();
+        assert_eq!(s.median, 0.0);
+        assert!(s.rel_iqr_pct().is_infinite());
+        assert_eq!(Spread::of(&[0.0, 0.0, 0.0]).unwrap().rel_iqr_pct(), 0.0);
     }
 
     #[test]

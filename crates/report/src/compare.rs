@@ -34,6 +34,28 @@ pub struct Cell {
     /// Workload parameters equal the baseline's and every run reports the
     /// metric in the row's unit and direction.
     pub comparable: bool,
+    /// Run-to-run spread (half the relative IQR) exceeds
+    /// `Options::unstable_spread_pct`: shown, but neither charted nor scored.
+    pub unstable: bool,
+}
+
+/// Thresholds that decide what a report highlights.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    /// A change is only highlighted when its magnitude reaches this many
+    /// percent (and its interval excludes zero). Covers drift between
+    /// sessions that the within-session bootstrap cannot see; an A/A run of
+    /// one scheduler is the way to calibrate it.
+    pub min_effect_pct: f64,
+    /// Cells whose run-to-run spread (± half the relative IQR) exceeds this
+    /// many percent are marked unstable.
+    pub unstable_spread_pct: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { min_effect_pct: 5.0, unstable_spread_pct: 10.0 }
+    }
 }
 
 /// Change vs baseline in percent, positive = better.
@@ -43,6 +65,9 @@ pub struct Delta {
     pub median: f64,
     /// 95% bootstrap interval resampling runs of both sides; `None` with too few runs.
     pub ci: Option<(f64, f64)>,
+    /// "Goodness" ratio of the medians: >1 better, <1 worse
+    /// (baseline/candidate for lower-is-better, candidate/baseline otherwise).
+    pub ratio: f64,
 }
 
 impl Delta {
@@ -50,6 +75,12 @@ impl Delta {
     /// formal significance test.
     pub fn ci_excludes_zero(&self) -> bool {
         self.ci.is_some_and(|(lo, hi)| lo > 0.0 || hi < 0.0)
+    }
+
+    /// Worth highlighting: interval excludes zero *and* the change is at
+    /// least `min_effect_pct` in magnitude.
+    pub fn notable(&self, min_effect_pct: f64) -> bool {
+        self.ci_excludes_zero() && self.median.abs() >= min_effect_pct
     }
 }
 
@@ -59,6 +90,8 @@ pub struct MetricRow {
     pub metric: String,
     pub unit: String,
     pub better: Better,
+    /// Single-sample extreme (e.g. max): table only.
+    pub extreme: bool,
     /// Indexed like `Comparison::series`; `None` if that file lacks the metric.
     pub cells: Vec<Option<Cell>>,
 }
@@ -67,15 +100,25 @@ fn change(better: Better, base: f64, v: f64) -> Option<f64> {
     if base == 0.0 {
         return None;
     }
-    Some(match better {
-        Better::Lower => (base - v) / base * 100.0,
-        Better::Higher => (v - base) / base * 100.0,
-    })
+    match better {
+        Better::Lower => Some((base - v) / base * 100.0),
+        Better::Higher => Some((v - base) / base * 100.0),
+        Better::Neither => None,
+    }
+}
+
+fn goodness_ratio(better: Better, base: f64, v: f64) -> f64 {
+    match better {
+        Better::Lower => base / v,
+        Better::Higher => v / base,
+        Better::Neither => 1.0,
+    }
 }
 
 impl MetricRow {
     /// Change of series `i` vs the baseline. `None` if either side is
-    /// missing or the workload parameters differ.
+    /// missing, the workload parameters differ, or the metric has no
+    /// direction (informational).
     pub fn improvement(&self, baseline: usize, i: usize) -> Option<Delta> {
         let b = self.cells.get(baseline)?.as_ref()?;
         let s = self.cells.get(i)?.as_ref()?;
@@ -84,7 +127,22 @@ impl MetricRow {
         }
         let median = change(self.better, b.spread.median, s.spread.median)?;
         let ci = bootstrap_ci(&b.values, &s.values, |mb, mc| change(self.better, mb, mc));
-        Some(Delta { median, ci })
+        let ratio = goodness_ratio(self.better, b.spread.median, s.spread.median);
+        Some(Delta { median, ci, ratio })
+    }
+
+    /// Either side of the comparison is unstable.
+    pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
+        [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
+    }
+
+    /// Whether series `i` belongs on the change chart: a scored metric that
+    /// is not a single-sample extreme, comparable, and stable on both sides.
+    pub fn chartable(&self, baseline: usize, i: usize) -> bool {
+        !self.extreme
+            && self.better != Better::Neither
+            && !self.unstable_pair(baseline, i)
+            && self.improvement(baseline, i).is_some()
     }
 }
 
@@ -111,6 +169,7 @@ pub struct Diagnostics {
 pub struct Comparison {
     pub series: Vec<Series>,
     pub baseline: usize,
+    pub opts: Options,
     pub rows: Vec<MetricRow>,
     pub distributions: Vec<Distribution>,
     pub diagnostics: Vec<Diagnostics>,
@@ -122,6 +181,10 @@ pub struct Comparison {
 
 impl Comparison {
     pub fn build(files: Vec<ResultFile>, baseline: usize) -> Self {
+        Self::build_with(files, baseline, Options::default())
+    }
+
+    pub fn build_with(files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
         let series: Vec<Series> = disambiguate(files)
             .into_iter()
             .enumerate()
@@ -131,7 +194,7 @@ impl Comparison {
 
         // Workload and metric order: first appearance across inputs.
         let mut order: Vec<(String, String)> = Vec::new();
-        let mut meta: BTreeMap<(String, String), (String, Better)> = BTreeMap::new();
+        let mut meta: BTreeMap<(String, String), (String, Better, bool)> = BTreeMap::new();
         let mut warnings = Vec::new();
         let mut diagnostics = Vec::new();
 
@@ -148,7 +211,7 @@ impl Comparison {
                     for (k, m) in &r.metrics {
                         let key = (w.name.clone(), k.clone());
                         if let std::collections::btree_map::Entry::Vacant(e) = meta.entry(key.clone()) {
-                            e.insert((m.unit.clone(), m.better));
+                            e.insert((m.unit.clone(), m.better, m.extreme));
                             order.push(key);
                         }
                     }
@@ -192,7 +255,7 @@ impl Comparison {
         for w in &base.file.workloads {
             for r in w.runs.iter().filter(|r| r.valid) {
                 for (k, m) in &r.metrics {
-                    meta.insert((w.name.clone(), k.clone()), (m.unit.clone(), m.better));
+                    meta.insert((w.name.clone(), k.clone()), (m.unit.clone(), m.better, m.extreme));
                 }
             }
         }
@@ -207,7 +270,7 @@ impl Comparison {
         let rows = order
             .into_iter()
             .map(|(workload, metric)| {
-                let (unit, better) = meta[&(workload.clone(), metric.clone())].clone();
+                let (unit, better, extreme) = meta[&(workload.clone(), metric.clone())].clone();
                 let base_params = base.file.workloads.iter().find(|w| w.name == workload).map(|w| &w.params);
                 let cells = series
                     .iter()
@@ -228,15 +291,17 @@ impl Comparison {
                             ));
                         }
                         let values: Vec<f64> = ms.iter().map(|m| m.value).filter(|v| v.is_finite()).collect();
+                        let spread = Spread::of(&values)?;
                         Some(Cell {
-                            spread: Spread::of(&values)?,
+                            unstable: spread.n >= 2 && spread.rel_iqr_pct() / 2.0 > opts.unstable_spread_pct,
+                            spread,
                             values,
                             total_runs: w.runs.len(),
                             comparable: units_ok && base_params.is_none_or(|p| *p == w.params),
                         })
                     })
                     .collect();
-                MetricRow { workload, metric, unit, better, cells }
+                MetricRow { workload, metric, unit, better, extreme, cells }
             })
             .collect::<Vec<_>>();
 
@@ -262,7 +327,7 @@ impl Comparison {
             })
             .collect();
 
-        Comparison { series, baseline, rows, distributions, diagnostics, warnings, env_notes }
+        Comparison { series, baseline, opts, rows, distributions, diagnostics, warnings, env_notes }
     }
 }
 
@@ -422,6 +487,7 @@ mod tests {
             },
             scheduler: Scheduler::Fair { class: "EEVDF".into(), scx_capable: false, bore: None },
             restart_detectable: true,
+            design: None,
             workloads: vec![WorkloadResult {
                 name: "w".into(),
                 description: String::new(),
@@ -537,6 +603,63 @@ mod tests {
         let c = Comparison::build(vec![with_curve(file("base", &[1.0], 1), "us"), mixed], 0);
         assert!(c.distributions[0].curves[1].is_none());
         assert!(c.warnings.iter().any(|w| w.contains("different quantile units")));
+    }
+
+    #[test]
+    fn info_metrics_are_never_scored() {
+        let mut base = file("base", &[1.0, 1.0, 1.0], 1);
+        let mut cand = file("cand", &[1.0, 1.0, 1.0], 1);
+        for f in [&mut base, &mut cand] {
+            for (i, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                r.metrics.insert("hog".into(), Metric::info(100.0 + i as f64, "units/s"));
+            }
+        }
+        let c = Comparison::build(vec![base, cand], 0);
+        let hog = c.rows.iter().find(|r| r.metric == "hog").unwrap();
+        assert!(hog.improvement(0, 1).is_none());
+        assert!(!hog.chartable(0, 1));
+    }
+
+    #[test]
+    fn extremes_and_unstable_cells_stay_off_the_chart() {
+        let mut base = file("base", &[10.0, 10.0, 10.0, 10.0], 1);
+        let mut cand = file("cand", &[1.0, 10.0, 30.0, 90.0], 1); // wildly unstable
+        for f in [&mut base, &mut cand] {
+            for r in &mut f.workloads[0].runs {
+                let v = r.metrics["p99"].value;
+                r.metrics.insert("max".into(), Metric::lower(v, "us").extreme());
+            }
+        }
+        let c = Comparison::build(vec![base, cand], 0);
+        let p99 = c.rows.iter().find(|r| r.metric == "p99").unwrap();
+        assert!(p99.cells[1].as_ref().unwrap().unstable);
+        assert!(p99.improvement(0, 1).is_some(), "still in the table");
+        assert!(!p99.chartable(0, 1));
+        let max = c.rows.iter().find(|r| r.metric == "max").unwrap();
+        assert!(max.extreme && !max.chartable(0, 1));
+    }
+
+    #[test]
+    fn zero_median_metrics_can_be_unstable() {
+        let c = Comparison::build(vec![file("base", &[0.0, 0.0, 0.0, 100.0, 100.0], 1)], 0);
+        assert!(c.rows.iter().find(|r| r.metric == "p99").unwrap().cells[0].as_ref().unwrap().unstable);
+    }
+
+    #[test]
+    fn small_effects_are_not_notable() {
+        // ~2% shift with tight runs: interval excludes zero, but below 5%.
+        let c = Comparison::build(
+            vec![
+                file("base", &[100.0, 100.1, 99.9, 100.0, 100.05], 1),
+                file("cand", &[98.0, 98.1, 97.9, 98.0, 98.05], 1),
+            ],
+            0,
+        );
+        let d = c.rows.iter().find(|r| r.metric == "p99").unwrap().improvement(0, 1).unwrap();
+        assert!(d.ci_excludes_zero());
+        assert!(!d.notable(5.0));
+        assert!(d.notable(1.0));
+        assert!((d.ratio - 100.0 / 98.0).abs() < 1e-9);
     }
 
     #[test]

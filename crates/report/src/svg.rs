@@ -53,6 +53,24 @@ fn text_w(s: &str) -> f64 {
     s.chars().count() as f64 * CHAR_W
 }
 
+/// A change as a reader would say it: a multiple when the medians differ by
+/// 2× or more ("34× worse"), a signed percentage otherwise.
+pub fn fmt_delta(d: &crate::compare::Delta) -> String {
+    let r = d.ratio;
+    if r.is_finite() && r >= 2.0 {
+        format!("{}× better", times(r))
+    } else if r > 0.0 && r <= 0.5 {
+        format!("{}× worse", times(1.0 / r))
+    } else {
+        // Includes a zero median on one side, where no multiple is meaningful.
+        pct(d.median)
+    }
+}
+
+fn times(x: f64) -> String {
+    if x >= 10.0 { format!("{x:.0}") } else { format!("{x:.1}") }
+}
+
 /// Signed percent with a real minus sign.
 pub fn pct(v: f64) -> String {
     if v.abs() < 0.05 {
@@ -127,8 +145,7 @@ fn row_label(r: &MetricRow) -> String {
 /// `None` when there is nothing to compare against.
 pub fn delta_chart(c: &Comparison) -> Option<String> {
     let cands: Vec<usize> = (0..c.series.len()).filter(|i| *i != c.baseline).collect();
-    let rows: Vec<&MetricRow> =
-        c.rows.iter().filter(|r| cands.iter().any(|i| r.improvement(c.baseline, *i).is_some())).collect();
+    let rows: Vec<&MetricRow> = c.rows.iter().filter(|r| cands.iter().any(|i| r.chartable(c.baseline, *i))).collect();
     if cands.is_empty() || rows.is_empty() {
         return None;
     }
@@ -143,7 +160,7 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
     let mut extent: f64 = 5.0;
     for r in &rows {
         for i in &cands {
-            if let Some(d) = r.improvement(c.baseline, *i) {
+            if let Some(d) = r.improvement(c.baseline, *i).filter(|_| r.chartable(c.baseline, *i)) {
                 let (lo, hi) = d.ci.unwrap_or((d.median, d.median));
                 extent = extent.max(d.median.abs()).max(lo.abs()).max(hi.abs());
             }
@@ -171,6 +188,18 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
         ink.t1,
         esc(base)
     );
+
+    // Noise band: changes inside ±min_effect are not highlighted anywhere.
+    let band = c.opts.min_effect_pct.min(extent);
+    if band > 0.0 {
+        let _ = write!(
+            s,
+            r#"<rect x="{bx:.1}" y="{top}" width="{bw:.1}" height="{plot_h:.1}" {f} opacity="0.55"><title>noise band ±{band}%: smaller changes are not highlighted</title></rect>"#,
+            bx = x(-band),
+            bw = x(band) - x(-band),
+            f = fill("grid")
+        );
+    }
 
     // Grid + tick labels.
     let n_ticks = (2.0 * extent / step).round() as i64;
@@ -205,6 +234,9 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
         );
         for (k, i) in cands.iter().enumerate() {
             let by = y + k as f64 * (bar_h + bar_gap);
+            if !r.chartable(c.baseline, *i) {
+                continue;
+            }
             let Some(d) = r.improvement(c.baseline, *i) else { continue };
             let m = d.median;
             let (lo, hi) = d.ci.unwrap_or((m, m));
@@ -221,7 +253,7 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
                 ser.label,
                 r.workload,
                 r.metric,
-                pct(m),
+                fmt_delta(&d),
                 fmt_value(cell.spread.median),
                 fmt_value(base_cell.spread.median),
                 r.unit,
@@ -272,7 +304,7 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
                 r#"<text x="{tx:.1}" y="{ty:.1}" {t2} font-size="11" text-anchor="{anchor}" dominant-baseline="middle">{t}</text>"#,
                 ty = by + bar_h / 2.0,
                 t2 = ink.t2,
-                t = pct(m)
+                t = fmt_delta(&d)
             );
         }
         y += group_h + group_pad;
@@ -433,6 +465,16 @@ mod tests {
         assert_eq!(pct(12.34), "+12.3%");
         assert_eq!(pct(-3.0), "\u{2212}3.0%");
         assert_eq!(pct(0.01), "0.0%");
+    }
+
+    #[test]
+    fn deltas_switch_to_multiples() {
+        use crate::compare::Delta;
+        let d = |median, ratio| Delta { median, ci: None, ratio };
+        assert_eq!(fmt_delta(&d(-3298.6, 1.0 / 33.986)), "34× worse");
+        assert_eq!(fmt_delta(&d(89.6, 9.6)), "9.6× better");
+        assert_eq!(fmt_delta(&d(-31.4, 1.0 / 1.314)), "\u{2212}31.4%");
+        assert_eq!(fmt_delta(&d(50.0, 2.0)), "2.0× better");
     }
 
     #[test]
