@@ -262,7 +262,7 @@ pub fn text_table(c: &Comparison) -> String {
     head.extend(c.series.iter().map(|s| s.label.clone()));
     rows.push(head);
     for r in &c.rows {
-        let mut row = vec![format!("{}·{} [{}{}]", r.workload, r.metric, r.unit, row_suffix(r))];
+        let mut row = vec![format!("{}·{} [{} {}]", r.workload, r.metric, r.unit, row_suffix(r))];
         for (i, cell) in r.cells.iter().enumerate() {
             row.push(match cell {
                 None => "—".into(),

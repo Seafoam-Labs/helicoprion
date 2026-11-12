@@ -1,6 +1,8 @@
+mod matrix;
+
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -49,6 +51,63 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Interleave several schedulers, switched with scxcli (scx.service):
+    /// every round visits each scheduler once, in alternating order, so
+    /// slow drift affects all of them alike. Writes one result file per
+    /// scheduler and a report into the output directory, then restores the
+    /// previously selected scheduler. Run as root to avoid a polkit prompt
+    /// at every switch.
+    Matrix {
+        /// Scheduler to include, as scxcli takes it: `default` (kernel),
+        /// a scheduler (`scx_lavd`), a catalog profile id, or a scheduler
+        /// with options in one argument (`"scx_bpfland -s 5000"`). Repeat;
+        /// the first one is the report's baseline.
+        #[arg(long = "sched", required = true)]
+        scheds: Vec<String>,
+        /// Rounds; each visits every scheduler once.
+        #[arg(long, default_value_t = 5)]
+        rounds: u32,
+        #[arg(long, default_value = "quick", value_parser = clap::builder::PossibleValuesParser::new(SUITES))]
+        suite: String,
+        /// Measured runs per workload per visit.
+        #[arg(long, default_value_t = 1)]
+        runs_per_visit: usize,
+        /// Unrecorded warm-up runs per workload per visit.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Seconds per run.
+        #[arg(long, default_value_t = 5.0)]
+        duration: f64,
+        /// Seconds of idle between runs.
+        #[arg(long, default_value_t = 1.0)]
+        cooldown: f64,
+        /// Seconds a scheduler must stay unchanged after a switch before
+        /// measuring.
+        #[arg(long, default_value_t = 3.0)]
+        settle: f64,
+        /// Seconds to wait for a switch to take effect.
+        #[arg(long, default_value_t = 30.0)]
+        switch_timeout: f64,
+        /// Seconds any single scxcli/systemctl call may take before it is
+        /// killed.
+        #[arg(long, default_value_t = 20.0)]
+        command_timeout: f64,
+        /// Accept a kernel ops name that differs from the scheduler's name
+        /// (normally `scx_lavd` must attach as `lavd`).
+        #[arg(long)]
+        allow_ops_mismatch: bool,
+        /// scxcli binary.
+        #[arg(long, default_value = "scxcli")]
+        scxcli: PathBuf,
+        /// systemctl binary (used only to restore scx.service's enablement).
+        #[arg(long, default_value = "systemctl")]
+        systemctl: PathBuf,
+        /// Output directory (default: helicoprion-matrix-<unix time>).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[command(flatten)]
+        thresholds: Thresholds,
+    },
     /// Compare result files and write an HTML report.
     Compare {
         /// Result files; colours follow this order.
@@ -74,6 +133,39 @@ fn main() -> Result<()> {
         Cmd::Run { suite, runs, warmup, duration, cooldown, label, output } => {
             run(&suite, runs, warmup, duration, cooldown, label, output)
         }
+        Cmd::Matrix {
+            scheds,
+            rounds,
+            suite,
+            runs_per_visit,
+            warmup,
+            duration,
+            cooldown,
+            settle,
+            switch_timeout,
+            command_timeout,
+            allow_ops_mismatch,
+            scxcli,
+            systemctl,
+            output,
+            thresholds,
+        } => matrix_cmd(MatrixArgs {
+            scheds,
+            rounds,
+            suite,
+            runs_per_visit,
+            warmup,
+            duration,
+            cooldown,
+            settle,
+            switch_timeout,
+            command_timeout,
+            allow_ops_mismatch,
+            scxcli,
+            systemctl,
+            output,
+            opts: thresholds.options()?,
+        }),
         Cmd::Compare { files, baseline, output, svg_dir, thresholds } => {
             compare(&files, baseline, &output, svg_dir, thresholds.options()?)
         }
@@ -154,6 +246,8 @@ fn run(
 
     let cfg = RunConfig {
         expected: sched.clone(),
+        detect: &Scheduler::detect,
+        cancel: &|| false,
         runs,
         warmup,
         duration: Duration::from_secs_f64(duration),
@@ -161,20 +255,7 @@ fn run(
     };
     let mut results = Vec::new();
     for w in &workloads {
-        let res = run_workload(w.as_ref(), &cfg, |ev| match ev {
-            Event::Start { workload, run, total, warmup } => {
-                if warmup {
-                    eprint!("  {workload:<22} warm-up {}… ", run + 1);
-                } else {
-                    eprint!("  {workload:<22} run {}/{total}… ", run + 1);
-                }
-                let _ = std::io::stderr().flush();
-            }
-            Event::Done { warmup: true, .. } => eprintln!("discarded"),
-            Event::Done { valid, summary, .. } => {
-                eprintln!("{}{summary}", if valid { "" } else { "✗ " });
-            }
-        });
+        let res = run_workload(w.as_ref(), &cfg, progress);
         results.push(res);
     }
 
@@ -198,7 +279,7 @@ fn run(
 fn compare(
     files: &[PathBuf],
     baseline: Option<String>,
-    output: &PathBuf,
+    output: &Path,
     svg_dir: Option<PathBuf>,
     opts: Options,
 ) -> Result<()> {
@@ -234,16 +315,7 @@ fn compare(
     };
 
     let c = Comparison::build_with(parsed, base, opts);
-    print!("{}", html::text_table(&c));
-    for w in &c.warnings {
-        eprintln!("warning: {w}");
-    }
-    for n in &c.env_notes {
-        eprintln!("note:    {n}");
-    }
-
-    fs::write(output, html::report(&c)).with_context(|| format!("writing {}", output.display()))?;
-    eprintln!("\nwrote {}", output.display());
+    write_report_with(&c, output)?;
 
     if let Some(dir) = svg_dir {
         fs::create_dir_all(&dir)?;
@@ -262,6 +334,156 @@ fn compare(
             eprintln!("wrote {}", p.display());
         }
     }
+    Ok(())
+}
+
+fn progress(ev: Event<'_>) {
+    match ev {
+        Event::Start { workload, run, total, warmup } => {
+            if warmup {
+                eprint!("  {workload:<22} warm-up {}… ", run + 1);
+            } else {
+                eprint!("  {workload:<22} run {}/{total}… ", run + 1);
+            }
+            let _ = std::io::stderr().flush();
+        }
+        Event::Done { warmup: true, .. } => eprintln!("discarded"),
+        Event::Done { valid, summary, .. } => {
+            eprintln!("{}{summary}", if valid { "" } else { "✗ " });
+        }
+    }
+}
+
+struct MatrixArgs {
+    scheds: Vec<String>,
+    rounds: u32,
+    suite: String,
+    runs_per_visit: usize,
+    warmup: usize,
+    duration: f64,
+    cooldown: f64,
+    settle: f64,
+    switch_timeout: f64,
+    command_timeout: f64,
+    allow_ops_mismatch: bool,
+    scxcli: PathBuf,
+    systemctl: PathBuf,
+    output: Option<PathBuf>,
+    opts: Options,
+}
+
+fn matrix_cmd(a: MatrixArgs) -> Result<()> {
+    use matrix::{Control, Prior, ScxCli, Session, SwitchCfg, interrupted, prepare_out_dir, resolve, run_matrix};
+
+    if a.rounds == 0 || a.runs_per_visit == 0 {
+        bail!("--rounds and --runs-per-visit must be at least 1");
+    }
+    for (name, v) in [
+        ("--duration", a.duration),
+        ("--settle", a.settle),
+        ("--switch-timeout", a.switch_timeout),
+        ("--command-timeout", a.command_timeout),
+    ] {
+        if !(v.is_finite() && v > 0.0) {
+            bail!("{name} must be > 0");
+        }
+    }
+    if !(a.cooldown.is_finite() && a.cooldown >= 0.0) {
+        bail!("--cooldown must be >= 0");
+    }
+    if a.scheds.len() > 8 {
+        bail!("at most 8 schedulers per matrix (one report colour each)");
+    }
+    let cmd_timeout = Duration::from_secs_f64(a.command_timeout);
+    let ctl = ScxCli { bin: a.scxcli.clone(), systemctl: a.systemctl.clone() };
+    let initial = ctl.get(cmd_timeout).context("is scxcli installed? (--scxcli PATH)")?;
+    let prior = Prior::plan(&initial)?;
+    let targets = resolve(&a.scheds, &ctl, cmd_timeout)?;
+    let sys = SystemInfo::collect();
+    let workloads = suite(&a.suite, sys.usable_cpus).context("unknown suite")?;
+    let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let out_dir = a.output.clone().unwrap_or_else(|| PathBuf::from(format!("helicoprion-matrix-{started_at}")));
+    prepare_out_dir(&out_dir)?;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("warning:   not root: scxcli will ask polkit at every switch");
+    }
+    let per_visit =
+        a.settle + workloads.len() as f64 * (a.warmup + a.runs_per_visit) as f64 * (a.duration + a.cooldown);
+    eprintln!("kernel:    {}  ({} CPUs)", sys.kernel, sys.usable_cpus);
+    eprintln!("now:       {}  (restored at the end)", prior.describe());
+    eprintln!(
+        "           by hand, if needed: {}",
+        prior.commands().iter().map(matrix::Cmd::shell).collect::<Vec<_>>().join(" && ")
+    );
+    eprintln!(
+        "matrix:    {} schedulers × {} rounds, {} workloads, ≈{:.0} min → {}",
+        targets.len(),
+        a.rounds,
+        workloads.len(),
+        per_visit * (targets.len() as u32 * a.rounds) as f64 / 60.0,
+        out_dir.display()
+    );
+    matrix::install_sigint();
+
+    let session = Session {
+        targets,
+        rounds: a.rounds,
+        runs_per_visit: a.runs_per_visit,
+        warmup: a.warmup,
+        duration: Duration::from_secs_f64(a.duration),
+        cooldown: Duration::from_secs_f64(a.cooldown),
+        switch: SwitchCfg {
+            timeout: Duration::from_secs_f64(a.switch_timeout),
+            settle: Duration::from_secs_f64(a.settle),
+            poll: Duration::from_millis(200),
+            cmd_timeout,
+            allow_ops_mismatch: a.allow_ops_mismatch,
+        },
+        workloads: &workloads,
+        out_dir: out_dir.clone(),
+        system: sys,
+        started_at,
+        session_id: matrix::new_session_id(),
+    };
+    let out = run_matrix(&session, &ctl, &Scheduler::detect, &interrupted, prior, progress);
+
+    if out.interrupted {
+        eprintln!("\ninterrupted after {} visits; results so far are in {}", out.visits, out_dir.display());
+    }
+    // Report the restore problem first: a later failure (writing the
+    // report on a full disk, say) must not hide it.
+    if let Some(e) = &out.restore_error {
+        eprintln!("error:     the previous scx.service state was NOT restored: {e:#}");
+    }
+    let report =
+        if out.files.is_empty() { Ok(()) } else { write_report(out.files, &out_dir.join("report.html"), a.opts) };
+    if let Err(e) = &report {
+        eprintln!("error:     writing the report failed: {e:#}");
+    }
+    // Most important first: the error that ended the session, then the
+    // restore, then the report.
+    match (out.error, out.restore_error, report) {
+        (Some(e), _, _) | (None, Some(e), _) | (None, None, Err(e)) => Err(e),
+        (None, None, Ok(())) => Ok(()),
+    }
+}
+
+fn write_report(files: Vec<ResultFile>, path: &Path, opts: Options) -> Result<()> {
+    write_report_with(&Comparison::build_with(files, 0, opts), path)
+}
+
+fn write_report_with(c: &Comparison, path: &Path) -> Result<()> {
+    print!("{}", html::text_table(c));
+    for w in &c.warnings {
+        eprintln!("warning: {w}");
+    }
+    for n in &c.env_notes {
+        eprintln!("note:    {n}");
+    }
+    fs::write(path, html::report(c)).with_context(|| format!("writing {}", path.display()))?;
+    eprintln!("wrote {}", path.display());
     Ok(())
 }
 

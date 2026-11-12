@@ -11,9 +11,14 @@ use helicoprion_core::{RunResult, Scheduler, WorkloadResult};
 
 use crate::Workload;
 
-pub struct RunConfig {
+pub struct RunConfig<'a> {
     /// The scheduler this session claims to measure.
     pub expected: Scheduler,
+    /// Reads the current scheduler (`Scheduler::detect` outside tests).
+    pub detect: &'a dyn Fn() -> Scheduler,
+    /// Checked before every run; once true, no further runs start and the
+    /// runs completed so far are returned.
+    pub cancel: &'a dyn Fn() -> bool,
     pub runs: usize,
     pub warmup: usize,
     pub duration: Duration,
@@ -42,18 +47,21 @@ pub fn judge(r: &mut RunResult, expected: &Scheduler, before: Scheduler, after: 
     r.sched_after = Some(after);
 }
 
-pub fn run_workload(w: &dyn Workload, cfg: &RunConfig, mut on: impl FnMut(Event<'_>)) -> WorkloadResult {
+pub fn run_workload(w: &dyn Workload, cfg: &RunConfig<'_>, mut on: impl FnMut(Event<'_>)) -> WorkloadResult {
     let name = w.name();
     let mut runs = Vec::with_capacity(cfg.runs);
 
     for i in 0..cfg.warmup + cfg.runs {
+        if (cfg.cancel)() {
+            break;
+        }
         let warmup = i < cfg.warmup;
         let idx = if warmup { i } else { i - cfg.warmup };
         on(Event::Start { workload: &name, run: idx, total: cfg.runs, warmup });
 
-        let before = Scheduler::detect();
+        let before = (cfg.detect)();
         let mut r = w.run(cfg.duration);
-        let after = Scheduler::detect();
+        let after = (cfg.detect)();
         judge(&mut r, &cfg.expected, before, after);
 
         let summary = match &r.invalid_reason {
@@ -118,6 +126,43 @@ mod tests {
         assert!(r.valid);
         assert_eq!(r.sched_before, Some(lavd(3)));
         assert_eq!(r.sched_after, Some(lavd(3)));
+    }
+
+    struct Instant1;
+    impl Workload for Instant1 {
+        fn name(&self) -> String {
+            "instant".into()
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn params(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn run(&self, _: Duration) -> RunResult {
+            RunResult::default()
+        }
+    }
+
+    #[test]
+    fn cancel_stops_before_the_next_run() {
+        let n = std::cell::Cell::new(0);
+        let cancel = || {
+            n.set(n.get() + 1);
+            n.get() > 3 // allow 3 runs
+        };
+        let cfg = RunConfig {
+            expected: eevdf(),
+            detect: &eevdf,
+            cancel: &cancel,
+            runs: 10,
+            warmup: 0,
+            duration: Duration::ZERO,
+            cooldown: Duration::ZERO,
+        };
+        let res = run_workload(&Instant1, &cfg, |_| {});
+        assert_eq!(res.runs.len(), 3);
+        assert!(res.runs.iter().all(|r| r.valid));
     }
 
     #[test]

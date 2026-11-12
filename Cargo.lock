@@ -119,6 +119,7 @@ dependencies = [
  "helicoprion-core",
  "helicoprion-report",
  "helicoprion-workloads",
+ "libc",
  "serde_json",
 ]
 

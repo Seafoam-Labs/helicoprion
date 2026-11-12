@@ -13,7 +13,7 @@ use crate::{Scheduler, SystemInfo};
 /// 3: latency histograms and quantile curves per population (e.g.
 ///    `rtt_blocked` / `rtt_fast`) instead of a single mixed distribution.
 /// 4: `Better::Neither` (informational metrics), `Metric::extreme`,
-///    `RunResult::visit`, `ResultFile::design`. Schema 3 files still read.
+///    `RunResult::visit`/`round`, `ResultFile::design`. Schema 3 files still read.
 pub const SCHEMA_VERSION: u32 = 4;
 /// Oldest schema `compare` can read.
 pub const MIN_READABLE_SCHEMA: u32 = 3;
@@ -72,6 +72,10 @@ pub struct RunResult {
     /// (`matrix`) session; absent for plain `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visit: Option<u32>,
+    /// Round of an interleaved session (every scheduler is visited once per
+    /// round), for paired analysis; absent for plain `run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
     /// Length of the measurement window (excludes thread setup/teardown).
     pub duration_s: f64,
     /// Actual boundaries of each measurement window, in seconds relative
@@ -115,6 +119,11 @@ pub struct Design {
     pub schedulers: Vec<String>,
     /// The spec this file holds results for.
     pub spec: String,
+    /// Random identifier shared by every file of one session; pairing by
+    /// round requires equal ids. Files without it (written before the field
+    /// existed) are identified by start time and scheduler list instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -26,6 +26,71 @@ $B compare eevdf.json lavd.json -o report.html --svg-dir charts/
 report (light/dark aware, no JavaScript). With `--svg-dir` each chart is
 also saved as a standalone SVG.
 
+For comparing schedulers, prefer `matrix` (below): separate `run` sessions
+differ by a few percent on their own, which the per-session statistics
+cannot see.
+
+## Interleaved sessions with scxcli (`matrix`)
+
+```sh
+sudo helicoprion matrix --sched default --sched scx_lavd --sched scx_cosmos \
+    --sched "scx_bpfland -s 5000" --rounds 5 -o lavd-vs-cosmos/
+```
+
+Every round visits each scheduler once, in alternating order (A B C, C B A,
+A B C, …), and runs every workload during each visit, so slow drift
+(thermal state, background activity) hits every scheduler alike. Switching
+goes through [scxcli](https://github.com/sched-ext/scx/tree/main/tools/scxcli)
+and scx.service:
+
+* `--sched` takes what scxcli takes: `default` (the kernel's scheduler,
+  `scxcli start default`), a scheduler or catalog profile id
+  (`scxcli start ID`), or a scheduler with options in one argument
+  (`scxcli run SCHED ARGS…`). The first one is the report's baseline.
+  Profile ids are looked up in `scxcli list --json` up front, so the
+  scheduler and options they stand for can be checked after the switch.
+* `scxcli start`/`run` return once systemd restarted the unit, not once the
+  scheduler is attached. A switch has settled only when `scxcli get --json`
+  reports the expected process (and options, for profiles and `run`) with no
+  failure, the kernel shows a BPF scheduler whose ops name matches it
+  (`scx_lavd` attaches as `lavd`; `--allow-ops-mismatch` for a scheduler
+  that names itself differently), and that state, `enable_seq` included,
+  holds for `--settle` seconds (default 3). A failure or a switch that does
+  not settle within `--switch-timeout` ends the session.
+* Every scxcli/systemctl call runs in its own process group (a terminal
+  Ctrl-C reaches only helicoprion) under one deadline,
+  `--command-timeout` seconds (default 20), for the process to exit *and*
+  its output pipes to close; past it the process group is killed. That
+  also covers a call that exits but leaves a child holding its output open
+  (a child that left the group with setsid is abandoned, not waited for).
+  The switch deadline covers these calls too, so a hung scxcli cannot stall
+  the session.
+* The state from before the session is restored at the end, after an error
+  and after Ctrl-C: the selection (scheduler and options), whether
+  scx.service was active, and whether it was enabled (scxcli enables the unit
+  when it starts a scheduler, so helicoprion runs `systemctl enable|disable
+  scx.service` to put that back). The result is verified twice: the
+  configuration against a fresh `scxcli get --json`, and the running state,
+  i.e. the previous scheduler (with its options) running and attached with a
+  matching ops name, or nothing attached, with no failure. The commands that
+  would restore it by hand are printed at the start. A failed restore is
+  reported before anything else, so a later error (writing the report)
+  cannot hide it.
+* `matrix` refuses to start in states it could not restore exactly: an
+  `SCX_SCHEDULER_OVERRIDE`/`SCX_FLAGS_OVERRIDE` (scxcli clears it), a
+  `systemctl enable --runtime` enablement, an active unit with no
+  configured scheduler, an environment scxcli could not fully resolve
+  (`config_error`), or a unit and kernel that disagree (`scheduler: null`).
+* Ctrl-C: the first press stops before the next run (or switch) and
+  restores; a second press terminates at once, without restoring.
+* Run as root: as a user, scxcli asks polkit at every switch.
+* Output goes to a new directory (`--output`, default
+  `helicoprion-matrix-<time>`; an existing non-empty one is refused). Each
+  scheduler gets `NN-<spec>.json`, rewritten atomically after every visit,
+  so a crash loses at most the visit in progress; `report.html` is written
+  at the end. `design` records the session and each run its `visit` and
+  `round`. `compare` works on these files as on any others.
+
 ## Scheduler detection
 
 | Condition | Reported as |
@@ -102,12 +167,24 @@ On an idle 2-CPU VM ~97% of round trips were blocked; under load only
 * Change vs baseline is normalised so **positive = better** for every metric.
   Its interval is a 95% percentile bootstrap that resamples the runs of
   *both* the baseline and the candidate (needs ≥3 valid runs per side).
-  A change is highlighted only when that interval excludes zero; with a
-  handful of runs this is a rough guide, not a significance test. There is
-  no multiple-comparison correction: with ~20 metrics, about one may be
-  highlighted by chance even between two runs of the same scheduler.
-* The change axis is capped at ±100%; larger changes are drawn clipped and
-  labelled with the real value.
+  A change is highlighted only when that interval excludes zero **and** its
+  magnitude reaches `--min-effect` (default 5%); with a handful of runs this
+  is a rough guide, not a significance test. The bootstrap only sees
+  run-to-run spread *within* a session: an A/A test (EEVDF twice on the
+  same machine) showed whole sessions shifting by ~3%, which starred seven
+  metrics without the threshold. Calibrate `--min-effect` with an A/A run on
+  your hardware, or use `matrix`. There is no multiple-comparison
+  correction.
+* Cells whose run-to-run spread (± half the relative IQR) exceeds
+  `--unstable-spread` (default 10%) are marked unstable: shown in the table,
+  never highlighted, kept off the change chart. Typical case: p99.9 under
+  load sitting on the edge of a ~1.6 ms plateau that holds ~0.1% of the
+  samples, flipping between 40 µs and 1.4 ms from run to run.
+* Single-sample extremes (`*_max`) and informational metrics
+  (`hog_work_per_s`, which only says how CPU time was split between the
+  hogs and the ping/pong threads) are listed but never scored or charted.
+* Changes of 2× or more are written as multiples ("34× worse"). The change
+  axis is capped at ±100%; larger changes are drawn clipped.
 * `compare` refuses to compute a change, and leaves the series out of the
   latency charts, when the workload parameters (`pairs`, `hogs`, …) differ
   from the baseline's. It also refuses when a metric's unit or direction
@@ -124,12 +201,15 @@ build, and several runs per scheduler.
 
 ## Result format
 
-One JSON file per session (`schema: 3`): tool version, label, system
-metadata, the expected scheduler and `restart_detectable`, and per-workload
+One JSON file per session (`schema: 4`; `compare` also reads 3): tool version, label, system
+metadata, the expected scheduler and `restart_detectable`, `design` (for `matrix`
+    sessions), and per-workload
 `params` and runs. Each run stores:
 
 * `sched_before` / `sched_after` — the readings the validity check used;
 * `metrics` — value, unit, and direction (compared across files);
+* `visit`, `round` — in a `matrix` session, which scheduler visit and round
+  the run belongs to;
 * `counters` — diagnostics (not compared);
 * `windows` — actual measurement boundaries relative to the common start;
 * `latency_histograms` — per population, the full distribution in a log-linear encoding
