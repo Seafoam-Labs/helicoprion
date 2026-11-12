@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use helicoprion_core::{MIN_READABLE_SCHEMA, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
 use helicoprion_report::{Comparison, Options, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
-use helicoprion_workloads::{SUITES, suite};
+use helicoprion_workloads::{SUITES, SuiteOpts, suite};
 
 #[derive(Parser)]
 #[command(name = "helicoprion", version, about)]
@@ -50,6 +50,10 @@ enum Cmd {
         /// Output file (default: helicoprion-<label>-<unix time>.json).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Skip the same-/cross-CPU diagnostics (one sched_getcpu per round
+        /// trip); results then compare with ones recorded without them.
+        #[arg(long)]
+        no_cpu_diag: bool,
     },
     /// Interleave several schedulers, switched with scxcli (scx.service):
     /// every round visits each scheduler once, in alternating order, so
@@ -102,6 +106,9 @@ enum Cmd {
         /// systemctl binary (used only to restore scx.service's enablement).
         #[arg(long, default_value = "systemctl")]
         systemctl: PathBuf,
+        /// Skip the same-/cross-CPU diagnostics.
+        #[arg(long)]
+        no_cpu_diag: bool,
         /// Output directory (default: helicoprion-matrix-<unix time>).
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -130,9 +137,16 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Info { json } => info(json),
-        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output } => {
-            run(&suite, runs, warmup, duration, cooldown, label, output)
-        }
+        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag } => run(RunArgs {
+            suite,
+            runs,
+            warmup,
+            duration,
+            cooldown,
+            label,
+            output,
+            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag },
+        }),
         Cmd::Matrix {
             scheds,
             rounds,
@@ -147,6 +161,7 @@ fn main() -> Result<()> {
             allow_ops_mismatch,
             scxcli,
             systemctl,
+            no_cpu_diag,
             output,
             thresholds,
         } => matrix_cmd(MatrixArgs {
@@ -163,6 +178,7 @@ fn main() -> Result<()> {
             allow_ops_mismatch,
             scxcli,
             systemctl,
+            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag },
             output,
             opts: thresholds.options()?,
         }),
@@ -200,15 +216,20 @@ fn info(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run(
-    suite_name: &str,
+struct RunArgs {
+    suite: String,
     runs: usize,
     warmup: usize,
     duration: f64,
     cooldown: f64,
     label: Option<String>,
     output: Option<PathBuf>,
-) -> Result<()> {
+    suite_opts: SuiteOpts,
+}
+
+fn run(a: RunArgs) -> Result<()> {
+    let RunArgs { suite: suite_name, runs, warmup, duration, cooldown, label, output, suite_opts } = a;
+    let suite_name = suite_name.as_str();
     if runs == 0 {
         bail!("--runs must be at least 1");
     }
@@ -217,7 +238,7 @@ fn run(
     }
     let sched = Scheduler::detect();
     let sys = SystemInfo::collect();
-    let workloads = suite(suite_name, sys.usable_cpus).context("unknown suite")?;
+    let workloads = suite(suite_name, sys.usable_cpus, suite_opts).context("unknown suite")?;
     let label = label.unwrap_or_else(|| sched.label());
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let output = output.unwrap_or_else(|| PathBuf::from(format!("helicoprion-{}-{started_at}.json", sanitize(&label))));
@@ -368,6 +389,7 @@ struct MatrixArgs {
     allow_ops_mismatch: bool,
     scxcli: PathBuf,
     systemctl: PathBuf,
+    suite_opts: SuiteOpts,
     output: Option<PathBuf>,
     opts: Options,
 }
@@ -400,7 +422,7 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     let prior = Prior::plan(&initial)?;
     let targets = resolve(&a.scheds, &ctl, cmd_timeout)?;
     let sys = SystemInfo::collect();
-    let workloads = suite(&a.suite, sys.usable_cpus).context("unknown suite")?;
+    let workloads = suite(&a.suite, sys.usable_cpus, a.suite_opts).context("unknown suite")?;
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let out_dir = a.output.clone().unwrap_or_else(|| PathBuf::from(format!("helicoprion-matrix-{started_at}")));
     prepare_out_dir(&out_dir)?;

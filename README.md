@@ -142,6 +142,36 @@ p99.9 ≥ 10000), so a small population never produces a fake tail.
 On an idle 2-CPU VM ~97% of round trips were blocked; under load only
 ~45–65%, with ~20% two-sided.
 
+### Same CPU or cross CPU
+
+The ponger reads its CPU (`sched_getcpu`) just before handing the token
+back; the pinger reads its own once it has the token again. *Same CPU*
+means those two readings name the same logical CPU, *cross CPU* that they
+differ. They are two observations at two instants, not a trace of the
+wakeup: either thread may move in between, so neither label proves a local
+wakeup or an IPI. What they do well is tell regimes apart, such as a pair
+sharing one CPU versus spread out. Blocked round trips get
+`rtt_blocked_same_cpu_*` and `rtt_blocked_cross_cpu_*` metrics (p50/p99;
+full histograms in the result, no extra charts); diagnostics show the
+same-CPU share of blocked and fast round trips and `ping_cpu_changes`, how
+often the pinger was seen on a different CPU than after the previous round
+trip (observed changes between samples, not a migration count). SMT
+siblings and separate cores are not told apart yet.
+
+On a 2-vCPU VM, idle round trips with equal readings had p50 ≈ 1.9 µs vs
+≈ 20 µs with different ones, and under load whole runs flipped between
+~100% different (p50 ≈ 28 µs) and 80–90% equal (p50 ≈ 2 µs).
+
+Cost: one `sched_getcpu` (≈3 ns, vDSO) inside each timed round trip, on the
+ponger's side; `reply_cpu` shares the token's cache line, so no extra cache
+line moves between CPUs. An interleaved A/A on that VM (8 sessions with,
+8 without) showed no difference beyond its noise (±4% idle; loaded runs are
+bimodal there), which cannot rule out effects of a few percent on fast
+hand-offs of ~0.5 µs. `--no-cpu-diag` (for `run` and `matrix`) turns it
+off; the workload parameters then match results recorded before the option
+existed, and differ from runs with diagnostics, so the two are never
+compared with each other.
+
 ### Timing and failure handling
 
 * Every worker acknowledges readiness; only then is one start instant fixed
@@ -202,9 +232,8 @@ build, and several runs per scheduler.
 ## Result format
 
 One JSON file per session (`schema: 4`; `compare` also reads 3): tool version, label, system
-metadata, the expected scheduler and `restart_detectable`, `design` (for `matrix`
-    sessions), and per-workload
-`params` and runs. Each run stores:
+metadata, the expected scheduler and `restart_detectable`, `design` (for
+`matrix` sessions), and per-workload `params` and runs. Each run stores:
 
 * `sched_before` / `sched_after` — the readings the validity check used;
 * `metrics` — value, unit, and direction (compared across files);

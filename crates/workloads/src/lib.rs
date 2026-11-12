@@ -29,12 +29,25 @@ pub trait Workload: Send + Sync {
 }
 
 /// Named sets of workloads.
-pub fn suite(name: &str, cpus: usize) -> Option<Vec<Box<dyn Workload>>> {
+/// Options that change how a suite measures.
+#[derive(Debug, Clone, Copy)]
+pub struct SuiteOpts {
+    /// Same-/cross-CPU diagnostics in wake-pingpong.
+    pub cpu_diag: bool,
+}
+
+impl Default for SuiteOpts {
+    fn default() -> Self {
+        SuiteOpts { cpu_diag: true }
+    }
+}
+
+pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Workload>>> {
     let pairs = (cpus / 2).max(1);
     match name {
         "quick" => Some(vec![
-            Box::new(wake_pingpong::WakePingPong { pairs, hogs: 0 }),
-            Box::new(wake_pingpong::WakePingPong { pairs, hogs: cpus }),
+            Box::new(wake_pingpong::WakePingPong { pairs, hogs: 0, cpu_diag: opts.cpu_diag }),
+            Box::new(wake_pingpong::WakePingPong { pairs, hogs: cpus, cpu_diag: opts.cpu_diag }),
         ]),
         _ => None,
     }

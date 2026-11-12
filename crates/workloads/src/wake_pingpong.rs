@@ -17,6 +17,26 @@
 //! sleep cannot be classified either way; it is counted as
 //! `roundtrips_ambiguous` and kept out of both histograms.
 //!
+//! # Same CPU or cross CPU
+//!
+//! With `cpu_diag`, the ponger records its CPU (`sched_getcpu`) just
+//! before handing the token back, and the pinger reads its own CPU once it
+//! has the token again. *Same CPU* means those two readings name the same
+//! logical CPU; *cross CPU* means they differ. These are two observations
+//! at two instants, not a trace of the wakeup: either thread may migrate in
+//! between, so neither label proves a local wakeup or an IPI. They are
+//! useful to tell regimes apart (e.g. a pair sharing one CPU vs. spread
+//! out), not to attribute latency to a mechanism. Blocked round trips are
+//! split into `rtt_blocked_same_cpu` and `rtt_blocked_cross_cpu`
+//! (histograms in the result, p50/p99 as metrics, no separate charts);
+//! counters give the shares for both populations and how often the pinger
+//! was seen on a different CPU than after the previous round trip
+//! (`ping_cpu_changes`, observed changes, not a migration count).
+//!
+//! Cost: one `sched_getcpu` (a few ns, vDSO) inside each timed round trip,
+//! on the ponger's side; `reply_cpu` shares the token's cache line so no
+//! extra line transfer is added. `cpu_diag: false` removes both.
+//!
 //! Each population gets its own histogram and metrics. Counters record the
 //! share of each, and `roundtrips_two_sided` counts round trips where the
 //! pinger slept *and* its FUTEX_WAKE really woke the ponger.
@@ -64,10 +84,33 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const POP_BLOCKED: &str = "rtt_blocked";
 pub const POP_FAST: &str = "rtt_fast";
+pub const POP_BLOCKED_SAME: &str = "rtt_blocked_same_cpu";
+pub const POP_BLOCKED_CROSS: &str = "rtt_blocked_cross_cpu";
+
+/// Current CPU, or `None` if the kernel cannot say.
+fn current_cpu() -> Option<u32> {
+    // SAFETY: sched_getcpu has no preconditions.
+    let c = unsafe { libc::sched_getcpu() };
+    u32::try_from(c).ok()
+}
+
+/// No CPU recorded (sched_getcpu failed or diagnostics are off).
+const NO_CPU: u32 = u32::MAX;
+
+/// A pair's shared state, in one cache line: the ponger's `reply_cpu`
+/// store lands in the line it writes for the token anyway.
+#[repr(C, align(64))]
+struct PairLine {
+    token: AtomicU32,
+    reply_cpu: AtomicU32,
+}
 
 pub struct WakePingPong {
     pub pairs: usize,
     pub hogs: usize,
+    /// Record the CPU of each reply and continuation (same-/cross-CPU
+    /// split). Costs one `sched_getcpu` (a few ns) inside each round trip.
+    pub cpu_diag: bool,
 }
 
 impl Workload for WakePingPong {
@@ -84,7 +127,13 @@ impl Workload for WakePingPong {
     }
 
     fn params(&self) -> serde_json::Value {
-        json!({ "pairs": self.pairs, "hogs": self.hogs })
+        // `cpu_diag` only appears when on, so a run without it compares
+        // with results recorded before the option existed.
+        if self.cpu_diag {
+            json!({ "pairs": self.pairs, "hogs": self.hogs, "cpu_diag": true })
+        } else {
+            json!({ "pairs": self.pairs, "hogs": self.hogs })
+        }
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -92,8 +141,15 @@ impl Workload for WakePingPong {
     }
 
     fn progress_note(&self, r: &RunResult) -> Option<String> {
-        let (b, t) = (r.counters.get("roundtrips_blocked")?, r.counters.get("roundtrips")?);
-        (*t > 0).then(|| format!("blocked={:.0}%", *b as f64 / *t as f64 * 100.0))
+        let c = &r.counters;
+        let (b, t) = (*c.get("roundtrips_blocked")?, *c.get("roundtrips")?);
+        let mut note = format!("blocked={:.0}%", pct_of(b, t)?);
+        if let Some(same) = c.get("roundtrips_blocked_same_cpu") {
+            if let Some(p) = pct_of(*same, b) {
+                note.push_str(&format!(" (same-cpu {p:.0}%)"));
+            }
+        }
+        Some(note)
     }
 
     fn run(&self, duration: Duration) -> RunResult {
@@ -116,7 +172,7 @@ impl WakePingPong {
             None
         };
 
-        let mut crew = Crew::new(fault);
+        let mut crew = Crew::new(fault, self.cpu_diag);
         for i in 0..self.pairs {
             if let Err(e) = crew.spawn_pair(i, duration) {
                 // `crew` and `hogs` are dropped on return: everything stops.
@@ -143,7 +199,7 @@ impl WakePingPong {
         let outcome = crew.finish();
         drop(hogs);
         match outcome {
-            Ok((pings, pongs)) => summarize(&pings, &pongs, start, hog),
+            Ok((pings, pongs)) => summarize(&pings, &pongs, start, hog, self.cpu_diag),
             Err(why) => invalid(why),
         }
     }
@@ -179,6 +235,10 @@ fn classify(slept: bool, interrupted: bool) -> Class {
         (false, true) => Class::Ambiguous,
         (false, false) => Class::Fast,
     }
+}
+
+fn pct_of(part: u64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 / whole as f64 * 100.0)
 }
 
 fn invalid(why: String) -> RunResult {
@@ -233,6 +293,16 @@ struct PingOut {
     two_sided: u64,
     /// Round trips that could not be classified (EINTR without a completed sleep).
     ambiguous: u64,
+    /// Blocked round trips by where the reply and the continuation ran.
+    blocked_same: Recorder,
+    blocked_cross: Recorder,
+    fast_same: u64,
+    fast_cross: u64,
+    /// Either side's CPU could not be read.
+    cpu_unknown: u64,
+    /// The pinger was seen on a different CPU than after the previous round
+    /// trip. Observed changes between samples, not a count of migrations.
+    cpu_changes: u64,
     end: Option<Instant>,
 }
 
@@ -241,7 +311,8 @@ struct Shared {
     ready: AtomicU32,
     abort: AtomicBool,
     start: OnceLock<Instant>,
-    tokens: Mutex<Vec<Arc<AtomicU32>>>,
+    tokens: Mutex<Vec<Arc<PairLine>>>,
+    cpu_diag: bool,
     error: Mutex<Option<String>>,
     fault: Fault,
 }
@@ -259,7 +330,8 @@ impl Shared {
         self.gate.store(1, Ordering::Release);
         let _ = futex::wake(&self.gate, i32::MAX);
         let _ = futex::wake(&self.ready, i32::MAX);
-        for t in self.tokens.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        for line in self.tokens.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            let t = &line.token;
             t.store(ABORT, Ordering::Release);
             let _ = futex::wake(t, i32::MAX);
         }
@@ -294,7 +366,7 @@ struct Crew {
 }
 
 impl Crew {
-    fn new(fault: Fault) -> Self {
+    fn new(fault: Fault, cpu_diag: bool) -> Self {
         Crew {
             shared: Arc::new(Shared {
                 gate: AtomicU32::new(0),
@@ -302,6 +374,7 @@ impl Crew {
                 abort: AtomicBool::new(false),
                 start: OnceLock::new(),
                 tokens: Mutex::new(Vec::new()),
+                cpu_diag,
                 error: Mutex::new(None),
                 fault,
             }),
@@ -311,7 +384,11 @@ impl Crew {
     }
 
     fn spawn_pair(&mut self, i: usize, duration: Duration) -> std::io::Result<()> {
-        let token = Arc::new(AtomicU32::new(if self.shared.aborted() { ABORT } else { PING }));
+        let token = Arc::new(PairLine {
+            token: AtomicU32::new(if self.shared.aborted() { ABORT } else { PING }),
+            reply_cpu: AtomicU32::new(NO_CPU),
+        });
+        // CPU the ponger replied on; published by its PONG -> PING CAS.
         self.shared.tokens.lock().unwrap_or_else(|p| p.into_inner()).push(Arc::clone(&token));
         let (t, sh) = (Arc::clone(&token), Arc::clone(&self.shared));
         self.pongers.push(
@@ -426,8 +503,10 @@ fn ready_then_wait_gate(sh: &Shared) -> bool {
     !sh.aborted()
 }
 
-fn ping(token: &AtomicU32, sh: &Shared, duration: Duration) -> PingOut {
+fn ping(line: &PairLine, sh: &Shared, duration: Duration) -> PingOut {
+    let token = &line.token;
     let mut out = PingOut::default();
+    let mut prev_cpu: Option<u32> = None;
     if ready_then_wait_gate(sh) {
         let start = *sh.start.get().expect("start is set before the gate opens");
         let deadline = start + duration;
@@ -472,12 +551,42 @@ fn ping(token: &AtomicU32, sh: &Shared, duration: Duration) -> PingOut {
                 }
             }
             let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // Outside the timed section. After the Acquire load that saw
+            // PING, so the ponger's `reply_cpu` store is visible. These are
+            // two observations at two instants, not a record of the wakeup
+            // path: either thread may have moved in between.
+            let same = if sh.cpu_diag {
+                let mine = current_cpu();
+                let theirs = Some(line.reply_cpu.load(Ordering::Relaxed)).filter(|c| *c != NO_CPU);
+                if let (Some(p), Some(m)) = (prev_cpu, mine) {
+                    out.cpu_changes += u64::from(p != m);
+                }
+                prev_cpu = mine.or(prev_cpu);
+                match (mine, theirs) {
+                    (Some(a), Some(b)) => Some(a == b),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             match classify(slept, interrupted) {
                 Class::Blocked => {
                     out.blocked.record(ns);
                     out.two_sided += u64::from(woke_peer);
+                    match same {
+                        Some(true) => out.blocked_same.record(ns),
+                        Some(false) => out.blocked_cross.record(ns),
+                        None => out.cpu_unknown += u64::from(sh.cpu_diag),
+                    }
                 }
-                Class::Fast => out.fast.record(ns),
+                Class::Fast => {
+                    out.fast.record(ns);
+                    match same {
+                        Some(true) => out.fast_same += 1,
+                        Some(false) => out.fast_cross += 1,
+                        None => out.cpu_unknown += u64::from(sh.cpu_diag),
+                    }
+                }
                 Class::Ambiguous => out.ambiguous += 1,
             }
         }
@@ -489,7 +598,8 @@ fn ping(token: &AtomicU32, sh: &Shared, duration: Duration) -> PingOut {
     out
 }
 
-fn pong(token: &AtomicU32, sh: &Shared) -> Counts {
+fn pong(line: &PairLine, sh: &Shared) -> Counts {
+    let token = &line.token;
     let mut c = Counts::default();
     if !ready_then_wait_gate(sh) {
         return c;
@@ -516,7 +626,13 @@ fn pong(token: &AtomicU32, sh: &Shared) -> Counts {
                         _ => {}
                     }
                 }
-                // CAS so an ABORT stored concurrently is never overwritten.
+                if sh.cpu_diag {
+                    // Same cache line as the token, which this thread is about
+                    // to write anyway: no extra line transfer inside the RTT.
+                    line.reply_cpu.store(current_cpu().unwrap_or(NO_CPU), Ordering::Relaxed);
+                }
+                // CAS so an ABORT stored concurrently is never overwritten;
+                // its Release also publishes `reply_cpu` to the pinger.
                 if token.compare_exchange(PONG, PING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                     handoffs += 1;
                     match futex::wake(token, 1) {
@@ -532,6 +648,17 @@ fn pong(token: &AtomicU32, sh: &Shared) -> Counts {
                 }
             }
             _ => return c, // ABORT
+        }
+    }
+}
+
+/// p50/p99 for a sub-population (same rule for sample counts), no curve:
+/// the full histogram is kept in the result, but it is not charted.
+fn sub_population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Recorder) {
+    let n = rec.count();
+    for (q, suffix) in [(0.5, "p50"), (0.99, "p99")] {
+        if n >= min_samples_for(q) {
+            m.insert(format!("{name}_{suffix}"), Metric::lower(rec.quantile(q).unwrap_or(0.0) / 1000.0, "us"));
         }
     }
 }
@@ -552,13 +679,22 @@ fn population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Record
     quantile_grid().into_iter().filter(|q| n >= min_samples_for(*q)).map(|q| (q, us(q))).collect()
 }
 
-fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<HogWindow>) -> RunResult {
+fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<HogWindow>, cpu_diag: bool) -> RunResult {
     let mut blocked = Recorder::default();
     let mut fast = Recorder::default();
     let mut ping_c = Counts::default();
     let mut two_sided = 0;
     let mut ambiguous = 0;
+    let mut blocked_same = Recorder::default();
+    let mut blocked_cross = Recorder::default();
+    let (mut fast_same, mut fast_cross, mut cpu_unknown, mut cpu_changes) = (0, 0, 0, 0);
     for p in pings {
+        blocked_same.merge(&p.blocked_same);
+        blocked_cross.merge(&p.blocked_cross);
+        fast_same += p.fast_same;
+        fast_cross += p.fast_cross;
+        cpu_unknown += p.cpu_unknown;
+        cpu_changes += p.cpu_changes;
         blocked.merge(&p.blocked);
         fast.merge(&p.fast);
         ping_c.add(&p.counts);
@@ -582,6 +718,10 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
 
     let blocked_curve = population_metrics(&mut r.metrics, POP_BLOCKED, &blocked);
     let fast_curve = population_metrics(&mut r.metrics, POP_FAST, &fast);
+    if cpu_diag {
+        sub_population_metrics(&mut r.metrics, POP_BLOCKED_SAME, &blocked_same);
+        sub_population_metrics(&mut r.metrics, POP_BLOCKED_CROSS, &blocked_cross);
+    }
     let m = &mut r.metrics;
     m.insert("roundtrips_per_s".into(), Metric::higher(roundtrips as f64 / window, "1/s"));
     // Threads FUTEX_WAKE actually woke, not an assumed two per round trip.
@@ -604,6 +744,14 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
     c.insert("roundtrips_fast".into(), fast.count());
     c.insert("roundtrips_ambiguous".into(), ambiguous);
     c.insert("roundtrips_two_sided".into(), two_sided);
+    if cpu_diag {
+        c.insert("roundtrips_blocked_same_cpu".into(), blocked_same.count());
+        c.insert("roundtrips_blocked_cross_cpu".into(), blocked_cross.count());
+        c.insert("roundtrips_fast_same_cpu".into(), fast_same);
+        c.insert("roundtrips_fast_cross_cpu".into(), fast_cross);
+        c.insert("roundtrips_cpu_unknown".into(), cpu_unknown);
+        c.insert("ping_cpu_changes".into(), cpu_changes);
+    }
     c.insert("ping_waits_slept".into(), ping_c.waits_slept);
     c.insert("ping_waits_eagain".into(), ping_c.waits_eagain);
     c.insert("ping_waits_eintr".into(), ping_c.waits_eintr);
@@ -613,6 +761,11 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
     c.insert("futex_wake_calls".into(), ping_c.wake_calls + pong_c.wake_calls);
     c.insert("futex_woken".into(), woken);
 
+    for (name, rec) in [(POP_BLOCKED_SAME, &blocked_same), (POP_BLOCKED_CROSS, &blocked_cross)] {
+        if rec.count() > 0 {
+            r.latency_histograms.insert(name.into(), rec.to_histogram("ns"));
+        }
+    }
     for (name, rec, curve) in [(POP_BLOCKED, &blocked, blocked_curve), (POP_FAST, &fast, fast_curve)] {
         if rec.count() > 0 {
             r.latency_histograms.insert(name.into(), rec.to_histogram("ns"));
@@ -642,7 +795,7 @@ mod tests {
     #[test]
     fn populations_partition_round_trips() {
         let r = run_bounded(
-            WakePingPong { pairs: 2, hogs: 0 },
+            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true },
             Duration::from_millis(150),
             Fault::None,
             Duration::from_secs(10),
@@ -652,8 +805,25 @@ mod tests {
         assert_eq!(c["roundtrips"], c["roundtrips_blocked"] + c["roundtrips_fast"] + c["roundtrips_ambiguous"]);
         assert!(r.windows.contains_key("latency"));
         assert!(c["roundtrips_two_sided"] <= c["roundtrips_blocked"]);
+        // Every classified round trip has a CPU verdict (or is counted unknown).
+        assert_eq!(
+            c["roundtrips_blocked_same_cpu"]
+                + c["roundtrips_blocked_cross_cpu"]
+                + c["roundtrips_fast_same_cpu"]
+                + c["roundtrips_fast_cross_cpu"]
+                + c["roundtrips_cpu_unknown"],
+            c["roundtrips_blocked"] + c["roundtrips_fast"]
+        );
+        let sub: u64 = [POP_BLOCKED_SAME, POP_BLOCKED_CROSS]
+            .iter()
+            .filter_map(|p| r.latency_histograms.get(*p))
+            .map(|h| h.count)
+            .sum();
+        assert!(sub <= c["roundtrips_blocked"] && sub + c["roundtrips_cpu_unknown"] >= c["roundtrips_blocked"]);
+        assert!(r.quantile_curves.keys().all(|k| k == POP_BLOCKED || k == POP_FAST), "sub-populations are not charted");
         assert!(c["futex_woken"] <= c["futex_wake_calls"]);
-        let total: u64 = r.latency_histograms.values().map(|h| h.count).sum();
+        let total: u64 =
+            [POP_BLOCKED, POP_FAST].iter().filter_map(|p| r.latency_histograms.get(*p)).map(|h| h.count).sum();
         // Ambiguous (EINTR) round trips are counted but deliberately in neither histogram.
         assert_eq!(total + c["roundtrips_ambiguous"], c["roundtrips"]);
         // Pingers run until the common deadline, so the window cannot be shorter
@@ -663,9 +833,27 @@ mod tests {
     }
 
     #[test]
+    fn cpu_diagnostics_can_be_turned_off() {
+        let w = WakePingPong { pairs: 1, hogs: 0, cpu_diag: false };
+        assert_eq!(w.params(), json!({ "pairs": 1, "hogs": 0 }), "same params as results without the option");
+        let r = run_bounded(w, Duration::from_millis(100), Fault::None, Duration::from_secs(10));
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        assert!(!r.counters.contains_key("roundtrips_blocked_same_cpu"));
+        assert!(!r.counters.contains_key("roundtrips_cpu_unknown"));
+        assert!(!r.metrics.keys().any(|k| k.contains("_cpu_")));
+        assert!(!r.latency_histograms.contains_key(POP_BLOCKED_SAME));
+    }
+
+    #[test]
+    fn pair_state_shares_one_cache_line() {
+        assert_eq!(std::mem::align_of::<PairLine>(), 64);
+        assert_eq!(std::mem::size_of::<PairLine>(), 64);
+    }
+
+    #[test]
     fn hog_rate_is_reported() {
         let r = run_bounded(
-            WakePingPong { pairs: 1, hogs: 1 },
+            WakePingPong { pairs: 1, hogs: 1, cpu_diag: true },
             Duration::from_millis(100),
             Fault::None,
             Duration::from_secs(10),
@@ -706,8 +894,12 @@ mod tests {
 
     fn assert_fault_aborts_promptly(fault: Fault, needle: &str) {
         // 60 s requested: only the abort path can finish within the limit.
-        let r =
-            run_bounded(WakePingPong { pairs: 2, hogs: 0 }, Duration::from_secs(60), fault, Duration::from_secs(10));
+        let r = run_bounded(
+            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true },
+            Duration::from_secs(60),
+            fault,
+            Duration::from_secs(10),
+        );
         let why = r.invalid_reason.expect("run must be invalid");
         assert!(why.contains(needle), "{why}");
     }
@@ -731,7 +923,7 @@ mod tests {
     fn crew_drop_without_start_does_not_hang() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut crew = Crew::new(Fault::None);
+            let mut crew = Crew::new(Fault::None, true);
             crew.spawn_pair(0, Duration::from_secs(60)).unwrap();
             crew.spawn_pair(1, Duration::from_secs(60)).unwrap();
             drop(crew); // gate never opened: Drop must release and join.

@@ -190,7 +190,7 @@ pub fn report(c: &Comparison) -> String {
     h.push_str("</table>");
 
     if !c.diagnostics.is_empty() {
-        h.push_str("<h2>Run diagnostics</h2><p class=sub>Counters summed over valid runs. For wake-pingpong: <code>roundtrips_blocked</code>/<code>roundtrips_fast</code> split round trips by whether the pinger slept; <code>roundtrips_ambiguous</code> had a wait interrupted by a signal (EINTR) without a completed sleep and are in neither histogram; <code>roundtrips_two_sided</code> are blocked round trips whose FUTEX_WAKE also woke a sleeping ponger; <code>*_waits_slept</code> are FUTEX_WAITs that really slept, <code>*_waits_eagain</code> returned at once because the token had already moved; <code>futex_woken</code> is the number of threads FUTEX_WAKE actually woke.</p>");
+        h.push_str("<h2>Run diagnostics</h2><p class=sub>Counters summed over valid runs. For wake-pingpong: <code>roundtrips_blocked</code>/<code>roundtrips_fast</code> split round trips by whether the pinger slept; <code>roundtrips_ambiguous</code> had a wait interrupted by a signal (EINTR) without a completed sleep and are in neither histogram; <code>roundtrips_two_sided</code> are blocked round trips whose FUTEX_WAKE also woke a sleeping ponger; <code>*_waits_slept</code> are FUTEX_WAITs that really slept, <code>*_waits_eagain</code> returned at once because the token had already moved; <code>futex_woken</code> is the number of threads FUTEX_WAKE actually woke. Same-CPU means the CPU read by the ponger just before replying and the CPU read by the pinger just after receiving the reply are the same logical CPU; cross-CPU means they differ. These are two observations at two instants (either thread may move in between), useful to tell regimes apart, not proof of a local wakeup or an IPI. <code>ping_cpu_changes</code> counts observed CPU changes between round trips, not migrations. Blocked round trips are also split into <code>rtt_blocked_same_cpu</code> / <code>rtt_blocked_cross_cpu</code> metrics in the table above.</p>");
         let mut workloads: Vec<&str> = Vec::new();
         for d in &c.diagnostics {
             if !workloads.contains(&d.workload.as_str()) {
@@ -212,17 +212,20 @@ pub fn report(c: &Comparison) -> String {
                 );
             }
             h.push_str("</tr>");
-            for (num, label) in [
-                ("roundtrips_blocked", "blocked share (pinger slept)"),
-                ("roundtrips_two_sided", "two-sided share (both sides slept)"),
-                ("roundtrips_ambiguous", "ambiguous share (EINTR, excluded)"),
+            for (num, den, label) in [
+                ("roundtrips_blocked", "roundtrips", "blocked share (pinger slept)"),
+                ("roundtrips_two_sided", "roundtrips", "two-sided share (both sides slept)"),
+                ("roundtrips_blocked_same_cpu", "roundtrips_blocked", "same-CPU share of blocked round trips"),
+                ("roundtrips_fast_same_cpu", "roundtrips_fast", "same-CPU share of fast round trips"),
+                ("ping_cpu_changes", "roundtrips", "pinger seen on a new CPU, per round trip"),
+                ("roundtrips_ambiguous", "roundtrips", "ambiguous share (EINTR, excluded)"),
             ] {
                 if !keys.iter().any(|k| *k == num) {
                     continue;
                 }
                 let _ = write!(h, "<tr><td><strong>{label}</strong></td>");
                 for d in &ds {
-                    match (d.counters.get(num), d.counters.get("roundtrips")) {
+                    match (d.counters.get(num), d.counters.get(den)) {
                         (Some(s), Some(t)) if *t > 0 => {
                             let _ = write!(h, "<td><strong>{:.1}%</strong></td>", *s as f64 / *t as f64 * 100.0);
                         }
