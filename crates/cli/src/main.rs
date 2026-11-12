@@ -55,8 +55,9 @@ enum Cmd {
         #[arg(long)]
         no_cpu_diag: bool,
     },
-    /// Interleave several schedulers, switched with scxcli (scx.service):
-    /// every round visits each scheduler once, in alternating order, so
+    /// Interleave several schedulers, switched with scxcli (scx.service).
+    ///
+    /// Every round visits each scheduler once, in alternating order, so
     /// slow drift affects all of them alike. Writes one result file per
     /// scheduler and a report into the output directory, then restores the
     /// previously selected scheduler. Run as root to avoid a polkit prompt
