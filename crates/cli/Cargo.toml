@@ -1,0 +1,24 @@
+[package]
+name = "helicoprion"
+description = "Scheduler-focused CPU benchmark: detects EEVDF vs sched-ext, runs workloads, charts the difference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "helicoprion"
+path = "src/main.rs"
+
+[dependencies]
+helicoprion-core.workspace = true
+helicoprion-workloads.workspace = true
+helicoprion-report.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
