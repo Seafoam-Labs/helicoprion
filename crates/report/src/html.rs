@@ -7,7 +7,7 @@ use helicoprion_core::Better;
 use crate::compare::{Comparison, Delta, MetricRow};
 use crate::esc;
 use crate::stats::MIN_RUNS_FOR_CI;
-use crate::svg::{delta_chart, fmt_delta, fmt_value, pct, tail_chart};
+use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_value, tail_chart};
 use crate::theme::{STYLE, series_var};
 
 const PAGE_CSS: &str = r#"
@@ -53,7 +53,7 @@ fn delta_cell(d: &Delta, highlight: bool) -> (String, &'static str) {
         (_, None) if d.unmatched_rounds => {
             format!("{} (no matching rounds: descriptive comparison only)", fmt_delta(d))
         }
-        (Some((lo, hi)), _) => format!("{} [{} … {}]{paired}", fmt_delta(d), pct(lo), pct(hi)),
+        (Some((lo, hi)), _) => format!("{} [{}]{paired}", fmt_delta(d), fmt_interval(d, lo, hi)),
         (None, Some(n)) => format!("{} (paired, {n} round(s): no interval){paired}", fmt_delta(d)),
         (None, None) => format!("{} (n&lt;{MIN_RUNS_FOR_CI}){paired}", fmt_delta(d)),
     };
@@ -165,7 +165,7 @@ pub fn report(c: &Comparison) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored.</p><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored.</p><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct

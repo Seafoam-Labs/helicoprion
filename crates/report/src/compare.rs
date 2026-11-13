@@ -95,6 +95,8 @@ pub struct Delta {
     /// Paired only: half the IQR of the per-round changes, in percentage
     /// points; how consistent the effect is from round to round.
     pub paired_spread_pp: Option<f64>,
+    /// Direction of the metric, to turn a change back into a ratio.
+    pub better: Better,
 }
 
 impl Delta {
@@ -108,6 +110,17 @@ impl Delta {
     /// least `min_effect_pct` in magnitude.
     pub fn notable(&self, min_effect_pct: f64) -> bool {
         self.ci_excludes_zero() && self.median.abs() >= min_effect_pct
+    }
+
+    /// The goodness ratio (like `ratio`) that a change of `change_pct`
+    /// percent stands for; the inverse of `change()`. Monotonic, so an
+    /// interval of changes maps onto an interval of ratios.
+    pub fn ratio_of(&self, change_pct: f64) -> f64 {
+        match self.better {
+            Better::Lower => 1.0 / (1.0 - change_pct / 100.0),
+            Better::Higher => 1.0 + change_pct / 100.0,
+            Better::Neither => 1.0,
+        }
     }
 }
 
@@ -162,7 +175,15 @@ impl MetricRow {
         let median = change(self.better, b.spread.median, s.spread.median)?;
         let ci = bootstrap_ci(&b.values, &s.values, |mb, mc| change(self.better, mb, mc));
         let ratio = goodness_ratio(self.better, b.spread.median, s.spread.median);
-        Some(Delta { median, ci, ratio, paired_rounds: None, unmatched_rounds: false, paired_spread_pp: None })
+        Some(Delta {
+            median,
+            ci,
+            ratio,
+            paired_rounds: None,
+            unmatched_rounds: false,
+            paired_spread_pp: None,
+            better: self.better,
+        })
     }
 
     /// Estimate for two cells from the same interleaved session, which is
@@ -192,6 +213,7 @@ impl MetricRow {
                 paired_rounds: None,
                 unmatched_rounds: true,
                 paired_spread_pp: None,
+                better: self.better,
             });
         };
         let ratios: Vec<f64> = common
@@ -207,6 +229,7 @@ impl MetricRow {
             paired_rounds: Some(changes.len()),
             unmatched_rounds: false,
             paired_spread_pp: Some((spread.q3 - spread.q1) / 2.0),
+            better: self.better,
         })
     }
 

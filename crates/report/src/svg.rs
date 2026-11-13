@@ -53,18 +53,45 @@ fn text_w(s: &str) -> f64 {
     s.chars().count() as f64 * CHAR_W
 }
 
+/// Whether a goodness ratio is shown as a multiple: `Some(true)` for "N×
+/// better" (2× or more), `Some(false)` for "N× worse", `None` for a percentage.
+fn multiple(r: f64) -> Option<bool> {
+    if r.is_finite() && r >= 2.0 {
+        Some(true)
+    } else if r > 0.0 && r <= 0.5 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// A change as a reader would say it: a multiple when the medians differ by
 /// 2× or more ("34× worse"), a signed percentage otherwise.
 pub fn fmt_delta(d: &crate::compare::Delta) -> String {
     let r = d.ratio;
-    if r.is_finite() && r >= 2.0 {
-        format!("{}× better", times(r))
-    } else if r > 0.0 && r <= 0.5 {
-        format!("{}× worse", times(1.0 / r))
-    } else {
+    match multiple(r) {
+        Some(true) => format!("{}× better", times(r)),
+        Some(false) => format!("{}× worse", times(1.0 / r)),
         // Includes a zero median on one side, where no multiple is meaningful.
-        pct(d.median)
+        None => pct(d.median),
     }
+}
+
+/// An interval of changes `lo … hi` (percent, worse to better), in the
+/// same terms as `fmt_delta` puts the estimate: next to "8.7× worse" it
+/// reads "9.1× … 8.1×", not "−89.0% … −87.7%". A bound on the other side
+/// of no change, where that multiple would fall below 1×, stays a
+/// percentage.
+pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
+    let Some(better) = multiple(d.ratio) else {
+        return format!("{} … {}", pct(lo), pct(hi));
+    };
+    let bound = |c: f64| {
+        let r = d.ratio_of(c);
+        let x = if better { r } else { 1.0 / r };
+        if x.is_finite() && x >= 1.0 { format!("{}×", times(x)) } else { pct(c) }
+    };
+    format!("{} … {}", bound(lo), bound(hi))
 }
 
 fn times(x: f64) -> String {
@@ -76,8 +103,8 @@ fn times(x: f64) -> String {
 fn interval_text(d: &crate::compare::Delta) -> String {
     match (d.ci, d.paired_rounds) {
         (_, None) if d.unmatched_rounds => "no matching rounds: descriptive comparison only".into(),
-        (Some((lo, hi)), Some(n)) => format!("paired over {n} rounds, 95% CI {} … {}", pct(lo), pct(hi)),
-        (Some((lo, hi)), None) => format!("95% CI {} … {}", pct(lo), pct(hi)),
+        (Some((lo, hi)), Some(n)) => format!("paired over {n} rounds, 95% CI {}", fmt_interval(d, lo, hi)),
+        (Some((lo, hi)), None) => format!("95% CI {}", fmt_interval(d, lo, hi)),
         (None, Some(n)) => format!("paired over {n} round(s): no interval (needs ≥3 rounds)"),
         (None, None) => "too few runs for an interval".into(),
     }
@@ -468,6 +495,7 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helicoprion_core::Better;
 
     #[test]
     fn percent_format() {
@@ -486,11 +514,51 @@ mod tests {
             paired_rounds: None,
             unmatched_rounds: false,
             paired_spread_pp: None,
+            better: Better::Lower,
         };
         assert_eq!(fmt_delta(&d(-3298.6, 1.0 / 33.986)), "34× worse");
         assert_eq!(fmt_delta(&d(89.6, 9.6)), "9.6× better");
         assert_eq!(fmt_delta(&d(-31.4, 1.0 / 1.314)), "\u{2212}31.4%");
         assert_eq!(fmt_delta(&d(50.0, 2.0)), "2.0× better");
+    }
+
+    #[test]
+    fn intervals_follow_the_estimate_into_multiples() {
+        use crate::compare::Delta;
+        let d = |median, ratio, better| Delta {
+            median,
+            ci: None,
+            ratio,
+            paired_rounds: None,
+            unmatched_rounds: false,
+            paired_spread_pp: None,
+            better,
+        };
+        // Numbers from a default vs scx_pandemonium matrix.
+        // Higher is better: 1.14M -> 130k round trips/s.
+        assert_eq!(fmt_interval(&d(-88.6, 1.0 / 8.7, Better::Higher), -89.0, -87.7), "9.1× … 8.1×");
+        // Lower is better: 9.66 -> 354 us.
+        assert_eq!(fmt_interval(&d(-3564.0, 1.0 / 40.0, Better::Lower), -4485.4, -2525.3), "46× … 26×");
+        // Better, lower is better: 1614 -> 586 us.
+        assert_eq!(fmt_interval(&d(63.7, 2.75, Better::Lower), 63.2, 68.7), "2.7× … 3.2×");
+        // A bound across no change stays a percentage.
+        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "6.0× … +10.0%");
+        // No multiple, no conversion.
+        assert_eq!(fmt_interval(&d(-11.4, 0.886, Better::Higher), -12.2, -9.3), "\u{2212}12.2% … \u{2212}9.3%");
+        // Every conversion inverts change().
+        for better in [Better::Lower, Better::Higher] {
+            for (base, v) in [(10.0, 354.0), (1.14, 0.13), (1614.0, 586.0)] {
+                let c = match better {
+                    Better::Lower => (base - v) / base * 100.0,
+                    _ => (v - base) / base * 100.0,
+                };
+                let want = match better {
+                    Better::Lower => base / v,
+                    _ => v / base,
+                };
+                assert!((d(c, want, better).ratio_of(c) - want).abs() < 1e-9);
+            }
+        }
     }
 
     #[test]
@@ -503,6 +571,7 @@ mod tests {
             paired_rounds,
             unmatched_rounds,
             paired_spread_pp: None,
+            better: Better::Lower,
         };
         assert_eq!(interval_text(&d(None, Some(2), false)), "paired over 2 round(s): no interval (needs ≥3 rounds)");
         assert!(interval_text(&d(Some((-8.0, -4.0)), Some(5), false)).starts_with("paired over 5 rounds"));
