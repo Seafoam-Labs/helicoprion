@@ -228,11 +228,15 @@ compared with each other.
   load sitting on the edge of a ~1.6 ms plateau that holds ~0.1% of the
   samples, flipping between 40 µs and 1.4 ms from run to run.
 * **Uneven paired changes.** In a matrix session stability is judged on the
-  per-round changes, not the raw spread. When they differ by more than
-  `--unstable-spread` percentage points (half their interquartile range),
-  the change is tagged *uneven ±x pp* (`≠` in the terminal table): listed,
-  but not highlighted or charted even if its interval excludes zero. The
-  summary counts these separately among the unclear ones.
+  per-round results, not the raw spread. When the ratio between the two
+  schedulers differs from round to round by more than `--unstable-spread`
+  percent (half the interquartile range of the per-round ratios, on a
+  relative scale, so a steady "26× better" counts as even), the change is
+  tagged *uneven ±x%* (`≠` in the terminal table): listed, but not
+  highlighted or charted even if its interval excludes zero. The summary
+  counts these separately among the unclear ones. A round where one side
+  measured zero has no ratio; such rounds are not dropped: the per-round
+  changes are then compared in percentage points (*uneven ±x pp*).
 * **Summary.** The report opens with one line per scheduler and workload:
   *better*, *worse*, *mixed* or *no clear difference* against the baseline,
   with the number of compared metrics that are clearly better, clearly

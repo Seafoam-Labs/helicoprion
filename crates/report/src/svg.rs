@@ -545,7 +545,7 @@ mod tests {
             ratio,
             paired_rounds: None,
             unmatched_rounds: false,
-            paired_spread_pp: None,
+            paired_spread: None,
             better: Better::Lower,
         };
         assert_eq!(fmt_delta(&d(-3298.6, 1.0 / 33.986)), "34× worse");
@@ -563,7 +563,7 @@ mod tests {
             ratio,
             paired_rounds: None,
             unmatched_rounds: false,
-            paired_spread_pp: None,
+            paired_spread: None,
             better,
         };
         // Numbers from a default vs scx_pandemonium matrix.
@@ -602,7 +602,7 @@ mod tests {
             ratio: 0.94,
             paired_rounds,
             unmatched_rounds,
-            paired_spread_pp: None,
+            paired_spread: None,
             better: Better::Lower,
         };
         assert_eq!(interval_text(&d(None, Some(2), false)), "paired over 2 round(s): no interval (needs ≥3 rounds)");

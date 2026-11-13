@@ -92,9 +92,8 @@ pub struct Delta {
     /// nothing could be paired, so this is a descriptive comparison of
     /// medians only, without an interval. `paired_rounds` is `None` then.
     pub unmatched_rounds: bool,
-    /// Paired only: half the IQR of the per-round changes, in percentage
-    /// points; how consistent the effect is from round to round.
-    pub paired_spread_pp: Option<f64>,
+    /// Paired only: how consistent the effect is from round to round.
+    pub paired_spread: Option<PairedSpread>,
     /// Direction of the metric, to turn a change back into a ratio.
     pub better: Better,
 }
@@ -112,23 +111,60 @@ impl Delta {
         self.ci_excludes_zero() && self.median.abs() >= min_effect_pct
     }
 
-    /// Paired only: the per-round changes disagree by more than
-    /// `threshold_pp` percentage points (half their IQR, returned). The
-    /// schedulers then did not differ by one amount under the session's
-    /// conditions, so the median change is not scored.
-    pub fn uneven(&self, threshold_pp: f64) -> Option<f64> {
-        self.paired_spread_pp.filter(|pp| *pp > threshold_pp)
+    /// Paired only: the per-round results disagree by more than
+    /// `threshold` (`PairedSpread`, returned; percent or percentage points
+    /// alike). The schedulers then did not differ by one factor under the
+    /// session's conditions, so the median change is not scored.
+    pub fn uneven(&self, threshold: f64) -> Option<PairedSpread> {
+        self.paired_spread.filter(|s| s.value() > threshold)
     }
 
     /// The goodness ratio (like `ratio`) that a change of `change_pct`
     /// percent stands for; the inverse of `change()`. Monotonic, so an
     /// interval of changes maps onto an interval of ratios.
     pub fn ratio_of(&self, change_pct: f64) -> f64 {
-        match self.better {
-            Better::Lower => 1.0 / (1.0 - change_pct / 100.0),
-            Better::Higher => 1.0 + change_pct / 100.0,
-            Better::Neither => 1.0,
+        ratio_of_change(self.better, change_pct)
+    }
+}
+
+/// How far the per-round results of a paired comparison are from one
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PairedSpread {
+    /// In percent, between the per-round ratios of the two sides: half the
+    /// IQR of their logarithms, as a factor minus one. Relative, so that
+    /// "26× better" in every round is as even as "+5%" in every round,
+    /// whichever direction the metric and the change have.
+    Relative(f64),
+    /// In percentage points, between the per-round changes: half their
+    /// IQR. Used when some round has no usable ratio (a zero on one side),
+    /// so that such a round still counts; a ratio scale would drop it.
+    Points(f64),
+}
+
+impl PairedSpread {
+    pub fn value(self) -> f64 {
+        match self {
+            PairedSpread::Relative(v) | PairedSpread::Points(v) => v,
         }
+    }
+}
+
+impl std::fmt::Display for PairedSpread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PairedSpread::Relative(v) => write!(f, "±{v:.1}%"),
+            PairedSpread::Points(v) => write!(f, "±{v:.1} pp"),
+        }
+    }
+}
+
+/// The goodness ratio a change of `change_pct` percent stands for.
+fn ratio_of_change(better: Better, change_pct: f64) -> f64 {
+    match better {
+        Better::Lower => 1.0 / (1.0 - change_pct / 100.0),
+        Better::Higher => 1.0 + change_pct / 100.0,
+        Better::Neither => 1.0,
     }
 }
 
@@ -189,7 +225,7 @@ impl MetricRow {
             ratio,
             paired_rounds: None,
             unmatched_rounds: false,
-            paired_spread_pp: None,
+            paired_spread: None,
             better: self.better,
         })
     }
@@ -212,7 +248,12 @@ impl MetricRow {
         }
         let common: Vec<(f64, f64)> =
             b.rounds.iter().filter_map(|(r, bv)| s.rounds.get(r).map(|sv| (*bv, *sv))).collect();
-        let changes: Vec<f64> = common.iter().filter_map(|(bv, sv)| change(self.better, *bv, *sv)).collect();
+        // Rounds with a change (a non-zero baseline), with their ratio.
+        let rounds: Vec<(f64, f64)> = common
+            .iter()
+            .filter_map(|(bv, sv)| Some((change(self.better, *bv, *sv)?, goodness_ratio(self.better, *bv, *sv))))
+            .collect();
+        let changes: Vec<f64> = rounds.iter().map(|(c, _)| *c).collect();
         let Some(spread) = Spread::of(&changes) else {
             return Some(Delta {
                 median: change(self.better, b.spread.median, s.spread.median)?,
@@ -220,23 +261,28 @@ impl MetricRow {
                 ratio: goodness_ratio(self.better, b.spread.median, s.spread.median),
                 paired_rounds: None,
                 unmatched_rounds: true,
-                paired_spread_pp: None,
+                paired_spread: None,
                 better: self.better,
             });
         };
-        let ratios: Vec<f64> = common
-            .iter()
-            .map(|(bv, sv)| goodness_ratio(self.better, *bv, *sv))
-            .filter(|r| r.is_finite() && *r > 0.0)
-            .collect();
+        let ratios: Vec<f64> = rounds.iter().map(|(_, r)| *r).filter(|r| r.is_finite() && *r > 0.0).collect();
+        // A round where one side is zero has a change but no usable ratio.
+        // Judging evenness on the remaining ratios would drop exactly the
+        // rounds that differ most, so fall back to the changes themselves,
+        // and take the ratio from the median change so the two agree.
+        let (ratio, paired_spread) = if ratios.len() == changes.len() {
+            (median(&ratios).unwrap_or(1.0), relative_spread_pct(&ratios).map(PairedSpread::Relative))
+        } else {
+            (ratio_of_change(self.better, spread.median), Some(PairedSpread::Points((spread.q3 - spread.q1) / 2.0)))
+        };
         Some(Delta {
             median: spread.median,
             // `bootstrap_median_ci` returns None below MIN_ROUNDS_FOR_CI.
             ci: bootstrap_median_ci(&changes),
-            ratio: median(&ratios).unwrap_or(1.0),
+            ratio,
             paired_rounds: Some(changes.len()),
             unmatched_rounds: false,
-            paired_spread_pp: Some((spread.q3 - spread.q1) / 2.0),
+            paired_spread,
             better: self.better,
         })
     }
@@ -246,7 +292,7 @@ impl MetricRow {
     /// changes disagree by more than the threshold (raw run-to-run spread
     /// there is mostly drift between rounds, which pairing removes).
     pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
-        if let Some(d) = self.improvement(baseline, i).filter(|d| d.paired_spread_pp.is_some()) {
+        if let Some(d) = self.improvement(baseline, i).filter(|d| d.paired_spread.is_some()) {
             return d.uneven(self.unstable_spread_pct).is_some();
         }
         [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
@@ -320,6 +366,15 @@ pub struct Comparison {
     pub warnings: Vec<String>,
     /// Environment differences vs the baseline (informational).
     pub env_notes: Vec<String>,
+}
+
+/// Spread of positive ratios relative to one another, in percent: half the
+/// IQR of their logarithms, turned back into a factor. Ratios of 1.00 and
+/// 1.10 are as far apart as 20 and 22.
+fn relative_spread_pct(ratios: &[f64]) -> Option<f64> {
+    let logs: Vec<f64> = ratios.iter().map(|r| r.ln()).collect();
+    let s = Spread::of(&logs)?;
+    Some((((s.q3 - s.q1) / 2.0).exp() - 1.0) * 100.0)
 }
 
 /// How a candidate's clear changes on one workload add up.
@@ -1301,11 +1356,6 @@ mod tests {
         assert!(ulo < 0.0 && uhi > 0.0, "unpaired interval should straddle zero: {u:?}");
     }
 
-    /// `matrix --rounds 2 --runs-per-visit 5`: ten runs per scheduler but
-    /// only two independent rounds. No per-run bootstrap (pseudoreplication):
-    /// a paired point estimate, no interval, never highlighted.
-    /// Two sessions started in the same second with the same scheduler list
-    /// are still two experiments: their rounds must not be paired.
     #[test]
     fn uneven_paired_changes_are_tagged_not_scored() {
         // The candidate is 10% better in every other round and 50% better
@@ -1319,24 +1369,107 @@ mod tests {
         let c = Comparison::build(files, 0);
         let d = c.rows[0].improvement(0, 1).unwrap();
         assert!(d.notable(c.opts.min_effect_pct), "interval excludes zero, large: {d:?}");
-        let pp = d.uneven(c.opts.unstable_spread_pct).expect("uneven");
-        assert!((pp - 20.0).abs() < 1.0, "{pp}");
+        // Ratios of 1.11 and 2.0: about ±34% around their middle.
+        let uneven = d.uneven(c.opts.unstable_spread_pct).expect("uneven");
+        assert!(matches!(uneven, PairedSpread::Relative(s) if (30.0..40.0).contains(&s)), "{uneven:?}");
         assert!(c.rows[0].unstable_pair(0, 1) && !c.clear(&c.rows[0], 1, &d) && !c.rows[0].chartable(0, 1));
         let s = &c.summary()[0];
         assert_eq!((s.verdict(), s.better, s.uneven, s.unclear()), (Verdict::NoClearDifference, 0, 1, 1));
         // Both outputs say why it is not scored.
         let html = crate::html::report(&c);
-        assert!(html.contains(">uneven ±20.0 pp</span>") && html.contains("(1 uneven)"), "{html}");
+        assert!(html.contains(&format!(">uneven {uneven}</span>")) && html.contains("(1 uneven)"), "{html}");
         let text = crate::html::text_table(&c);
         assert!(text.contains("≠)") && text.contains("1 unclear, 1 of them uneven across rounds"), "{text}");
 
         // The even session carries no tag.
         let c = Comparison::build(drifting_session(), 0);
         assert!(c.rows[0].improvement(0, 1).unwrap().uneven(c.opts.unstable_spread_pct).is_none());
-        assert!(!crate::html::report(&c).contains(" pp</span>") && !crate::html::text_table(&c).contains("≠)"));
+        assert!(
+            !crate::html::report(&c).contains("class=bad title=\"the per-round ratios")
+                && !crate::html::text_table(&c).contains("≠)")
+        );
         assert_eq!(c.summary()[0].uneven, 0);
     }
 
+    /// A change of many multiples that is the same multiple in every round
+    /// is even, in either direction and for either kind of metric. In
+    /// percentage points its rounds are hundreds apart.
+    #[test]
+    fn steady_multiples_are_not_uneven() {
+        let mut files = drifting_session();
+        for f in &mut files {
+            for r in &mut f.workloads[0].runs {
+                let v = r.metrics["p99"].value;
+                r.metrics.insert("ops".into(), Metric::higher(v, "1/s"));
+            }
+        }
+        // Candidate: p99 40× higher (worse), ops 26× higher (better), each
+        // within ±4% from round to round.
+        for (k, r) in files[1].workloads[0].runs.iter_mut().enumerate() {
+            let wobble = if (k / 2) % 2 == 0 { 1.04 } else { 0.96 };
+            r.metrics.get_mut("p99").unwrap().value *= 40.0 / 0.9 * wobble;
+            r.metrics.get_mut("ops").unwrap().value *= 26.0 / 0.9 * wobble;
+        }
+        let c = Comparison::build(files, 0);
+        for (metric, ratio) in [("p99", 1.0 / 40.0), ("ops", 26.0)] {
+            let row = c.rows.iter().find(|r| r.metric == metric).unwrap();
+            let d = row.improvement(0, 1).unwrap();
+            assert!((d.ratio / ratio - 1.0).abs() < 0.05, "{metric}: {d:?}");
+            assert!((d.median.abs()) > 2000.0, "{metric}: a change of thousands of percent: {d:?}");
+            let spread = d.paired_spread.unwrap();
+            assert!(matches!(spread, PairedSpread::Relative(s) if (3.0..6.0).contains(&s)), "{metric}: {spread:?}");
+            assert!(d.uneven(c.opts.unstable_spread_pct).is_none(), "{metric}");
+            assert!(c.clear(row, 1, &d) && row.chartable(0, 1), "{metric}");
+        }
+        let s = &c.summary()[0];
+        assert_eq!((s.verdict(), s.better, s.worse, s.uneven), (Verdict::Mixed, 1, 1, 0));
+    }
+
+    /// A round where the candidate measured zero has a change (-100%) but
+    /// no usable ratio. It must still count: on a ratio scale the remaining
+    /// rounds (all -50%) would look perfectly even.
+    #[test]
+    fn rounds_without_a_ratio_still_count_as_uneven() {
+        let mut files = drifting_session();
+        for (f, cand) in files.iter_mut().zip([false, true]) {
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let v = match (cand, (k / 2) % 2 == 0) {
+                    (false, _) => 100.0,
+                    (true, true) => 0.0,
+                    (true, false) => 50.0,
+                };
+                r.metrics.insert("ops".into(), Metric::higher(v, "1/s"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let row = c.rows.iter().find(|r| r.metric == "ops").unwrap();
+        let d = row.improvement(0, 1).unwrap();
+        assert_eq!(d.paired_rounds, Some(6));
+        assert!((d.median + 75.0).abs() < 1e-9, "{d:?}");
+        assert!(d.notable(c.opts.min_effect_pct), "tight interval, large change: {d:?}");
+        // In percentage points of the change, all six rounds counted.
+        assert_eq!(d.paired_spread, Some(PairedSpread::Points(25.0)));
+        assert_eq!(d.uneven(c.opts.unstable_spread_pct), Some(PairedSpread::Points(25.0)));
+        assert!(row.unstable_pair(0, 1) && !c.clear(row, 1, &d) && !row.chartable(0, 1));
+        // The label agrees with the median change (4× worse), not with the
+        // median of the three ratios that exist (2× worse).
+        assert!((d.ratio - 0.25).abs() < 1e-9, "{d:?}");
+        assert!(crate::html::report(&c).contains(">uneven ±25.0 pp</span>"));
+
+        // A zero on the candidate's side of a lower-is-better metric (an
+        // infinite ratio) takes the same path.
+        let mut files = drifting_session();
+        for (k, r) in files[1].workloads[0].runs.iter_mut().enumerate() {
+            if (k / 2) % 2 == 0 {
+                r.metrics.get_mut("p99").unwrap().value = 0.0;
+            }
+        }
+        let d = Comparison::build(files, 0).rows[0].improvement(0, 1).unwrap();
+        assert!(matches!(d.paired_spread, Some(PairedSpread::Points(_))), "{d:?}");
+    }
+
+    /// Two sessions started in the same second with the same scheduler list
+    /// are still two experiments: their rounds must not be paired.
     #[test]
     fn sessions_are_told_apart_by_id_not_start_time() {
         let mut files = drifting_session();
@@ -1354,6 +1487,9 @@ mod tests {
         assert_eq!(Comparison::build(legacy, 0).rows[0].improvement(0, 1).unwrap().paired_rounds, Some(6));
     }
 
+    /// `matrix --rounds 2 --runs-per-visit 5`: ten runs per scheduler but
+    /// only two independent rounds. No per-run bootstrap (pseudoreplication):
+    /// a paired point estimate, no interval, never highlighted.
     #[test]
     fn two_rounds_give_a_point_estimate_without_interval() {
         let mut files = drifting_session();

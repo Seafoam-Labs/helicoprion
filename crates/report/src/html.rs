@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use helicoprion_core::Better;
 
-use crate::compare::{Comparison, Delta, MetricRow, Verdict};
+use crate::compare::{Comparison, Delta, MetricRow, PairedSpread, Verdict};
 use crate::esc;
 use crate::stats::MIN_RUNS_FOR_CI;
 use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_share, fmt_value, tail_chart};
@@ -43,7 +43,7 @@ footer { color: var(--ink-muted); margin-top: 40px; font-size: 12px; }
 /// when the bootstrap interval excludes zero.
 /// Text for a change cell and its class. Coloured only when `highlight`:
 /// notable (interval excludes zero, magnitude ≥ min effect) and stable.
-fn delta_cell(d: &Delta, highlight: bool, uneven_pp: f64) -> (String, &'static str) {
+fn delta_cell(d: &Delta, highlight: bool, uneven_threshold: f64) -> (String, &'static str) {
     let cls = match () {
         _ if highlight && d.median > 0.0 => "good",
         _ if highlight && d.median < 0.0 => "bad",
@@ -62,11 +62,17 @@ fn delta_cell(d: &Delta, highlight: bool, uneven_pp: f64) -> (String, &'static s
         (None, None) => format!("{} (n&lt;{MIN_RUNS_FOR_CI}){paired}", fmt_delta(d)),
     };
     let uneven = d
-        .uneven(uneven_pp)
-        .map(|pp| {
-            format!(
-                " <span class=bad title=\"the per-round changes differ by more than ±{uneven_pp} percentage points: never highlighted or charted\">uneven ±{pp:.1} pp</span>"
-            )
+        .uneven(uneven_threshold)
+        .map(|spread| {
+            let what = match spread {
+                PairedSpread::Relative(_) => format!(
+                    "the per-round ratios between the two schedulers differ from one another by more than ±{uneven_threshold}%"
+                ),
+                PairedSpread::Points(_) => format!(
+                    "some round has a zero value and so no ratio; the per-round changes differ by more than ±{uneven_threshold} percentage points"
+                ),
+            };
+            format!(" <span class=bad title=\"{what}: never highlighted or charted\">uneven {spread}</span>")
         })
         .unwrap_or_default();
     (text + &uneven, cls)
@@ -220,7 +226,7 @@ pub fn report(c: &Comparison) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x pp</em> differs between rounds by more than ±{us} percentage points (half the interquartile range of the per-round changes), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has a zero value and so no ratio, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct
@@ -421,7 +427,7 @@ pub fn text_table(c: &Comparison) -> String {
         );
         let _ = writeln!(
             out,
-            "≠ uneven: the per-round changes differ by more than ±{} percentage points, never starred",
+            "≠ uneven: the per-round ratios differ from one another by more than ±{}% (in percentage points of the change where a round has a zero value), never starred",
             c.opts.unstable_spread_pct
         );
     }
