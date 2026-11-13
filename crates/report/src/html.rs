@@ -43,7 +43,7 @@ footer { color: var(--ink-muted); margin-top: 40px; font-size: 12px; }
 /// when the bootstrap interval excludes zero.
 /// Text for a change cell and its class. Coloured only when `highlight`:
 /// notable (interval excludes zero, magnitude ≥ min effect) and stable.
-fn delta_cell(d: &Delta, highlight: bool) -> (String, &'static str) {
+fn delta_cell(d: &Delta, highlight: bool, uneven_pp: f64) -> (String, &'static str) {
     let cls = match () {
         _ if highlight && d.median > 0.0 => "good",
         _ if highlight && d.median < 0.0 => "bad",
@@ -61,7 +61,15 @@ fn delta_cell(d: &Delta, highlight: bool) -> (String, &'static str) {
         (None, Some(n)) => format!("{} (paired, {n} round(s): no interval){paired}", fmt_delta(d)),
         (None, None) => format!("{} (n&lt;{MIN_RUNS_FOR_CI}){paired}", fmt_delta(d)),
     };
-    (text, cls)
+    let uneven = d
+        .uneven(uneven_pp)
+        .map(|pp| {
+            format!(
+                " <span class=bad title=\"the per-round changes differ by more than ±{uneven_pp} percentage points: never highlighted or charted\">uneven ±{pp:.1} pp</span>"
+            )
+        })
+        .unwrap_or_default();
+    (text + &uneven, cls)
 }
 
 fn row_suffix(r: &MetricRow) -> &'static str {
@@ -102,7 +110,7 @@ fn summary_section(h: &mut String, c: &Comparison) {
     let base = esc(&c.series[c.baseline].label);
     let _ = write!(
         h,
-        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable or a minor population. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
+        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable or a minor population. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. <em>Unclear</em> counts the rest; those marked <em>uneven</em> would be clear, but the change differs too much from round to round (tagged in the table below). Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
         me = c.opts.min_effect_pct
     );
     for s in &summary {
@@ -122,7 +130,11 @@ fn summary_section(h: &mut String, c: &Comparison) {
             esc(&s.workload),
             s.better,
             s.worse,
-            s.unclear(),
+            if s.uneven > 0 {
+                format!("{} <span class=m>({} uneven)</span>", s.unclear(), s.uneven)
+            } else {
+                s.unclear().to_string()
+            },
             if top.is_empty() { "<span class=m>—</span>".to_string() } else { top.join(", ") }
         );
     }
@@ -208,7 +220,7 @@ pub fn report(c: &Comparison) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored.</p></details><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x pp</em> differs between rounds by more than ±{us} percentage points (half the interquartile range of the per-round changes), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct
@@ -254,7 +266,7 @@ pub fn report(c: &Comparison) -> String {
             if i != c.baseline {
                 match r.improvement(c.baseline, i) {
                     Some(d) => {
-                        let (text, cls) = delta_cell(&d, highlighted(c, r, i, &d));
+                        let (text, cls) = delta_cell(&d, highlighted(c, r, i, &d), c.opts.unstable_spread_pct);
                         let _ = write!(td, "<br><span class={cls}>{text}</span>");
                     }
                     None if !cell.comparable => td.push_str("<br><span class=m>params differ</span>"),
@@ -358,7 +370,13 @@ pub fn text_table(c: &Comparison) -> String {
                     if i != c.baseline {
                         match r.improvement(c.baseline, i) {
                             Some(d) => {
-                                let mark = if highlighted(c, r, i, &d) { "*" } else { "" };
+                                let mark = if highlighted(c, r, i, &d) {
+                                    "*"
+                                } else if d.uneven(c.opts.unstable_spread_pct).is_some() {
+                                    "≠"
+                                } else {
+                                    ""
+                                };
                                 s.push_str(&format!(" ({}{mark})", fmt_delta(&d)));
                             }
                             None if !cell.comparable => s.push_str(" (params differ)"),
@@ -401,6 +419,11 @@ pub fn text_table(c: &Comparison) -> String {
         out.push_str(
             "  matrix session: changes are paired round by round (median of per-round changes, rounds resampled)\n",
         );
+        let _ = writeln!(
+            out,
+            "≠ uneven: the per-round changes differ by more than ±{} percentage points, never starred",
+            c.opts.unstable_spread_pct
+        );
     }
     let summary = c.summary();
     if !summary.is_empty() {
@@ -409,7 +432,7 @@ pub fn text_table(c: &Comparison) -> String {
     for s in &summary {
         let _ = writeln!(
             out,
-            "  {} vs {} · {}: {} ({} better, {} worse, {} unclear of {} metrics)",
+            "  {} vs {} · {}: {} ({} better, {} worse, {} unclear{} of {} metrics)",
             c.series[s.series].label,
             c.series[c.baseline].label,
             s.workload,
@@ -417,6 +440,7 @@ pub fn text_table(c: &Comparison) -> String {
             s.better,
             s.worse,
             s.unclear(),
+            if s.uneven > 0 { format!(", {} of them uneven across rounds", s.uneven) } else { String::new() },
             s.compared
         );
     }

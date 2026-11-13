@@ -227,6 +227,12 @@ compared with each other.
   never highlighted, kept off the change chart. Typical case: p99.9 under
   load sitting on the edge of a ~1.6 ms plateau that holds ~0.1% of the
   samples, flipping between 40 µs and 1.4 ms from run to run.
+* **Uneven paired changes.** In a matrix session stability is judged on the
+  per-round changes, not the raw spread. When they differ by more than
+  `--unstable-spread` percentage points (half their interquartile range),
+  the change is tagged *uneven ±x pp* (`≠` in the terminal table): listed,
+  but not highlighted or charted even if its interval excludes zero. The
+  summary counts these separately among the unclear ones.
 * **Summary.** The report opens with one line per scheduler and workload:
   *better*, *worse*, *mixed* or *no clear difference* against the baseline,
   with the number of compared metrics that are clearly better, clearly

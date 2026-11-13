@@ -112,6 +112,14 @@ impl Delta {
         self.ci_excludes_zero() && self.median.abs() >= min_effect_pct
     }
 
+    /// Paired only: the per-round changes disagree by more than
+    /// `threshold_pp` percentage points (half their IQR, returned). The
+    /// schedulers then did not differ by one amount under the session's
+    /// conditions, so the median change is not scored.
+    pub fn uneven(&self, threshold_pp: f64) -> Option<f64> {
+        self.paired_spread_pp.filter(|pp| *pp > threshold_pp)
+    }
+
     /// The goodness ratio (like `ratio`) that a change of `change_pct`
     /// percent stands for; the inverse of `change()`. Monotonic, so an
     /// interval of changes maps onto an interval of ratios.
@@ -238,8 +246,8 @@ impl MetricRow {
     /// changes disagree by more than the threshold (raw run-to-run spread
     /// there is mostly drift between rounds, which pairing removes).
     pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
-        if let Some(pp) = self.improvement(baseline, i).and_then(|d| d.paired_spread_pp) {
-            return pp > self.unstable_spread_pct;
+        if let Some(d) = self.improvement(baseline, i).filter(|d| d.paired_spread_pp.is_some()) {
+            return d.uneven(self.unstable_spread_pct).is_some();
         }
         [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
     }
@@ -340,6 +348,9 @@ pub struct Summary {
     pub compared: usize,
     pub better: usize,
     pub worse: usize,
+    /// Among the unclear ones: changes that would be clear, were they not
+    /// uneven across rounds (`Delta::uneven`).
+    pub uneven: usize,
     /// The largest clear changes (up to three), largest first.
     pub top: Vec<(String, Delta)>,
 }
@@ -386,8 +397,15 @@ impl Comparison {
         let mut out = Vec::new();
         for i in (0..self.series.len()).filter(|i| *i != self.baseline) {
             for w in &workloads {
-                let mut s =
-                    Summary { series: i, workload: w.to_string(), compared: 0, better: 0, worse: 0, top: Vec::new() };
+                let mut s = Summary {
+                    series: i,
+                    workload: w.to_string(),
+                    compared: 0,
+                    better: 0,
+                    worse: 0,
+                    uneven: 0,
+                    top: Vec::new(),
+                };
                 for r in self.rows.iter().filter(|r| r.workload == *w && !r.extreme) {
                     let Some(d) = r.improvement(self.baseline, i) else { continue };
                     s.compared += 1;
@@ -398,6 +416,11 @@ impl Comparison {
                             s.worse += 1;
                         }
                         s.top.push((r.metric.clone(), d));
+                    } else if d.uneven(self.opts.unstable_spread_pct).is_some()
+                        && d.notable(self.opts.min_effect_pct)
+                        && !r.minor_pair(self.baseline, i)
+                    {
+                        s.uneven += 1;
                     }
                 }
                 // Largest first, by how far the ratio is from 1 either way.
@@ -1283,6 +1306,37 @@ mod tests {
     /// a paired point estimate, no interval, never highlighted.
     /// Two sessions started in the same second with the same scheduler list
     /// are still two experiments: their rounds must not be paired.
+    #[test]
+    fn uneven_paired_changes_are_tagged_not_scored() {
+        // The candidate is 10% better in every other round and 50% better
+        // in the rest: always better, but not by one amount.
+        let mut files = drifting_session();
+        for (k, r) in files[1].workloads[0].runs.iter_mut().enumerate() {
+            if (k / 2) % 2 == 0 {
+                r.metrics.get_mut("p99").unwrap().value *= 0.5 / 0.9;
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert!(d.notable(c.opts.min_effect_pct), "interval excludes zero, large: {d:?}");
+        let pp = d.uneven(c.opts.unstable_spread_pct).expect("uneven");
+        assert!((pp - 20.0).abs() < 1.0, "{pp}");
+        assert!(c.rows[0].unstable_pair(0, 1) && !c.clear(&c.rows[0], 1, &d) && !c.rows[0].chartable(0, 1));
+        let s = &c.summary()[0];
+        assert_eq!((s.verdict(), s.better, s.uneven, s.unclear()), (Verdict::NoClearDifference, 0, 1, 1));
+        // Both outputs say why it is not scored.
+        let html = crate::html::report(&c);
+        assert!(html.contains(">uneven ±20.0 pp</span>") && html.contains("(1 uneven)"), "{html}");
+        let text = crate::html::text_table(&c);
+        assert!(text.contains("≠)") && text.contains("1 unclear, 1 of them uneven across rounds"), "{text}");
+
+        // The even session carries no tag.
+        let c = Comparison::build(drifting_session(), 0);
+        assert!(c.rows[0].improvement(0, 1).unwrap().uneven(c.opts.unstable_spread_pct).is_none());
+        assert!(!crate::html::report(&c).contains(" pp</span>") && !crate::html::text_table(&c).contains("≠)"));
+        assert_eq!(c.summary()[0].uneven, 0);
+    }
+
     #[test]
     fn sessions_are_told_apart_by_id_not_start_time() {
         let mut files = drifting_session();
