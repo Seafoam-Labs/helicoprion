@@ -652,29 +652,43 @@ fn pong(line: &PairLine, sh: &Shared) -> Counts {
     }
 }
 
+/// Fraction of all `roundtrips` that `n` round trips are (0 if there were none).
+fn share_of(n: u64, roundtrips: u64) -> f64 {
+    if roundtrips == 0 { 0.0 } else { n as f64 / roundtrips as f64 }
+}
+
 /// p50/p99 for a sub-population (same rule for sample counts), no curve:
 /// the full histogram is kept in the result, but it is not charted.
-fn sub_population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Recorder) {
+fn sub_population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Recorder, roundtrips: u64) {
     let n = rec.count();
+    let share = share_of(n, roundtrips);
     for (q, suffix) in [(0.5, "p50"), (0.99, "p99")] {
         if n >= min_samples_for(q) {
-            m.insert(format!("{name}_{suffix}"), Metric::lower(rec.quantile(q).unwrap_or(0.0) / 1000.0, "us"));
+            let v = rec.quantile(q).unwrap_or(0.0) / 1000.0;
+            m.insert(format!("{name}_{suffix}"), Metric::lower(v, "us").share(share));
         }
     }
 }
 
 /// Insert p50/p99/p99.9/max for one population, each only if the sample
-/// count supports it; returns the quantile curve likewise truncated.
-fn population_metrics(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Recorder) -> Vec<(f64, f64)> {
+/// count supports it and tagged with the population's share of all
+/// `roundtrips`; returns the quantile curve likewise truncated.
+fn population_metrics(
+    m: &mut BTreeMap<String, Metric>,
+    name: &str,
+    rec: &Recorder,
+    roundtrips: u64,
+) -> Vec<(f64, f64)> {
     let n = rec.count();
+    let share = share_of(n, roundtrips);
     let us = |q: f64| rec.quantile(q).unwrap_or(0.0) / 1000.0;
     for (q, suffix) in [(0.5, "p50"), (0.99, "p99"), (0.999, "p99.9")] {
         if n >= min_samples_for(q) {
-            m.insert(format!("{name}_{suffix}"), Metric::lower(us(q), "us"));
+            m.insert(format!("{name}_{suffix}"), Metric::lower(us(q), "us").share(share));
         }
     }
     if let Some(max) = rec.max() {
-        m.insert(format!("{name}_max"), Metric::lower(max as f64 / 1000.0, "us").extreme());
+        m.insert(format!("{name}_max"), Metric::lower(max as f64 / 1000.0, "us").extreme().share(share));
     }
     quantile_grid().into_iter().filter(|q| n >= min_samples_for(*q)).map(|q| (q, us(q))).collect()
 }
@@ -716,11 +730,11 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
         return r;
     }
 
-    let blocked_curve = population_metrics(&mut r.metrics, POP_BLOCKED, &blocked);
-    let fast_curve = population_metrics(&mut r.metrics, POP_FAST, &fast);
+    let blocked_curve = population_metrics(&mut r.metrics, POP_BLOCKED, &blocked, roundtrips);
+    let fast_curve = population_metrics(&mut r.metrics, POP_FAST, &fast, roundtrips);
     if cpu_diag {
-        sub_population_metrics(&mut r.metrics, POP_BLOCKED_SAME, &blocked_same);
-        sub_population_metrics(&mut r.metrics, POP_BLOCKED_CROSS, &blocked_cross);
+        sub_population_metrics(&mut r.metrics, POP_BLOCKED_SAME, &blocked_same, roundtrips);
+        sub_population_metrics(&mut r.metrics, POP_BLOCKED_CROSS, &blocked_cross, roundtrips);
     }
     let m = &mut r.metrics;
     m.insert("roundtrips_per_s".into(), Metric::higher(roundtrips as f64 / window, "1/s"));
@@ -826,6 +840,22 @@ mod tests {
             [POP_BLOCKED, POP_FAST].iter().filter_map(|p| r.latency_histograms.get(*p)).map(|h| h.count).sum();
         // Ambiguous (EINTR) round trips are counted but deliberately in neither histogram.
         assert_eq!(total + c["roundtrips_ambiguous"], c["roundtrips"]);
+        // Every population metric carries its population's share of all round
+        // trips; whole-run metrics carry none.
+        let pops = [POP_BLOCKED_SAME, POP_BLOCKED_CROSS, POP_BLOCKED, POP_FAST]; // longest prefix first
+        let mut tagged = 0;
+        for (name, m) in &r.metrics {
+            match pops.iter().find(|p| name.strip_prefix(**p).is_some_and(|rest| rest.starts_with('_'))) {
+                Some(p) => {
+                    let n = c[&p.replacen("rtt_", "roundtrips_", 1)];
+                    let want = n as f64 / c["roundtrips"] as f64;
+                    assert!(m.share.is_some_and(|s| (s - want).abs() < 1e-12), "{name}: {:?} vs {want}", m.share);
+                    tagged += 1;
+                }
+                None => assert!(m.share.is_none(), "{name} is not a population metric"),
+            }
+        }
+        assert!(tagged > 0);
         // Pingers run until the common deadline, so the window cannot be shorter
         // than requested. How much longer is host-dependent and recorded in
         // `windows`, so it is not bounded here.
@@ -886,7 +916,7 @@ mod tests {
         for v in 0..500 {
             rec.record(1000 + v);
         }
-        let curve = population_metrics(&mut m, "x", &rec);
+        let curve = population_metrics(&mut m, "x", &rec, rec.count());
         assert!(m.contains_key("x_p50"));
         assert!(!m.contains_key("x_p99"), "500 samples cannot support p99");
         assert!(curve.iter().all(|(q, _)| *q <= 0.98));

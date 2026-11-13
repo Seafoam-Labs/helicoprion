@@ -41,6 +41,10 @@ pub struct Cell {
     pub session: Option<SessionKey>,
     /// Median of the valid runs of each round, for interleaved sessions.
     pub rounds: BTreeMap<u32, f64>,
+    /// Median over valid runs of the fraction (0–1) of the run's events the
+    /// metric's population holds (`Metric::share`); `None` for metrics over
+    /// everything.
+    pub share: Option<f64>,
 }
 
 /// Identifies one interleaved session: files with equal keys were measured
@@ -59,11 +63,15 @@ pub struct Options {
     /// Cells whose run-to-run spread (± half the relative IQR) exceeds this
     /// many percent are marked unstable.
     pub unstable_spread_pct: f64,
+    /// A population metric whose population holds less than this many
+    /// percent of the run's events (on either side) is a minor population:
+    /// compared in the table, never highlighted or charted.
+    pub min_share_pct: f64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { min_effect_pct: 5.0, unstable_spread_pct: 10.0 }
+        Options { min_effect_pct: 5.0, unstable_spread_pct: 10.0, min_share_pct: 1.0 }
     }
 }
 
@@ -113,6 +121,8 @@ pub struct MetricRow {
     pub extreme: bool,
     /// `Options::unstable_spread_pct` of the comparison this row belongs to.
     pub unstable_spread_pct: f64,
+    /// `Options::min_share_pct` of the comparison this row belongs to.
+    pub min_share_pct: f64,
     /// Indexed like `Comparison::series`; `None` if that file lacks the metric.
     pub cells: Vec<Option<Cell>>,
 }
@@ -211,12 +221,28 @@ impl MetricRow {
         [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
     }
 
+    /// Series `k`'s cell comes from a population that holds less than
+    /// `min_share_pct` of its run's events.
+    pub fn minor(&self, k: usize) -> bool {
+        self.cells.get(k).and_then(Option::as_ref).and_then(|c| c.share).is_some_and(|s| s * 100.0 < self.min_share_pct)
+    }
+
+    /// Either side is a minor population. Its quantiles then describe a
+    /// handful of unusual events (e.g. the few hand-offs that never slept),
+    /// so a large "change" says the populations differ, not that one
+    /// scheduler made the same events faster.
+    pub fn minor_pair(&self, baseline: usize, i: usize) -> bool {
+        self.minor(baseline) || self.minor(i)
+    }
+
     /// Whether series `i` belongs on the change chart: a scored metric that
-    /// is not a single-sample extreme, comparable, and stable on both sides.
+    /// is not a single-sample extreme, comparable, stable on both sides and
+    /// not a minor population on either side.
     pub fn chartable(&self, baseline: usize, i: usize) -> bool {
         !self.extreme
             && self.better != Better::Neither
             && !self.unstable_pair(baseline, i)
+            && !self.minor_pair(baseline, i)
             && self.improvement(baseline, i).is_some()
     }
 }
@@ -389,6 +415,16 @@ impl Comparison {
                             ));
                         }
                         let values: Vec<f64> = ms.iter().map(|m| m.value).filter(|v| v.is_finite()).collect();
+                        let shares: Vec<f64> = w
+                            .runs
+                            .iter()
+                            .filter(|r| r.valid)
+                            .filter_map(|r| {
+                                let m = r.metrics.get(&metric)?;
+                                m.share.or_else(|| legacy_share(&metric, &r.counters))
+                            })
+                            .filter(|v| v.is_finite())
+                            .collect();
                         let spread = Spread::of(&values)?;
                         Some(Cell {
                             unstable: spread.n >= 2 && spread.rel_iqr_pct() / 2.0 > opts.unstable_spread_pct,
@@ -398,10 +434,20 @@ impl Comparison {
                             comparable: units_ok && base_params.is_none_or(|p| *p == w.params),
                             session: session_key(&s.file),
                             rounds,
+                            share: median(&shares),
                         })
                     })
                     .collect();
-                MetricRow { workload, metric, unit, better, extreme, unstable_spread_pct: opts.unstable_spread_pct, cells }
+                MetricRow {
+                    workload,
+                    metric,
+                    unit,
+                    better,
+                    extreme,
+                    unstable_spread_pct: opts.unstable_spread_pct,
+                    min_share_pct: opts.min_share_pct,
+                    cells,
+                }
             })
             .collect::<Vec<_>>();
 
@@ -458,6 +504,17 @@ descriptive comparisons of medians only, not paired, without intervals",
 /// Uses the session's random id; files written before it existed fall back
 /// to start time (seconds) plus scheduler list, which two sessions started
 /// in the same second with the same list would share.
+/// Population share for wake-pingpong results written before
+/// `Metric::share` existed, so that they can be re-rendered: metric
+/// `rtt_<population>_<stat>` is backed by counter `roundtrips_<population>`
+/// out of `roundtrips`.
+fn legacy_share(metric: &str, counters: &BTreeMap<String, u64>) -> Option<f64> {
+    let (population, _stat) = metric.strip_prefix("rtt_")?.rsplit_once('_')?;
+    let n = *counters.get(&format!("roundtrips_{population}"))?;
+    let total = *counters.get("roundtrips")?;
+    (total > 0).then(|| n as f64 / total as f64)
+}
+
 pub fn session_key(f: &ResultFile) -> Option<SessionKey> {
     let d = f.design.as_ref().filter(|d| d.kind == "interleaved")?;
     Some(SessionKey(match &d.session_id {
@@ -772,6 +829,60 @@ mod tests {
         assert!(!p99.chartable(0, 1));
         let max = c.rows.iter().find(|r| r.metric == "max").unwrap();
         assert!(max.extreme && !max.chartable(0, 1));
+    }
+
+    /// Blocked/fast populations whose shares are given per side: `blocked`
+    /// out of 1000 round trips, the rest fast. `share` says whether the
+    /// metrics carry `Metric::share` or only the counters do (older files).
+    fn populations(label: &str, blocked: u64, p50: f64, share: bool) -> ResultFile {
+        let mut f = file(label, &[1.0; 5], 1);
+        for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+            let jitter = 1.0 + k as f64 * 1e-3;
+            for (pop, n) in [("blocked", blocked), ("fast", 1000 - blocked)] {
+                let s = n as f64 / 1000.0;
+                let m = Metric::lower(p50 * jitter, "us");
+                r.metrics.insert(format!("rtt_{pop}_p50"), if share { m.share(s) } else { m });
+                r.counters.insert(format!("roundtrips_{pop}"), n);
+            }
+            r.counters.insert("roundtrips".into(), 1000);
+        }
+        f
+    }
+
+    #[test]
+    fn minor_populations_are_compared_but_not_scored() {
+        for share in [true, false] {
+            // Candidate: only 5 of 1000 round trips are fast, at half the latency.
+            let c =
+                Comparison::build(vec![populations("base", 500, 10.0, share), populations("cand", 995, 5.0, share)], 0);
+            let row = |m: &str| c.rows.iter().find(|r| r.metric == m).unwrap();
+            let fast = row("rtt_fast_p50");
+            assert!((fast.cells[1].as_ref().unwrap().share.unwrap() - 0.005).abs() < 1e-12, "share={share}");
+            assert!(!fast.minor(0) && fast.minor(1) && fast.minor_pair(0, 1));
+            let d = fast.improvement(0, 1).expect("still in the table");
+            assert!(d.notable(5.0), "large, tight change...");
+            assert!(!fast.chartable(0, 1), "...but a minor population is not charted");
+            let blocked = row("rtt_blocked_p50");
+            assert!(!blocked.minor_pair(0, 1) && blocked.chartable(0, 1));
+            // Whole-run metrics have no share.
+            assert!(row("p99").cells[0].as_ref().unwrap().share.is_none());
+            // Rendered: tagged, never starred or coloured.
+            let line = |m: &str| {
+                crate::html::text_table(&c).lines().find(|l| l.starts_with(&format!("w·{m} "))).unwrap().to_string()
+            };
+            assert!(line("rtt_fast_p50").contains("°") && !line("rtt_fast_p50").contains('*'));
+            assert!(!line("rtt_blocked_p50").contains("°"));
+            let html = crate::html::report(&c);
+            assert!(html.contains(">minor 0.5%</span>"));
+        }
+        let opts = Options { min_share_pct: 0.0, ..Options::default() };
+        let c = Comparison::build_with(
+            vec![populations("base", 500, 10.0, true), populations("cand", 995, 5.0, true)],
+            0,
+            opts,
+        );
+        let fast = c.rows.iter().find(|r| r.metric == "rtt_fast_p50").unwrap();
+        assert!(!fast.minor_pair(0, 1) && fast.chartable(0, 1), "threshold 0 turns it off");
     }
 
     #[test]

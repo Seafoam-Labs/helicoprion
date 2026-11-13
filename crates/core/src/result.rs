@@ -14,6 +14,8 @@ use crate::{Scheduler, SystemInfo};
 ///    `rtt_blocked` / `rtt_fast`) instead of a single mixed distribution.
 /// 4: `Better::Neither` (informational metrics), `Metric::extreme`,
 ///    `RunResult::visit`/`round`, `ResultFile::design`. Schema 3 files still read.
+///    `Metric::share` was added later as an optional field; files without it
+///    are still schema 4.
 pub const SCHEMA_VERSION: u32 = 4;
 /// Oldest schema `compare` can read.
 pub const MIN_READABLE_SCHEMA: u32 = 3;
@@ -37,21 +39,31 @@ pub struct Metric {
     /// kept in tables.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub extreme: bool,
+    /// For a metric of one population of events (e.g. blocked round trips):
+    /// the fraction (0–1) of all the run's events that population holds.
+    /// `None` for metrics over everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<f64>,
 }
 
 impl Metric {
     pub fn lower(value: f64, unit: &str) -> Self {
-        Metric { value, unit: unit.into(), better: Better::Lower, extreme: false }
+        Metric { value, unit: unit.into(), better: Better::Lower, extreme: false, share: None }
     }
     pub fn higher(value: f64, unit: &str) -> Self {
-        Metric { value, unit: unit.into(), better: Better::Higher, extreme: false }
+        Metric { value, unit: unit.into(), better: Better::Higher, extreme: false, share: None }
     }
     pub fn info(value: f64, unit: &str) -> Self {
-        Metric { value, unit: unit.into(), better: Better::Neither, extreme: false }
+        Metric { value, unit: unit.into(), better: Better::Neither, extreme: false, share: None }
     }
     /// Mark as a single-sample extreme.
     pub fn extreme(mut self) -> Self {
         self.extreme = true;
+        self
+    }
+    /// Computed from a population holding `share` (0–1) of the run's events.
+    pub fn share(mut self, share: f64) -> Self {
+        self.share = Some(share);
         self
     }
 }

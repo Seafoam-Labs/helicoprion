@@ -522,6 +522,11 @@ struct Thresholds {
     /// is marked unstable and kept off the chart.
     #[arg(long, default_value_t = 10.0)]
     unstable_spread: f64,
+    /// Population share (in % of the run's round trips) below which a
+    /// population's metrics are marked minor: still compared in the table,
+    /// but never highlighted or charted. 0 turns this off.
+    #[arg(long, default_value_t = 1.0)]
+    min_share: f64,
 }
 
 impl Thresholds {
@@ -532,7 +537,14 @@ impl Thresholds {
         if !(self.unstable_spread.is_finite() && self.unstable_spread > 0.0) {
             bail!("--unstable-spread must be > 0");
         }
-        Ok(Options { min_effect_pct: self.min_effect, unstable_spread_pct: self.unstable_spread })
+        if !(self.min_share.is_finite() && (0.0..100.0).contains(&self.min_share)) {
+            bail!("--min-share must be >= 0 and < 100");
+        }
+        Ok(Options {
+            min_effect_pct: self.min_effect,
+            unstable_spread_pct: self.unstable_spread,
+            min_share_pct: self.min_share,
+        })
     }
 }
 

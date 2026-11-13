@@ -227,6 +227,17 @@ compared with each other.
   never highlighted, kept off the change chart. Typical case: p99.9 under
   load sitting on the edge of a ~1.6 ms plateau that holds ~0.1% of the
   samples, flipping between 40 µs and 1.4 ms from run to run.
+* **Minor populations.** Metrics of one population of events (`rtt_blocked_*`,
+  `rtt_fast_*`, the same-/cross-CPU split) carry that population's share of
+  the run's round trips. When it is below `--min-share` (default 1%) on
+  either side, the cell is tagged *minor* (`°` in the terminal table): the
+  change is still listed, but never highlighted or charted. Its quantiles
+  then describe a handful of unusual events, so a "78× worse" or "11×
+  better" there says that the populations differ (e.g. a scheduler under
+  which almost every round trip blocks, leaving 0.05% fast hand-offs), not
+  that the same events got slower or faster. Results written before the
+  share was recorded get it from the `roundtrips_*` counters, so they
+  re-render the same way. `--min-share 0` turns this off.
 * Single-sample extremes (`*_max`) and informational metrics
   (`hog_work_per_s`, which only says how CPU time was split between the
   hogs and the ping/pong threads) are listed but never scored or charted.

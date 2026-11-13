@@ -77,7 +77,19 @@ fn half_spread(rel_iqr_pct: f64) -> String {
 
 /// A row/cell combination whose change is coloured and starred.
 fn highlighted(c: &Comparison, r: &MetricRow, i: usize, d: &Delta) -> bool {
-    !r.extreme && !r.unstable_pair(c.baseline, i) && d.notable(c.opts.min_effect_pct)
+    !r.extreme && !r.unstable_pair(c.baseline, i) && !r.minor_pair(c.baseline, i) && d.notable(c.opts.min_effect_pct)
+}
+
+/// A share (0–1) as a percentage with enough digits to tell 0.05% from 0.5%.
+fn fmt_share(share: f64) -> String {
+    let p = share * 100.0;
+    if p < 0.1 {
+        format!("{p:.2}%")
+    } else if p < 10.0 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
+    }
 }
 
 pub fn report(c: &Comparison) -> String {
@@ -136,9 +148,10 @@ pub fn report(c: &Comparison) -> String {
         };
         let _ = write!(
             h,
-            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, and cells whose run-to-run spread exceeds ±{us}% (marked unstable).{paired_note}</p><figure>{svg}</figure>",
+            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, cells whose run-to-run spread exceeds ±{us}% (marked unstable), and minor populations, i.e. metrics of a population holding under {ms}% of the run's round trips on either side (marked minor).{paired_note}</p><figure>{svg}</figure>",
             me = c.opts.min_effect_pct,
-            us = c.opts.unstable_spread_pct
+            us = c.opts.unstable_spread_pct,
+            ms = c.opts.min_share_pct
         );
     }
     let tails: Vec<_> = c.distributions.iter().filter_map(|d| tail_chart(c, d)).collect();
@@ -152,9 +165,10 @@ pub fn report(c: &Comparison) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%). <em>info</em> metrics have no better direction and are never scored.</p><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=sub>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored.</p><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
-        us = c.opts.unstable_spread_pct
+        us = c.opts.unstable_spread_pct,
+        ms = c.opts.min_share_pct
     );
     for s in &c.series {
         let _ = write!(h, "<th>{}</th>", esc(&s.label));
@@ -184,6 +198,14 @@ pub fn report(c: &Comparison) -> String {
                     td,
                     " <span class=bad title=\"run-to-run spread above ±{}%\">unstable</span>",
                     c.opts.unstable_spread_pct
+                );
+            }
+            if let Some(share) = cell.share.filter(|_| r.minor(i)) {
+                let _ = write!(
+                    td,
+                    " <span class=bad title=\"this population is {s} of the run's round trips, under the {ms}% threshold: compared, never highlighted or charted\">minor {s}</span>",
+                    s = fmt_share(share),
+                    ms = c.opts.min_share_pct
                 );
             }
             if i != c.baseline {
@@ -287,6 +309,9 @@ pub fn text_table(c: &Comparison) -> String {
                     if cell.unstable {
                         s.push('~');
                     }
+                    if r.minor(i) {
+                        s.push('°');
+                    }
                     if i != c.baseline {
                         match r.improvement(c.baseline, i) {
                             Some(d) => {
@@ -326,8 +351,8 @@ pub fn text_table(c: &Comparison) -> String {
     }
     let _ = writeln!(
         out,
-        "* interval excludes zero and |change| ≥ {}% (needs ≥3 valid runs per side)\n~ unstable: run-to-run spread above ±{}%, never starred",
-        c.opts.min_effect_pct, c.opts.unstable_spread_pct
+        "* interval excludes zero and |change| ≥ {}% (needs ≥3 valid runs per side)\n~ unstable: run-to-run spread above ±{}%, never starred\n° minor population: under {}% of the run's round trips; neither it nor a change against it is starred",
+        c.opts.min_effect_pct, c.opts.unstable_spread_pct, c.opts.min_share_pct
     );
     if c.any_paired() {
         out.push_str(
