@@ -205,6 +205,23 @@ compared with each other.
   metrics without the threshold. Calibrate `--min-effect` with an A/A run on
   your hardware, or use `matrix`. There is no multiple-comparison
   correction.
+* **Paired analysis for `matrix`.** Files from one interleaved session (same
+  random `design.session_id`; files written before that field existed fall
+  back to start time and scheduler list) are compared round by round: the change is
+  computed within each round, where both schedulers ran under the same
+  conditions, the estimate is the median of those per-round changes, and
+  the interval is a bootstrap over whole rounds. Runs of one session are
+  never treated as independent samples (with `--rounds 2 --runs-per-visit
+  5` there are ten runs but only two independent rounds): with one or two
+  shared rounds the report gives the paired point estimate without an
+  interval, and with none the change of the medians, labelled as a
+  descriptive comparison (not paired) without an interval, plus a warning;
+  neither is ever highlighted. Use at least 3 rounds. Drift between rounds then cancels instead of
+  widening the interval; with simulated ±60% drift and a constant 10%
+  difference, the paired interval is about [+8%, +12%] while the unpaired
+  one on the same numbers straddles zero. Stability of a paired comparison
+  is judged by how much the per-round changes disagree, not by the raw
+  run-to-run spread, which in a `matrix` session is mostly that drift.
 * Cells whose run-to-run spread (± half the relative IQR) exceeds
   `--unstable-spread` (default 10%) are marked unstable: shown in the table,
   never highlighted, kept off the change chart. Typical case: p99.9 under

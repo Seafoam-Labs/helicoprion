@@ -45,9 +45,17 @@ fn delta_cell(d: &Delta, highlight: bool) -> (String, &'static str) {
         _ if highlight && d.median < 0.0 => "bad",
         _ => "m",
     };
-    let text = match d.ci {
-        Some((lo, hi)) => format!("{} [{} … {}]", fmt_delta(d), pct(lo), pct(hi)),
-        None => format!("{} (n&lt;{MIN_RUNS_FOR_CI})", fmt_delta(d)),
+    let paired = d
+        .paired_rounds
+        .map(|n| format!(" <span class=m title=\"paired over {n} rounds\">⇄{n}</span>"))
+        .unwrap_or_default();
+    let text = match (d.ci, d.paired_rounds) {
+        (_, None) if d.unmatched_rounds => {
+            format!("{} (no matching rounds: descriptive comparison only)", fmt_delta(d))
+        }
+        (Some((lo, hi)), _) => format!("{} [{} … {}]{paired}", fmt_delta(d), pct(lo), pct(hi)),
+        (None, Some(n)) => format!("{} (paired, {n} round(s): no interval){paired}", fmt_delta(d)),
+        (None, None) => format!("{} (n&lt;{MIN_RUNS_FOR_CI}){paired}", fmt_delta(d)),
     };
     (text, cls)
 }
@@ -121,9 +129,14 @@ pub fn report(c: &Comparison) -> String {
     h.push_str("</table>");
 
     if let Some(svg) = delta_chart(c) {
+        let paired_note = if c.any_paired() {
+            " <strong>Paired:</strong> files from one <code>matrix</code> session are compared round by round: the change is computed within each round (both schedulers measured under the same conditions), the bar is the median of those per-round changes and the interval resamples whole rounds, so drift between rounds cancels. Cells marked ⇄N were paired over N rounds. Runs of one session are never treated as independent samples: with fewer than 3 shared rounds there is a point estimate and no interval."
+        } else {
+            ""
+        };
         let _ = write!(
             h,
-            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, and cells whose run-to-run spread exceeds ±{us}% (marked unstable).</p><figure>{svg}</figure>",
+            "<h2>Change vs baseline</h2><p class=sub>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, and cells whose run-to-run spread exceeds ±{us}% (marked unstable).{paired_note}</p><figure>{svg}</figure>",
             me = c.opts.min_effect_pct,
             us = c.opts.unstable_spread_pct
         );
@@ -316,5 +329,10 @@ pub fn text_table(c: &Comparison) -> String {
         "* interval excludes zero and |change| ≥ {}% (needs ≥3 valid runs per side)\n~ unstable: run-to-run spread above ±{}%, never starred",
         c.opts.min_effect_pct, c.opts.unstable_spread_pct
     );
+    if c.any_paired() {
+        out.push_str(
+            "  matrix session: changes are paired round by round (median of per-round changes, rounds resampled)\n",
+        );
+    }
     out
 }

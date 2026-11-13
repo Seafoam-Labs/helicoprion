@@ -244,9 +244,11 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
             let cell = r.cells[*i].as_ref().expect("improvement implies cell");
             let base_cell = r.cells[c.baseline].as_ref().expect("improvement implies baseline");
             let clipped = m.abs() > extent;
-            let interval = match d.ci {
-                Some((lo, hi)) => format!("95% CI {} … {}", pct(lo), pct(hi)),
-                None => "too few runs for an interval".into(),
+            let interval = match (d.ci, d.paired_rounds) {
+                (_, None) if d.unmatched_rounds => "no matching rounds: descriptive comparison only".into(),
+                (Some((lo, hi)), Some(n)) => format!("paired over {n} rounds, 95% CI {} … {}", pct(lo), pct(hi)),
+                (Some((lo, hi)), None) => format!("95% CI {} … {}", pct(lo), pct(hi)),
+                (None, _) => "too few runs for an interval".into(),
             };
             let tip = format!(
                 "{}: {} {} — {} (median {} vs {} {}; {interval}; {} vs {} valid runs)",
@@ -470,7 +472,14 @@ mod tests {
     #[test]
     fn deltas_switch_to_multiples() {
         use crate::compare::Delta;
-        let d = |median, ratio| Delta { median, ci: None, ratio };
+        let d = |median, ratio| Delta {
+            median,
+            ci: None,
+            ratio,
+            paired_rounds: None,
+            unmatched_rounds: false,
+            paired_spread_pp: None,
+        };
         assert_eq!(fmt_delta(&d(-3298.6, 1.0 / 33.986)), "34× worse");
         assert_eq!(fmt_delta(&d(89.6, 9.6)), "9.6× better");
         assert_eq!(fmt_delta(&d(-31.4, 1.0 / 1.314)), "\u{2212}31.4%");

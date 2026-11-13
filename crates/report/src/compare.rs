@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use helicoprion_core::{Better, ResultFile, SystemInfo};
 
-use crate::stats::{Spread, bootstrap_ci};
+use crate::stats::{MIN_ROUNDS_FOR_CI, Spread, bootstrap_ci, bootstrap_median_ci, median};
 
 /// One input file as it appears in the report.
 #[derive(Debug, Clone)]
@@ -37,7 +37,16 @@ pub struct Cell {
     /// Run-to-run spread (half the relative IQR) exceeds
     /// `Options::unstable_spread_pct`: shown, but neither charted nor scored.
     pub unstable: bool,
+    /// Interleaved (`matrix`) session this cell's file came from, if any.
+    pub session: Option<SessionKey>,
+    /// Median of the valid runs of each round, for interleaved sessions.
+    pub rounds: BTreeMap<u32, f64>,
 }
+
+/// Identifies one interleaved session: files with equal keys were measured
+/// in the same rounds, so their rounds can be paired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKey(String);
 
 /// Thresholds that decide what a report highlights.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,6 +77,16 @@ pub struct Delta {
     /// "Goodness" ratio of the medians: >1 better, <1 worse
     /// (baseline/candidate for lower-is-better, candidate/baseline otherwise).
     pub ratio: f64,
+    /// Number of rounds the estimate was paired over (interleaved
+    /// sessions), or `None` for an unpaired comparison of runs.
+    pub paired_rounds: Option<usize>,
+    /// Same interleaved session as the baseline, but no round in common:
+    /// nothing could be paired, so this is a descriptive comparison of
+    /// medians only, without an interval. `paired_rounds` is `None` then.
+    pub unmatched_rounds: bool,
+    /// Paired only: half the IQR of the per-round changes, in percentage
+    /// points; how consistent the effect is from round to round.
+    pub paired_spread_pp: Option<f64>,
 }
 
 impl Delta {
@@ -92,6 +111,8 @@ pub struct MetricRow {
     pub better: Better,
     /// Single-sample extreme (e.g. max): table only.
     pub extreme: bool,
+    /// `Options::unstable_spread_pct` of the comparison this row belongs to.
+    pub unstable_spread_pct: f64,
     /// Indexed like `Comparison::series`; `None` if that file lacks the metric.
     pub cells: Vec<Option<Cell>>,
 }
@@ -125,14 +146,68 @@ impl MetricRow {
         if !s.comparable {
             return None;
         }
+        if let Some(d) = self.paired(b, s) {
+            return Some(d);
+        }
         let median = change(self.better, b.spread.median, s.spread.median)?;
         let ci = bootstrap_ci(&b.values, &s.values, |mb, mc| change(self.better, mb, mc));
         let ratio = goodness_ratio(self.better, b.spread.median, s.spread.median);
-        Some(Delta { median, ci, ratio })
+        Some(Delta { median, ci, ratio, paired_rounds: None, unmatched_rounds: false, paired_spread_pp: None })
     }
 
-    /// Either side of the comparison is unstable.
+    /// Estimate for two cells from the same interleaved session, which is
+    /// always paired: the runs of one session are not independent samples,
+    /// so they are never fed to the per-run bootstrap (pseudoreplication).
+    ///
+    /// * at least `MIN_ROUNDS_FOR_CI` shared rounds: the change is computed within
+    ///   each round (candidate vs baseline under the same conditions), the
+    ///   estimate is the median of those per-round changes, and the interval
+    ///   resamples whole rounds, so drift between rounds cancels;
+    /// * 1-2 shared rounds: the same point estimate, no interval;
+    /// * no shared rounds: the change of the medians, no interval.
+    ///
+    /// `None` only when the cells are not from one session.
+    fn paired(&self, b: &Cell, s: &Cell) -> Option<Delta> {
+        if b.session.is_none() || b.session != s.session {
+            return None;
+        }
+        let common: Vec<(f64, f64)> =
+            b.rounds.iter().filter_map(|(r, bv)| s.rounds.get(r).map(|sv| (*bv, *sv))).collect();
+        let changes: Vec<f64> = common.iter().filter_map(|(bv, sv)| change(self.better, *bv, *sv)).collect();
+        let Some(spread) = Spread::of(&changes) else {
+            return Some(Delta {
+                median: change(self.better, b.spread.median, s.spread.median)?,
+                ci: None,
+                ratio: goodness_ratio(self.better, b.spread.median, s.spread.median),
+                paired_rounds: None,
+                unmatched_rounds: true,
+                paired_spread_pp: None,
+            });
+        };
+        let ratios: Vec<f64> = common
+            .iter()
+            .map(|(bv, sv)| goodness_ratio(self.better, *bv, *sv))
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .collect();
+        Some(Delta {
+            median: spread.median,
+            // `bootstrap_median_ci` returns None below MIN_ROUNDS_FOR_CI.
+            ci: bootstrap_median_ci(&changes),
+            ratio: median(&ratios).unwrap_or(1.0),
+            paired_rounds: Some(changes.len()),
+            unmatched_rounds: false,
+            paired_spread_pp: Some((spread.q3 - spread.q1) / 2.0),
+        })
+    }
+
+    /// The comparison is too noisy to score. Unpaired: either side's
+    /// run-to-run spread is above the threshold. Paired: the per-round
+    /// changes disagree by more than the threshold (raw run-to-run spread
+    /// there is mostly drift between rounds, which pairing removes).
     pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
+        if let Some(pp) = self.improvement(baseline, i).and_then(|d| d.paired_spread_pp) {
+            return pp > self.unstable_spread_pct;
+        }
         [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
     }
 
@@ -180,6 +255,15 @@ pub struct Comparison {
 }
 
 impl Comparison {
+    /// Some candidate is compared with the baseline round by round.
+    pub fn any_paired(&self) -> bool {
+        self.rows.iter().any(|r| {
+            (0..self.series.len())
+                .filter(|i| *i != self.baseline)
+                .any(|i| r.improvement(self.baseline, i).is_some_and(|d| d.paired_rounds.is_some()))
+        })
+    }
+
     pub fn build(files: Vec<ResultFile>, baseline: usize) -> Self {
         Self::build_with(files, baseline, Options::default())
     }
@@ -276,8 +360,23 @@ impl Comparison {
                     .iter()
                     .map(|s| {
                         let w = s.file.workloads.iter().find(|w| w.name == workload)?;
-                        let ms: Vec<_> =
-                            w.runs.iter().filter(|r| r.valid).filter_map(|r| r.metrics.get(&metric)).collect();
+                        let with_round: Vec<_> = w
+                            .runs
+                            .iter()
+                            .filter(|r| r.valid)
+                            .filter_map(|r| r.metrics.get(&metric).map(|m| (r.round, m)))
+                            .collect();
+                        let ms: Vec<_> = with_round.iter().map(|(_, m)| *m).collect();
+                        let mut by_round: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
+                        for (round, m) in &with_round {
+                            if let Some(r) = round {
+                                if m.value.is_finite() {
+                                    by_round.entry(*r).or_default().push(m.value);
+                                }
+                            }
+                        }
+                        let rounds: BTreeMap<u32, f64> =
+                            by_round.into_iter().filter_map(|(r, v)| median(&v).map(|m| (r, m))).collect();
                         let units_ok = ms.iter().all(|m| m.unit == unit && m.better == better);
                         if !units_ok {
                             let (u, b) = ms
@@ -298,12 +397,36 @@ impl Comparison {
                             values,
                             total_runs: w.runs.len(),
                             comparable: units_ok && base_params.is_none_or(|p| *p == w.params),
+                            session: session_key(&s.file),
+                            rounds,
                         })
                     })
                     .collect();
-                MetricRow { workload, metric, unit, better, extreme, cells }
+                MetricRow { workload, metric, unit, better, extreme, unstable_spread_pct: opts.unstable_spread_pct, cells }
             })
             .collect::<Vec<_>>();
+
+        // Paired comparisons without enough rounds for an interval.
+        for (i, ser) in series.iter().enumerate() {
+            if i == baseline {
+                continue;
+            }
+            let deltas: Vec<Delta> = rows.iter().filter_map(|r| r.improvement(baseline, i)).collect();
+            if deltas.iter().any(|d| d.unmatched_rounds) {
+                warnings.push(format!(
+                    "{}: same matrix session as the baseline but some metrics share no round with it; those are \
+descriptive comparisons of medians only, not paired, without intervals",
+                    ser.label
+                ));
+            }
+            match deltas.iter().filter_map(|d| d.paired_rounds).min() {
+                Some(n) if n < MIN_ROUNDS_FOR_CI => warnings.push(format!(
+                    "{}: paired with the baseline over only {n} round(s); point estimates only, no intervals (use >= {MIN_ROUNDS_FOR_CI} rounds)",
+                    ser.label
+                )),
+                _ => {}
+            }
+        }
 
         let mut workloads: Vec<String> = Vec::new();
         for r in &rows {
@@ -329,6 +452,19 @@ impl Comparison {
 
         Comparison { series, baseline, opts, rows, distributions, diagnostics, warnings, env_notes }
     }
+}
+
+/// The interleaved session a file belongs to, if it came from `matrix`.
+///
+/// Uses the session's random id; files written before it existed fall back
+/// to start time (seconds) plus scheduler list, which two sessions started
+/// in the same second with the same list would share.
+pub fn session_key(f: &ResultFile) -> Option<SessionKey> {
+    let d = f.design.as_ref().filter(|d| d.kind == "interleaved")?;
+    Some(SessionKey(match &d.session_id {
+        Some(id) => format!("id:{id}"),
+        None => format!("legacy:{}:{}", f.started_at, d.schedulers.join("\u{1f}")),
+    }))
 }
 
 /// Human-readable differences that can affect results.
@@ -660,6 +796,116 @@ mod tests {
         assert!(!d.notable(5.0));
         assert!(d.notable(1.0));
         assert!((d.ratio - 100.0 / 98.0).abs() < 1e-9);
+    }
+
+    /// Two schedulers from one interleaved session with strong drift between
+    /// rounds and a constant 10% difference within every round.
+    fn drifting_session() -> Vec<ResultFile> {
+        let drift = [100.0, 140.0, 80.0, 160.0, 90.0, 130.0];
+        let mk = |label: &str, factor: f64| {
+            let mut f = file(label, &[], 1);
+            f.started_at = 42;
+            f.design = Some(helicoprion_core::Design {
+                kind: "interleaved".into(),
+                rounds: drift.len() as u32,
+                schedulers: vec!["base".into(), "cand".into()],
+                spec: label.into(),
+                session_id: Some("0123456789abcdef".into()),
+            });
+            for (round, d) in drift.iter().enumerate() {
+                for jitter in [0.99, 1.01] {
+                    let mut r = RunResult { valid: true, round: Some(round as u32), ..Default::default() };
+                    r.metrics.insert("p99".into(), Metric::lower(d * factor * jitter, "us"));
+                    f.workloads[0].runs.push(r);
+                }
+            }
+            f
+        };
+        vec![mk("base", 1.0), mk("cand", 0.9)]
+    }
+
+    #[test]
+    fn paired_rounds_cancel_drift() {
+        let c = Comparison::build(drifting_session(), 0);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert_eq!(d.paired_rounds, Some(6));
+        let (lo, hi) = d.ci.unwrap();
+        // Every round shows exactly a 10% improvement: tight, excludes zero.
+        assert!((d.median - 10.0).abs() < 1.0, "{d:?}");
+        assert!(lo > 8.0 && hi < 12.0, "{d:?}");
+        assert!(c.any_paired());
+        // Raw runs swing with the drift (unstable per run), but the paired
+        // effect is consistent, so it is charted and can be highlighted.
+        assert!(c.rows[0].cells[1].as_ref().unwrap().unstable);
+        assert!(!c.rows[0].unstable_pair(0, 1));
+        assert!(c.rows[0].chartable(0, 1));
+
+        // The same numbers without the session link: the drift swamps the effect.
+        let mut files = drifting_session();
+        files[1].design.as_mut().unwrap().session_id = Some("another-session".into());
+        let u = Comparison::build(files, 0).rows[0].improvement(0, 1).unwrap();
+        assert_eq!(u.paired_rounds, None);
+        let (ulo, uhi) = u.ci.unwrap();
+        assert!(ulo < 0.0 && uhi > 0.0, "unpaired interval should straddle zero: {u:?}");
+    }
+
+    /// `matrix --rounds 2 --runs-per-visit 5`: ten runs per scheduler but
+    /// only two independent rounds. No per-run bootstrap (pseudoreplication):
+    /// a paired point estimate, no interval, never highlighted.
+    /// Two sessions started in the same second with the same scheduler list
+    /// are still two experiments: their rounds must not be paired.
+    #[test]
+    fn sessions_are_told_apart_by_id_not_start_time() {
+        let mut files = drifting_session();
+        files[1].design.as_mut().unwrap().session_id = Some("fedcba9876543210".into());
+        assert_eq!(files[0].started_at, files[1].started_at);
+        let d = Comparison::build(files, 0).rows[0].improvement(0, 1).unwrap();
+        assert_eq!(d.paired_rounds, None);
+        assert!(!d.unmatched_rounds, "different sessions: an ordinary unpaired comparison");
+
+        // Files from before the id existed still pair by start time + list.
+        let mut legacy = drifting_session();
+        for f in &mut legacy {
+            f.design.as_mut().unwrap().session_id = None;
+        }
+        assert_eq!(Comparison::build(legacy, 0).rows[0].improvement(0, 1).unwrap().paired_rounds, Some(6));
+    }
+
+    #[test]
+    fn two_rounds_give_a_point_estimate_without_interval() {
+        let mut files = drifting_session();
+        for f in &mut files {
+            f.workloads[0].runs.retain(|r| r.round.unwrap() < 2);
+            let extra: Vec<_> = f.workloads[0].runs.clone();
+            for _ in 0..4 {
+                f.workloads[0].runs.extend(extra.iter().cloned());
+            }
+        }
+        assert_eq!(files[0].workloads[0].runs.len(), 20);
+        let c = Comparison::build(files, 0);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert_eq!(d.paired_rounds, Some(2));
+        assert!(d.ci.is_none());
+        assert!((d.median - 10.0).abs() < 1.0);
+        assert!(!d.notable(0.0));
+        assert!(c.warnings.iter().any(|w| w.contains("only 2 round")));
+    }
+
+    #[test]
+    fn same_session_without_shared_rounds_never_uses_per_run_bootstrap() {
+        let mut files = drifting_session();
+        files[0].workloads[0].runs.retain(|r| r.round.unwrap() < 3);
+        files[1].workloads[0].runs.retain(|r| r.round.unwrap() >= 3);
+        let c = Comparison::build(files, 0);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert_eq!(d.paired_rounds, None, "nothing was paired");
+        assert!(d.unmatched_rounds);
+        assert!(d.ci.is_none());
+        assert!(!c.any_paired());
+        assert!(c.warnings.iter().any(|w| w.contains("share no round") && w.contains("not paired")));
+        let html = crate::html::report(&c);
+        assert!(html.contains("no matching rounds"), "report must not call it paired");
+        assert!(!html.contains("paired, 0"));
     }
 
     #[test]

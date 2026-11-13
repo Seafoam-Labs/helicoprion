@@ -67,6 +67,40 @@ pub fn bootstrap_ci(base: &[f64], cand: &[f64], f: impl Fn(f64, f64) -> Option<f
     Some((interp(&stats, 0.025), interp(&stats, 0.975)))
 }
 
+/// Fewer paired rounds than this: no paired interval.
+pub const MIN_ROUNDS_FOR_CI: usize = 3;
+
+/// Percentile-bootstrap 95% interval of the median of `d`, resampling its
+/// elements (for paired designs: one element per round). Deterministic.
+pub fn bootstrap_median_ci(d: &[f64]) -> Option<(f64, f64)> {
+    if d.len() < MIN_ROUNDS_FOR_CI {
+        return None;
+    }
+    let mut rng = 0xD1B5_4A32_D192_ED03u64;
+    let mut buf = vec![0.0; d.len()];
+    let mut stats = Vec::with_capacity(BOOTSTRAP_ITERS);
+    for _ in 0..BOOTSTRAP_ITERS {
+        for x in &mut buf {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *x = d[(rng % d.len() as u64) as usize];
+        }
+        stats.push(median_in_place(&mut buf));
+    }
+    stats.sort_by(f64::total_cmp);
+    Some((interp(&stats, 0.025), interp(&stats, 0.975)))
+}
+
+/// Median of a slice (copied).
+pub fn median(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut c = v.to_vec();
+    Some(median_in_place(&mut c))
+}
+
 fn median_in_place(v: &mut [f64]) -> f64 {
     v.sort_by(f64::total_cmp);
     interp(v, 0.5)
