@@ -671,10 +671,18 @@ descriptive comparisons of medians only, not paired, without intervals",
                 ));
             }
             match deltas.iter().filter_map(|d| d.paired_rounds).min() {
-                Some(n) if n < MIN_ROUNDS_FOR_CI => warnings.push(format!(
-                    "{}: paired with the baseline over only {n} round(s); point estimates only, no intervals (use >= {MIN_ROUNDS_FOR_CI} rounds)",
-                    ser.label
-                )),
+                Some(n) if n < MIN_ROUNDS_FOR_CI => {
+                    let paired = deltas.iter().filter(|d| d.paired_rounds.is_some()).count();
+                    let few = deltas.iter().filter(|d| d.paired_rounds.is_some_and(|k| k < MIN_ROUNDS_FOR_CI)).count();
+                    // All of them: the session is too short. Some: those metrics
+                    // exist in few rounds only (e.g. a population that is usually empty).
+                    let which =
+                        if few == paired { "all metrics".to_string() } else { format!("{few} of {paired} metrics") };
+                    warnings.push(format!(
+                        "{}: {which} paired with the baseline over fewer than {MIN_ROUNDS_FOR_CI} rounds (as few as {n}); point estimates only for those, no intervals (a metric needs observations in at least {MIN_ROUNDS_FOR_CI} shared rounds)",
+                        ser.label
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1391,6 +1399,22 @@ mod tests {
         assert_eq!(c.summary()[0].uneven, 0);
     }
 
+    /// A metric that exists in one round only (a population that is usually
+    /// empty) must not make the warning read as if the session were short.
+    #[test]
+    fn few_rounds_warning_says_how_many_metrics() {
+        let mut files = drifting_session();
+        for f in &mut files {
+            for r in f.workloads[0].runs.iter_mut().filter(|r| r.round == Some(0)) {
+                r.metrics.insert("rare_p50".into(), Metric::lower(1.0, "us"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let w = c.warnings.iter().find(|w| w.contains("fewer than")).expect("warning");
+        assert!(w.contains("cand: 1 of 2 metrics paired") && w.contains("as few as 1"), "{w}");
+        assert!(!Comparison::build(drifting_session(), 0).warnings.iter().any(|w| w.contains("fewer than")));
+    }
+
     /// A change of many multiples that is the same multiple in every round
     /// is even, in either direction and for either kind of metric. In
     /// percentage points its rounds are hundreds apart.
@@ -1507,7 +1531,7 @@ mod tests {
         assert!(d.ci.is_none());
         assert!((d.median - 10.0).abs() < 1.0);
         assert!(!d.notable(0.0));
-        assert!(c.warnings.iter().any(|w| w.contains("only 2 round")));
+        assert!(c.warnings.iter().any(|w| w.contains("all metrics paired") && w.contains("as few as 2")));
     }
 
     #[test]
