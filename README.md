@@ -231,7 +231,8 @@ compared with each other.
   `rtt_fast_*`, the same-/cross-CPU split) carry that population's share of
   the run's round trips. When it is below `--min-share` (default 1%) on
   either side, the cell is tagged *minor* (`°` in the terminal table): the
-  change is still listed, but never highlighted or charted. Its quantiles
+  change is still listed, but never highlighted or put on the change
+  chart; on the quantile charts its curve is dashed. Its quantiles
   then describe a handful of unusual events, so a "78× worse" or "11×
   better" there says that the populations differ (e.g. a scheduler under
   which almost every round trip blocks, leaving 0.05% fast hand-offs), not

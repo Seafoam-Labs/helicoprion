@@ -7,7 +7,7 @@ use helicoprion_core::Better;
 use crate::compare::{Comparison, Delta, MetricRow};
 use crate::esc;
 use crate::stats::MIN_RUNS_FOR_CI;
-use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_value, tail_chart};
+use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_share, fmt_value, tail_chart};
 use crate::theme::{STYLE, series_var};
 
 const PAGE_CSS: &str = r#"
@@ -80,18 +80,6 @@ fn highlighted(c: &Comparison, r: &MetricRow, i: usize, d: &Delta) -> bool {
     !r.extreme && !r.unstable_pair(c.baseline, i) && !r.minor_pair(c.baseline, i) && d.notable(c.opts.min_effect_pct)
 }
 
-/// A share (0–1) as a percentage with enough digits to tell 0.05% from 0.5%.
-fn fmt_share(share: f64) -> String {
-    let p = share * 100.0;
-    if p < 0.1 {
-        format!("{p:.2}%")
-    } else if p < 10.0 {
-        format!("{p:.1}%")
-    } else {
-        format!("{p:.0}%")
-    }
-}
-
 pub fn report(c: &Comparison) -> String {
     let mut h = String::new();
     let base = &c.series[c.baseline];
@@ -156,7 +144,11 @@ pub fn report(c: &Comparison) -> String {
     }
     let tails: Vec<_> = c.distributions.iter().filter_map(|d| tail_chart(c, d)).collect();
     if !tails.is_empty() {
-        h.push_str("<h2>Latency quantiles</h2><p class=sub>One chart per population. For wake-pingpong, <code>rtt_blocked</code> are round trips in which the pinger really slept in FUTEX_WAIT (wakeup latency); <code>rtt_fast</code> are hand-offs that completed before it blocked, and are not wakeup latency. Each curve is the quantile function of the runs' log-linear histograms (bucket width ≤1.6% of value; min and max exact), median per quantile across valid runs, plotted only up to the quantile every run has enough samples for (≥10 beyond it). Series run with different workload parameters than the baseline are left out. Hover a point for its value.</p>");
+        let _ = write!(
+            h,
+            "<h2>Latency quantiles</h2><p class=sub>One chart per population. For wake-pingpong, <code>rtt_blocked</code> are round trips in which the pinger really slept in FUTEX_WAIT (wakeup latency); <code>rtt_fast</code> are hand-offs that completed before it blocked, and are not wakeup latency. Each curve is the quantile function of the runs' log-linear histograms (bucket width ≤1.6% of value; min and max exact), median per quantile across valid runs, plotted only up to the quantile every run has enough samples for (≥10 beyond it). Series run with different workload parameters than the baseline are left out. A dashed curve is a minor population, holding under {ms}% of the run's round trips: its quantiles describe a handful of unusual events, not the run. Hover a point for its value.</p>",
+            ms = c.opts.min_share_pct
+        );
         for svg in tails {
             let _ = write!(h, "<figure>{svg}</figure>");
         }

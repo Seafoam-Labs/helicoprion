@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use helicoprion_core::{Better, ResultFile, SystemInfo};
+use helicoprion_core::{Better, ResultFile, RunResult, SystemInfo};
 
 use crate::stats::{MIN_ROUNDS_FOR_CI, Spread, bootstrap_ci, bootstrap_median_ci, median};
 
@@ -278,6 +278,17 @@ pub struct Distribution {
     pub population: String,
     pub unit: String,
     pub curves: Vec<Option<Vec<(f64, f64)>>>,
+    /// Indexed like `curves`: median over valid runs of the population's
+    /// share (0–1) of the run's events, where known.
+    pub shares: Vec<Option<f64>>,
+}
+
+impl Distribution {
+    /// Series `k`'s population holds less than `min_share_pct` of its
+    /// run's events (see `MetricRow::minor`).
+    pub fn minor(&self, k: usize, min_share_pct: f64) -> bool {
+        self.shares.get(k).copied().flatten().is_some_and(|s| s * 100.0 < min_share_pct)
+    }
 }
 
 /// Diagnostic counters summed over the valid runs of one workload.
@@ -527,6 +538,19 @@ descriptive comparisons of medians only, not paired, without intervals",
 /// Uses the session's random id; files written before it existed fall back
 /// to start time (seconds) plus scheduler list, which two sessions started
 /// in the same second with the same list would share.
+/// Share of one population in a run: from any of its own metrics
+/// (`<population>_<stat>`, not a sub-population's `<population>_<sub>_<stat>`),
+/// else from the counters as for `legacy_share`.
+fn population_share(r: &RunResult, population: &str) -> Option<f64> {
+    r.metrics
+        .iter()
+        .filter(|(k, _)| {
+            k.strip_prefix(population).and_then(|s| s.strip_prefix('_')).is_some_and(|stat| !stat.contains('_'))
+        })
+        .find_map(|(_, m)| m.share)
+        .or_else(|| legacy_share(&format!("{population}_max"), &r.counters))
+}
+
 /// Population share for wake-pingpong results written before
 /// `Metric::share` existed, so that they can be re-rendered: metric
 /// `rtt_<population>_<stat>` is backed by counter `roundtrips_<population>`
@@ -644,11 +668,26 @@ fn distribution(
             (!curve.is_empty()).then_some(curve)
         })
         .collect();
+    let shares = series
+        .iter()
+        .map(|s| {
+            let w = s.file.workloads.iter().find(|w| w.name == workload)?;
+            let v: Vec<f64> = w
+                .runs
+                .iter()
+                .filter(|r| r.valid)
+                .filter_map(|r| population_share(r, population))
+                .filter(|v| v.is_finite())
+                .collect();
+            median(&v)
+        })
+        .collect();
     curves.iter().any(Option::is_some).then(|| Distribution {
         workload: workload.to_string(),
         population: population.to_string(),
         unit: reference,
         curves,
+        shares,
     })
 }
 
@@ -669,7 +708,7 @@ fn disambiguate(files: Vec<ResultFile>) -> Vec<(String, ResultFile)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use helicoprion_core::{Metric, RunResult, Scheduler, WorkloadResult};
+    use helicoprion_core::{Metric, Scheduler, WorkloadResult};
     use serde_json::json;
 
     fn file(label: &str, p99: &[f64], pairs: u32) -> ResultFile {
@@ -906,6 +945,86 @@ mod tests {
         );
         let fast = c.rows.iter().find(|r| r.metric == "rtt_fast_p50").unwrap();
         assert!(!fast.minor_pair(0, 1) && fast.chartable(0, 1), "threshold 0 turns it off");
+    }
+
+    /// 1000 round trips: 900 blocked, of which `same` on the same CPU, and
+    /// 100 fast. Sub-population names extend their parent's
+    /// (`rtt_blocked_same_cpu_p50` vs `rtt_blocked_p50`) and sort before it.
+    fn sub_populations(label: &str, same: u64, share: bool) -> ResultFile {
+        let mut f = file(label, &[1.0; 5], 1);
+        for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+            let jitter = 1.0 + k as f64 * 1e-3;
+            for (pop, n) in
+                [("blocked", 900), ("blocked_same_cpu", same), ("blocked_cross_cpu", 900 - same), ("fast", 100)]
+            {
+                let m = Metric::lower(10.0 * jitter, "us");
+                r.metrics.insert(format!("rtt_{pop}_p50"), if share { m.share(n as f64 / 1000.0) } else { m });
+                r.counters.insert(format!("roundtrips_{pop}"), n);
+            }
+            r.counters.insert("roundtrips".into(), 1000);
+        }
+        f
+    }
+
+    #[test]
+    fn sub_population_shares_are_not_mixed_with_their_parent() {
+        for share in [true, false] {
+            let c = Comparison::build(vec![sub_populations("base", 450, share), sub_populations("cand", 4, share)], 0);
+            let row = |m: &str| c.rows.iter().find(|r| r.metric == m).unwrap();
+            let cand = |m: &str| row(m).cells[1].as_ref().unwrap().share.unwrap();
+            let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+            assert!(near(cand("rtt_blocked_p50"), 0.9), "share={share}");
+            assert!(near(cand("rtt_blocked_same_cpu_p50"), 0.004), "share={share}");
+            assert!(near(cand("rtt_blocked_cross_cpu_p50"), 0.896), "share={share}");
+            assert!(row("rtt_blocked_same_cpu_p50").minor_pair(0, 1));
+            assert!(!row("rtt_blocked_p50").minor_pair(0, 1) && !row("rtt_blocked_cross_cpu_p50").minor_pair(0, 1));
+
+            // The share of a whole population, as the quantile charts take it.
+            let run = &c.series[1].file.workloads[0].runs[0];
+            for (pop, want) in [
+                ("rtt_blocked", 0.9),
+                ("rtt_blocked_same_cpu", 0.004),
+                ("rtt_blocked_cross_cpu", 0.896),
+                ("rtt_fast", 0.1),
+            ] {
+                assert!(population_share(run, pop).is_some_and(|s| near(s, want)), "{pop}, share={share}");
+            }
+            assert!(population_share(run, "rtt").is_none() && population_share(run, "rtt_blocked_same").is_none());
+        }
+    }
+
+    #[test]
+    fn minor_populations_are_dashed_on_quantile_charts() {
+        for share in [true, false] {
+            let with_curves = |mut f: ResultFile| {
+                for r in &mut f.workloads[0].runs {
+                    for pop in ["rtt_blocked", "rtt_fast"] {
+                        r.quantile_curves.insert(pop.into(), vec![(0.5, 10.0), (0.9, 20.0), (0.99, 40.0)]);
+                    }
+                    r.quantile_unit = Some("us".into());
+                }
+                f
+            };
+            let c = Comparison::build(
+                vec![
+                    with_curves(populations("base", 500, 10.0, share)),
+                    with_curves(populations("cand", 995, 5.0, share)),
+                ],
+                0,
+            );
+            let d = |p: &str| c.distributions.iter().find(|d| d.population == p).unwrap();
+            let fast = d("rtt_fast");
+            assert!(!fast.minor(0, 1.0) && fast.minor(1, 1.0), "share={share}");
+            assert!((fast.shares[1].unwrap() - 0.005).abs() < 1e-12);
+            let svg = crate::svg::tail_chart(&c, fast).unwrap();
+            assert_eq!(svg.matches("stroke-dasharray").count(), 1, "only the candidate's curve");
+            assert!(svg.contains("cand (minor 0.5%)") && svg.contains("dashed: minor population"));
+            // The note is one fixed line: series are named in labels and hover text only.
+            let note = svg.split("dashed: minor population").nth(1).unwrap().split('<').next().unwrap();
+            assert!(!note.contains("cand") && !note.contains("0.5%"), "{note}");
+            let svg = crate::svg::tail_chart(&c, d("rtt_blocked")).unwrap();
+            assert!(!svg.contains("stroke-dasharray") && !svg.contains("minor"));
+        }
     }
 
     #[test]

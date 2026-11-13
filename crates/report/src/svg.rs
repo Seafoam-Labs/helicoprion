@@ -110,6 +110,18 @@ fn interval_text(d: &crate::compare::Delta) -> String {
     }
 }
 
+/// A share (0–1) as a percentage with enough digits to tell 0.05% from 0.5%.
+pub fn fmt_share(share: f64) -> String {
+    let p = share * 100.0;
+    if p < 0.1 {
+        format!("{p:.2}%")
+    } else if p < 10.0 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
+    }
+}
+
 /// Signed percent with a real minus sign.
 pub fn pct(v: f64) -> String {
     if v.abs() < 0.05 {
@@ -371,6 +383,14 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
         return None;
     }
     let ink = Ink::new();
+    let ms = c.opts.min_share_pct;
+    // Minor populations: dashed, and named in a note and their labels.
+    let minor = |i: usize| d.minor(i, ms).then(|| d.shares[i].map(fmt_share).unwrap_or_default());
+    let label = |i: usize| match minor(i) {
+        Some(sh) => format!("{} (minor {sh})", c.series[i].label),
+        None => c.series[i].label.clone(),
+    };
+    let any_minor = curves.iter().any(|(i, _)| minor(*i).is_some());
 
     let (vmin, vmax) = curves
         .iter()
@@ -381,9 +401,9 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
 
     let width = 820.0;
     let direct = curves.len() <= 4;
-    let right =
-        if direct { curves.iter().map(|(i, _)| text_w(&c.series[*i].label)).fold(0.0, f64::max) + 40.0 } else { 24.0 };
-    let (x0, x1, top, bottom) = (64.0, width - right, 44.0, 300.0);
+    let right = if direct { curves.iter().map(|(i, _)| text_w(&label(*i))).fold(0.0, f64::max) + 40.0 } else { 24.0 };
+    let top = if any_minor { 60.0 } else { 44.0 };
+    let (x0, x1, bottom) = (64.0, width - right, 300.0 + top - 44.0);
     let height = bottom + 48.0;
     let xq0 = nines(q_min);
     let xq1 = nines(0.9999);
@@ -393,6 +413,14 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
     let title = format!("{} · {} — latency quantiles ({})", d.workload, d.population, d.unit);
     let mut s = open(width, height, &title);
     let _ = write!(s, r#"<text x="16" y="24" {} font-size="14" font-weight="600">{}</text>"#, ink.t1, esc(&title));
+    if any_minor {
+        // One fixed line: which series, and their shares, are in the labels
+        // and hover text, so the note cannot outgrow the chart.
+        let note = format!(
+            "dashed: minor population, under {ms}% of the run's round trips; a few unusual events, not the run"
+        );
+        let _ = write!(s, r#"<text x="16" y="42" {} font-size="{FONT}">{}</text>"#, ink.tm, esc(&note));
+    }
 
     // Y grid at 1/2/5 per decade.
     let mut decade = lmin;
@@ -443,9 +471,10 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
             .enumerate()
             .map(|(k, (q, v))| format!("{}{:.1},{:.1}", if k == 0 { "M" } else { " L" }, x(*q), y(*v)))
             .collect();
+        let dash = if minor(*i).is_some() { r#" stroke-dasharray="6 5""# } else { "" };
         let _ = write!(
             s,
-            r#"<path d="{path}" fill="none" {st} stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>"#,
+            r#"<path d="{path}" fill="none" {st} stroke-width="2" stroke-linejoin="round" stroke-linecap="round"{dash}/>"#,
             st = stroke(&series_token(ser.slot))
         );
         if let Some((_, v)) = pts.last() {
@@ -462,7 +491,7 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
                 cx = x(*q),
                 cy = y(*v),
                 p = paint("dot", Some(&series_token(ser.slot)), Some("surface")),
-                t = esc(&format!("{}: {tname} = {} {}", ser.label, fmt_value(*v), d.unit))
+                t = esc(&format!("{}: {tname} = {} {}", label(*i), fmt_value(*v), d.unit))
             );
         }
     }
@@ -483,7 +512,7 @@ pub fn tail_chart(c: &Comparison, d: &Distribution) -> Option<String> {
                 tx = x1 + 22.0,
                 st = stroke(&series_token(ser.slot)),
                 t2 = ink.t2,
-                t = esc(&ser.label)
+                t = esc(&label(*i))
             );
         }
     }
