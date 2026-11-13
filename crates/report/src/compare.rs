@@ -943,6 +943,11 @@ mod tests {
             assert!(!line("rtt_blocked_p50").contains("°"));
             let html = crate::html::report(&c);
             assert!(html.contains(">minor 0.5%</span>"));
+            // Explanations are folded away; each section keeps a one-line caption.
+            assert_eq!(html.matches("<details class=help>").count(), html.matches("<p class=cap>").count());
+            assert!(
+                !html.contains("<p class=sub>Bars:") && html.contains("<summary>How to read this</summary><p>Median")
+            );
         }
         let opts = Options { min_share_pct: 0.0, ..Options::default() };
         let c = Comparison::build_with(
