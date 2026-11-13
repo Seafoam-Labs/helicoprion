@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use helicoprion_core::Better;
 
-use crate::compare::{Comparison, Delta, MetricRow};
+use crate::compare::{Comparison, Delta, MetricRow, Verdict};
 use crate::esc;
 use crate::stats::MIN_RUNS_FOR_CI;
 use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_share, fmt_value, tail_chart};
@@ -81,7 +81,52 @@ fn half_spread(rel_iqr_pct: f64) -> String {
 
 /// A row/cell combination whose change is coloured and starred.
 fn highlighted(c: &Comparison, r: &MetricRow, i: usize, d: &Delta) -> bool {
-    !r.extreme && !r.unstable_pair(c.baseline, i) && !r.minor_pair(c.baseline, i) && d.notable(c.opts.min_effect_pct)
+    c.clear(r, i, d)
+}
+
+fn verdict_word(v: Verdict) -> (&'static str, &'static str) {
+    match v {
+        Verdict::Better => ("better", "good"),
+        Verdict::Worse => ("worse", "bad"),
+        Verdict::Mixed => ("mixed", "m"),
+        Verdict::NoClearDifference => ("no clear difference", "m"),
+    }
+}
+
+/// "Which result is better": one row per candidate and workload.
+fn summary_section(h: &mut String, c: &Comparison) {
+    let summary = c.summary();
+    if summary.is_empty() {
+        return;
+    }
+    let base = esc(&c.series[c.baseline].label);
+    let _ = write!(
+        h,
+        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable or a minor population. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
+        me = c.opts.min_effect_pct
+    );
+    for s in &summary {
+        let (word, cls) = verdict_word(s.verdict());
+        let top: Vec<String> = s
+            .top
+            .iter()
+            .map(|(m, d)| {
+                let cls = if d.median > 0.0 { "good" } else { "bad" };
+                format!("{} <span class={cls}>{}</span>", esc(m), fmt_delta(d))
+            })
+            .collect();
+        let _ = write!(
+            h,
+            "<tr><td>{}</td><td class=l>{}</td><td class=l><strong class={cls}>{word}</strong></td><td>{}</td><td>{}</td><td>{}</td><td class=l>{}</td></tr>",
+            esc(&c.series[s.series].label),
+            esc(&s.workload),
+            s.better,
+            s.worse,
+            s.unclear(),
+            if top.is_empty() { "<span class=m>—</span>".to_string() } else { top.join(", ") }
+        );
+    }
+    h.push_str("</table>");
 }
 
 pub fn report(c: &Comparison) -> String {
@@ -114,6 +159,8 @@ pub fn report(c: &Comparison) -> String {
     for n in &c.env_notes {
         let _ = write!(h, r#"<div class="note">{}</div>"#, esc(n));
     }
+
+    summary_section(&mut h, c);
 
     h.push_str("<h2>Systems</h2><table><tr><th>Label</th><th class=l>Scheduler</th><th class=l>Kernel</th><th class=l>CPU</th><th>CPUs</th><th class=l>Governor / EPP</th></tr>");
     for s in &c.series {
@@ -353,6 +400,24 @@ pub fn text_table(c: &Comparison) -> String {
     if c.any_paired() {
         out.push_str(
             "  matrix session: changes are paired round by round (median of per-round changes, rounds resampled)\n",
+        );
+    }
+    let summary = c.summary();
+    if !summary.is_empty() {
+        out.push_str("\nSummary (clear changes only, i.e. the starred ones; a count, not a score):\n");
+    }
+    for s in &summary {
+        let _ = writeln!(
+            out,
+            "  {} vs {} · {}: {} ({} better, {} worse, {} unclear of {} metrics)",
+            c.series[s.series].label,
+            c.series[c.baseline].label,
+            s.workload,
+            verdict_word(s.verdict()).0,
+            s.better,
+            s.worse,
+            s.unclear(),
+            s.compared
         );
     }
     out

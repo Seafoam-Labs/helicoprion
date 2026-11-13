@@ -227,6 +227,15 @@ compared with each other.
   never highlighted, kept off the change chart. Typical case: p99.9 under
   load sitting on the edge of a ~1.6 ms plateau that holds ~0.1% of the
   samples, flipping between 40 µs and 1.4 ms from run to run.
+* **Summary.** The report opens with one line per scheduler and workload:
+  *better*, *worse*, *mixed* or *no clear difference* against the baseline,
+  with the number of compared metrics that are clearly better, clearly
+  worse or unclear, and the largest clear changes. "Clear" is exactly what
+  the table colours (and the terminal table stars). It is a count, not a
+  score: metrics overlap and are not weighed against each other, and under
+  load fewer round trips can be the price of more hog work. In the HTML
+  report the explanations of each section are folded under "How to read
+  this", so results and help text stay apart.
 * **Minor populations.** Metrics of one population of events (`rtt_blocked_*`,
   `rtt_fast_*`, the same-/cross-CPU split) carry that population's share of
   the run's round trips. When it is below `--min-share` (default 1%) on

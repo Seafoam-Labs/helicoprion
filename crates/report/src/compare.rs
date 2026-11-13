@@ -314,7 +314,104 @@ pub struct Comparison {
     pub env_notes: Vec<String>,
 }
 
+/// How a candidate's clear changes on one workload add up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Some metrics clearly better, none clearly worse.
+    Better,
+    /// Some metrics clearly worse, none clearly better.
+    Worse,
+    /// Clearly better in some metrics and clearly worse in others.
+    Mixed,
+    /// No metric changed clearly either way.
+    NoClearDifference,
+}
+
+/// One candidate against the baseline on one workload, for readers who
+/// only want to know which result is better. It counts the metrics the
+/// table colours, and is no more than that count: it does not weigh one
+/// metric against another.
+#[derive(Debug, Clone)]
+pub struct Summary {
+    /// Index into `Comparison::series`.
+    pub series: usize,
+    pub workload: String,
+    /// Scored metrics both sides have, single-sample extremes aside.
+    pub compared: usize,
+    pub better: usize,
+    pub worse: usize,
+    /// The largest clear changes (up to three), largest first.
+    pub top: Vec<(String, Delta)>,
+}
+
+impl Summary {
+    pub fn verdict(&self) -> Verdict {
+        match (self.better > 0, self.worse > 0) {
+            (true, false) => Verdict::Better,
+            (false, true) => Verdict::Worse,
+            (true, true) => Verdict::Mixed,
+            (false, false) => Verdict::NoClearDifference,
+        }
+    }
+
+    /// Compared metrics without a clear change: within the noise band, an
+    /// interval that includes zero or is missing, unstable, or a minor
+    /// population.
+    pub fn unclear(&self) -> usize {
+        self.compared - self.better - self.worse
+    }
+}
+
 impl Comparison {
+    /// The change of series `i` in row `r` is one the report colours and
+    /// stars: not a single-sample extreme, stable, not a minor population
+    /// on either side, interval excludes zero, at least the minimum effect.
+    pub fn clear(&self, r: &MetricRow, i: usize, d: &Delta) -> bool {
+        !r.extreme
+            && !r.unstable_pair(self.baseline, i)
+            && !r.minor_pair(self.baseline, i)
+            && d.notable(self.opts.min_effect_pct)
+    }
+
+    /// Per candidate and workload, how many compared metrics are clearly
+    /// better or worse than the baseline. Workloads the candidate cannot
+    /// be compared on (missing, or different parameters) are left out.
+    pub fn summary(&self) -> Vec<Summary> {
+        let mut workloads: Vec<&str> = Vec::new();
+        for r in &self.rows {
+            if !workloads.contains(&r.workload.as_str()) {
+                workloads.push(&r.workload);
+            }
+        }
+        let mut out = Vec::new();
+        for i in (0..self.series.len()).filter(|i| *i != self.baseline) {
+            for w in &workloads {
+                let mut s =
+                    Summary { series: i, workload: w.to_string(), compared: 0, better: 0, worse: 0, top: Vec::new() };
+                for r in self.rows.iter().filter(|r| r.workload == *w && !r.extreme) {
+                    let Some(d) = r.improvement(self.baseline, i) else { continue };
+                    s.compared += 1;
+                    if self.clear(r, i, &d) {
+                        if d.median > 0.0 {
+                            s.better += 1;
+                        } else {
+                            s.worse += 1;
+                        }
+                        s.top.push((r.metric.clone(), d));
+                    }
+                }
+                // Largest first, by how far the ratio is from 1 either way.
+                let size = |d: &Delta| if d.ratio > 0.0 && d.ratio.is_finite() { d.ratio.ln().abs() } else { 0.0 };
+                s.top.sort_by(|a, b| size(&b.1).total_cmp(&size(&a.1)));
+                s.top.truncate(3);
+                if s.compared > 0 {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
     /// Some candidate is compared with the baseline round by round.
     pub fn any_paired(&self) -> bool {
         self.rows.iter().any(|r| {
@@ -1003,6 +1100,47 @@ mod tests {
             }
             assert!(population_share(run, "rtt").is_none() && population_share(run, "rtt_blocked_same").is_none());
         }
+    }
+
+    #[test]
+    fn summary_counts_only_clear_changes() {
+        // One workload, lower is better: p50 and p99 (the helper's metrics).
+        let c = Comparison::build(
+            vec![
+                file("base", &[100.0, 101.0, 99.0, 100.5, 99.5], 1),
+                file("same", &[100.2, 100.8, 99.4, 100.1, 99.9], 1),
+                file("slow", &[150.0, 151.0, 149.0, 150.5, 149.5], 1),
+                file("other", &[50.0, 50.5, 49.5, 50.2, 49.8], 8),
+            ],
+            0,
+        );
+        let s = c.summary();
+        let of = |label: &str| s.iter().find(|s| c.series[s.series].label == label);
+        let same = of("same").unwrap();
+        assert_eq!((same.verdict(), same.better, same.worse), (Verdict::NoClearDifference, 0, 0));
+        assert_eq!(same.unclear(), same.compared);
+        // The helper's two metrics move together: a higher p99 (worse) comes
+        // with more ops (better), so the count does not pick a side.
+        let slow = of("slow").unwrap();
+        assert_eq!((slow.verdict(), slow.better, slow.worse, slow.unclear()), (Verdict::Mixed, 1, 1, 0));
+        assert_eq!(slow.top.len(), 2);
+        assert!(of("other").is_none(), "different parameters: nothing to compare");
+
+        // A minor population's change is compared, never counted as clear.
+        let c = Comparison::build(vec![populations("base", 500, 10.0, true), populations("cand", 995, 5.0, true)], 0);
+        let s = &c.summary()[0];
+        assert!(!s.top.iter().any(|(m, _)| m == "rtt_fast_p50"));
+        assert!(s.top.iter().any(|(m, _)| m == "rtt_blocked_p50"));
+        assert_eq!((s.verdict(), s.better, s.worse), (Verdict::Better, 1, 0));
+        // The same two files with the other one as baseline read as worse.
+        let flipped =
+            Comparison::build(vec![populations("base", 500, 10.0, true), populations("cand", 995, 5.0, true)], 1);
+        assert_eq!(flipped.summary()[0].verdict(), Verdict::Worse);
+
+        // Rendered in both outputs.
+        let html = crate::html::report(&c);
+        assert!(html.contains("<h2>Summary</h2>") && html.contains("class=good>better</strong>"));
+        assert!(crate::html::text_table(&c).contains("cand vs base · w: better"));
     }
 
     #[test]
