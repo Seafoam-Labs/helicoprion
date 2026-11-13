@@ -196,7 +196,7 @@ pub fn report(c: &Comparison) -> String {
                 let _ = write!(
                     td,
                     " <span class=bad title=\"this population is {s} of the run's round trips, under the {ms}% threshold: compared, never highlighted or charted\">minor {s}</span>",
-                    s = fmt_share(share),
+                    s = esc(&fmt_share(share)),
                     ms = c.opts.min_share_pct
                 );
             }

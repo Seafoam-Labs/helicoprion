@@ -113,7 +113,10 @@ fn interval_text(d: &crate::compare::Delta) -> String {
 /// A share (0–1) as a percentage with enough digits to tell 0.05% from 0.5%.
 pub fn fmt_share(share: f64) -> String {
     let p = share * 100.0;
-    if p < 0.1 {
+    if p > 0.0 && p < 0.01 {
+        // Not "0.00%": the population is tiny, not empty.
+        "<0.01%".into()
+    } else if p < 0.1 {
         format!("{p:.2}%")
     } else if p < 10.0 {
         format!("{p:.1}%")
@@ -606,6 +609,15 @@ mod tests {
         assert!(interval_text(&d(Some((-8.0, -4.0)), Some(5), false)).starts_with("paired over 5 rounds"));
         assert_eq!(interval_text(&d(None, None, false)), "too few runs for an interval");
         assert!(interval_text(&d(None, None, true)).contains("descriptive"));
+    }
+
+    #[test]
+    fn shares_keep_tiny_apart_from_empty() {
+        assert_eq!(fmt_share(0.0), "0.00%");
+        assert_eq!(fmt_share(0.00006), "<0.01%");
+        assert_eq!(fmt_share(0.0004), "0.04%");
+        assert_eq!(fmt_share(0.005), "0.5%");
+        assert_eq!(fmt_share(0.15), "15%");
     }
 
     #[test]

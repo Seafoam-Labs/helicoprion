@@ -453,10 +453,7 @@ impl Comparison {
                             .runs
                             .iter()
                             .filter(|r| r.valid)
-                            .filter_map(|r| {
-                                let m = r.metrics.get(&metric)?;
-                                m.share.or_else(|| legacy_share(&metric, &r.counters))
-                            })
+                            .filter_map(|r| metric_share(r, &metric))
                             .filter(|v| v.is_finite())
                             .collect();
                         let spread = Spread::of(&values)?;
@@ -533,11 +530,6 @@ descriptive comparisons of medians only, not paired, without intervals",
     }
 }
 
-/// The interleaved session a file belongs to, if it came from `matrix`.
-///
-/// Uses the session's random id; files written before it existed fall back
-/// to start time (seconds) plus scheduler list, which two sessions started
-/// in the same second with the same list would share.
 /// Share of one population in a run: from any of its own metrics
 /// (`<population>_<stat>`, not a sub-population's `<population>_<sub>_<stat>`),
 /// else from the counters as for `legacy_share`.
@@ -551,6 +543,16 @@ fn population_share(r: &RunResult, population: &str) -> Option<f64> {
         .or_else(|| legacy_share(&format!("{population}_max"), &r.counters))
 }
 
+/// Share of the population behind `metric` (`<population>_<stat>`) in a
+/// run, whether or not the run has that metric. A run with too few events
+/// for, say, a p99 still counts: taking only the runs that report the
+/// metric would take the ones where the population happened to be largest,
+/// and give two rows of one population different shares. `None` for
+/// metrics over everything.
+fn metric_share(r: &RunResult, metric: &str) -> Option<f64> {
+    r.metrics.get(metric).and_then(|m| m.share).or_else(|| population_share(r, metric.rsplit_once('_')?.0))
+}
+
 /// Population share for wake-pingpong results written before
 /// `Metric::share` existed, so that they can be re-rendered: metric
 /// `rtt_<population>_<stat>` is backed by counter `roundtrips_<population>`
@@ -562,6 +564,11 @@ fn legacy_share(metric: &str, counters: &BTreeMap<String, u64>) -> Option<f64> {
     (total > 0).then(|| n as f64 / total as f64)
 }
 
+/// The interleaved session a file belongs to, if it came from `matrix`.
+///
+/// Uses the session's random id; files written before it existed fall back
+/// to start time (seconds) plus scheduler list, which two sessions started
+/// in the same second with the same list would share.
 pub fn session_key(f: &ResultFile) -> Option<SessionKey> {
     let d = f.design.as_ref().filter(|d| d.kind == "interleaved")?;
     Some(SessionKey(match &d.session_id {
@@ -990,6 +997,33 @@ mod tests {
                 assert!(population_share(run, pop).is_some_and(|s| near(s, want)), "{pop}, share={share}");
             }
             assert!(population_share(run, "rtt").is_none() && population_share(run, "rtt_blocked_same").is_none());
+        }
+    }
+
+    #[test]
+    fn a_population_has_one_share_whichever_runs_report_the_metric() {
+        for share in [true, false] {
+            // 5 runs; the population is 0.1% of round trips except in the last
+            // run (4%), the only one with enough events for a p99.
+            let mut f = file("a", &[1.0; 5], 1);
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let n = if k == 4 { 40 } else { 1 };
+                let m = |v: f64| {
+                    let m = Metric::lower(v, "us");
+                    if share { m.share(n as f64 / 1000.0) } else { m }
+                };
+                r.metrics.insert("rtt_blocked_same_cpu_p50".into(), m(5.0));
+                if k == 4 {
+                    r.metrics.insert("rtt_blocked_same_cpu_p99".into(), m(60.0));
+                }
+                r.counters.insert("roundtrips_blocked_same_cpu".into(), n);
+                r.counters.insert("roundtrips".into(), 1000);
+            }
+            let c = Comparison::build(vec![f.clone(), f], 0);
+            let s = |m: &str| c.rows.iter().find(|r| r.metric == m).unwrap().cells[0].as_ref().unwrap().share;
+            assert_eq!(s("rtt_blocked_same_cpu_p50"), Some(0.001), "share={share}");
+            assert_eq!(s("rtt_blocked_same_cpu_p99"), Some(0.001), "share={share}: not 4% from the one run");
+            assert_eq!(s("p99"), None);
         }
     }
 
