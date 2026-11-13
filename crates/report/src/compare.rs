@@ -94,6 +94,11 @@ pub struct Delta {
     pub unmatched_rounds: bool,
     /// Paired only: how consistent the effect is from round to round.
     pub paired_spread: Option<PairedSpread>,
+    /// Paired only: shared rounds left out of the estimate because the
+    /// baseline measured zero there, which leaves the percentage change
+    /// undefined. The estimate then describes only the other rounds, so a
+    /// change with any such round is never scored.
+    pub undefined_rounds: usize,
     /// Direction of the metric, to turn a change back into a ratio.
     pub better: Better,
 }
@@ -137,8 +142,10 @@ pub enum PairedSpread {
     /// whichever direction the metric and the change have.
     Relative(f64),
     /// In percentage points, between the per-round changes: half their
-    /// IQR. Used when some round has no usable ratio (a zero on one side),
-    /// so that such a round still counts; a ratio scale would drop it.
+    /// IQR. Used when some round has no usable ratio (zero or not finite:
+    /// typically a zero on the candidate's side, possibly a ratio too large
+    /// to represent), so that such a round still counts; a ratio scale
+    /// would drop it.
     Points(f64),
 }
 
@@ -226,6 +233,7 @@ impl MetricRow {
             paired_rounds: None,
             unmatched_rounds: false,
             paired_spread: None,
+            undefined_rounds: 0,
             better: self.better,
         })
     }
@@ -262,6 +270,7 @@ impl MetricRow {
                 paired_rounds: None,
                 unmatched_rounds: true,
                 paired_spread: None,
+                undefined_rounds: common.len(),
                 better: self.better,
             });
         };
@@ -283,6 +292,7 @@ impl MetricRow {
             paired_rounds: Some(changes.len()),
             unmatched_rounds: false,
             paired_spread,
+            undefined_rounds: common.len() - rounds.len(),
             better: self.better,
         })
     }
@@ -292,7 +302,11 @@ impl MetricRow {
     /// changes disagree by more than the threshold (raw run-to-run spread
     /// there is mostly drift between rounds, which pairing removes).
     pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
-        if let Some(d) = self.improvement(baseline, i).filter(|d| d.paired_spread.is_some()) {
+        let d = self.improvement(baseline, i);
+        if d.as_ref().is_some_and(|d| d.undefined_rounds > 0) {
+            return true;
+        }
+        if let Some(d) = d.filter(|d| d.paired_spread.is_some()) {
             return d.uneven(self.unstable_spread_pct).is_some();
         }
         [baseline, i].iter().any(|k| self.cells.get(*k).and_then(Option::as_ref).is_some_and(|c| c.unstable))
@@ -667,6 +681,14 @@ impl Comparison {
                 warnings.push(format!(
                     "{}: same matrix session as the baseline but some metrics share no round with it; those are \
 descriptive comparisons of medians only, not paired, without intervals",
+                    ser.label
+                ));
+            }
+            let undefined = deltas.iter().filter(|d| d.undefined_rounds > 0).count();
+            if undefined > 0 {
+                warnings.push(format!(
+                    "{}: for {undefined} metric(s) the baseline measured zero in some shared rounds, where a percentage \
+change is undefined; those rounds are left out of the estimate, so these metrics are not scored",
                     ser.label
                 ));
             }
@@ -1490,6 +1512,46 @@ mod tests {
         }
         let d = Comparison::build(files, 0).rows[0].improvement(0, 1).unwrap();
         assert!(matches!(d.paired_spread, Some(PairedSpread::Points(_))), "{d:?}");
+    }
+
+    /// A round where the baseline measured zero has no percentage change at
+    /// all. Dropping it silently would leave three rounds of a steady -50%
+    /// out of six, in three of which the candidate did better than nothing.
+    #[test]
+    fn rounds_with_a_zero_baseline_block_scoring() {
+        let mut files = drifting_session();
+        for (f, cand) in files.iter_mut().zip([false, true]) {
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let v = match (cand, (k / 2) % 2 == 0) {
+                    (true, _) => 50.0,
+                    (false, true) => 0.0,
+                    (false, false) => 100.0,
+                };
+                r.metrics.insert("ops".into(), Metric::higher(v, "1/s"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let row = c.rows.iter().find(|r| r.metric == "ops").unwrap();
+        let d = row.improvement(0, 1).unwrap();
+        // What the three usable rounds say, taken alone: a tight -50%.
+        assert_eq!((d.paired_rounds, d.undefined_rounds), (Some(3), 3));
+        assert!((d.median + 50.0).abs() < 1e-9 && d.notable(c.opts.min_effect_pct), "{d:?}");
+        assert_eq!(d.paired_spread, Some(PairedSpread::Relative(0.0)));
+        assert!(d.uneven(c.opts.unstable_spread_pct).is_none(), "not an unevenness problem");
+        // Not scored anywhere, and the report says why.
+        assert!(row.unstable_pair(0, 1) && !c.clear(row, 1, &d) && !row.chartable(0, 1));
+        let s = &c.summary()[0];
+        assert_eq!((s.worse, s.uneven), (0, 0), "{s:?}");
+        assert!(c.warnings.iter().any(|w| w.contains("cand: for 1 metric(s) the baseline measured zero")));
+        assert!(crate::html::report(&c).contains(">3 of 6 rounds undefined</span>"));
+        let text = crate::html::text_table(&c);
+        assert!(text.contains("worse?)") && text.contains("? baseline measured zero"), "{text}");
+
+        // p99 of the same session has a change in every round: untouched.
+        let p99 = c.rows.iter().find(|r| r.metric == "p99").unwrap();
+        let d = p99.improvement(0, 1).unwrap();
+        assert_eq!(d.undefined_rounds, 0);
+        assert!(c.clear(p99, 1, &d));
     }
 
     /// Two sessions started in the same second with the same scheduler list

@@ -234,9 +234,13 @@ compared with each other.
   relative scale, so a steady "26× better" counts as even), the change is
   tagged *uneven ±x%* (`≠` in the terminal table): listed, but not
   highlighted or charted even if its interval excludes zero. The summary
-  counts these separately among the unclear ones. A round where one side
-  measured zero has no ratio; such rounds are not dropped: the per-round
-  changes are then compared in percentage points (*uneven ±x pp*).
+  counts these separately among the unclear ones. A round without a usable
+  ratio (typically the candidate measured zero) is not dropped: the
+  per-round changes are then compared in percentage points (*uneven ±x
+  pp*). A round where the baseline measured zero has no percentage change
+  at all; the estimate then covers the other rounds only, the change is
+  tagged *n of m rounds undefined* (`?` in the terminal table) and is not
+  scored.
 * **Summary.** The report opens with one line per scheduler and workload:
   *better*, *worse*, *mixed* or *no clear difference* against the baseline,
   with the number of compared metrics that are clearly better, clearly

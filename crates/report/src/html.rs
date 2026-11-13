@@ -69,13 +69,20 @@ fn delta_cell(d: &Delta, highlight: bool, uneven_threshold: f64) -> (String, &'s
                     "the per-round ratios between the two schedulers differ from one another by more than ±{uneven_threshold}%"
                 ),
                 PairedSpread::Points(_) => format!(
-                    "some round has a zero value and so no ratio; the per-round changes differ by more than ±{uneven_threshold} percentage points"
+                    "in some round the ratio between the two schedulers is zero or not finite (typically a zero value); the per-round changes differ by more than ±{uneven_threshold} percentage points"
                 ),
             };
             format!(" <span class=bad title=\"{what}: never highlighted or charted\">uneven {spread}</span>")
         })
         .unwrap_or_default();
-    (text + &uneven, cls)
+    let undefined = match (d.undefined_rounds, d.paired_rounds) {
+        (0, _) | (_, None) => String::new(),
+        (n, Some(used)) => format!(
+            " <span class=bad title=\"the baseline measured zero in {n} of the {all} shared rounds, where a percentage change is undefined; the estimate covers the other {used} only, so it is never highlighted or charted\">{n} of {all} rounds undefined</span>",
+            all = n + used
+        ),
+    };
+    (text + &uneven + &undefined, cls)
 }
 
 fn row_suffix(r: &MetricRow) -> &'static str {
@@ -226,7 +233,7 @@ pub fn report(c: &Comparison) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has a zero value and so no ratio, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. A change tagged <em>n of m rounds undefined</em> comes from a session where the baseline measured zero in some rounds: a percentage change does not exist there, the estimate covers the other rounds only, and it is not scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has no usable ratio, typically a zero value, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct
@@ -378,6 +385,8 @@ pub fn text_table(c: &Comparison) -> String {
                             Some(d) => {
                                 let mark = if highlighted(c, r, i, &d) {
                                     "*"
+                                } else if d.undefined_rounds > 0 {
+                                    "?"
                                 } else if d.uneven(c.opts.unstable_spread_pct).is_some() {
                                     "≠"
                                 } else {
@@ -427,7 +436,7 @@ pub fn text_table(c: &Comparison) -> String {
         );
         let _ = writeln!(
             out,
-            "≠ uneven: the per-round ratios differ from one another by more than ±{}% (in percentage points of the change where a round has a zero value), never starred",
+            "≠ uneven: the per-round ratios differ from one another by more than ±{}% (in percentage points of the change where a round has no usable ratio), never starred\n? baseline measured zero in some shared rounds: the change is undefined there and those rounds are left out, never starred",
             c.opts.unstable_spread_pct
         );
     }
