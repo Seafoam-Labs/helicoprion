@@ -71,6 +71,18 @@ fn times(x: f64) -> String {
     if x >= 10.0 { format!("{x:.0}") } else { format!("{x:.1}") }
 }
 
+/// How the interval of a change came about, for tooltips; worded like the
+/// table so the two never disagree.
+fn interval_text(d: &crate::compare::Delta) -> String {
+    match (d.ci, d.paired_rounds) {
+        (_, None) if d.unmatched_rounds => "no matching rounds: descriptive comparison only".into(),
+        (Some((lo, hi)), Some(n)) => format!("paired over {n} rounds, 95% CI {} … {}", pct(lo), pct(hi)),
+        (Some((lo, hi)), None) => format!("95% CI {} … {}", pct(lo), pct(hi)),
+        (None, Some(n)) => format!("paired over {n} round(s): no interval (needs ≥3 rounds)"),
+        (None, None) => "too few runs for an interval".into(),
+    }
+}
+
 /// Signed percent with a real minus sign.
 pub fn pct(v: f64) -> String {
     if v.abs() < 0.05 {
@@ -244,12 +256,7 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
             let cell = r.cells[*i].as_ref().expect("improvement implies cell");
             let base_cell = r.cells[c.baseline].as_ref().expect("improvement implies baseline");
             let clipped = m.abs() > extent;
-            let interval = match (d.ci, d.paired_rounds) {
-                (_, None) if d.unmatched_rounds => "no matching rounds: descriptive comparison only".into(),
-                (Some((lo, hi)), Some(n)) => format!("paired over {n} rounds, 95% CI {} … {}", pct(lo), pct(hi)),
-                (Some((lo, hi)), None) => format!("95% CI {} … {}", pct(lo), pct(hi)),
-                (None, _) => "too few runs for an interval".into(),
-            };
+            let interval = interval_text(&d);
             let tip = format!(
                 "{}: {} {} — {} (median {} vs {} {}; {interval}; {} vs {} valid runs)",
                 ser.label,
@@ -484,6 +491,23 @@ mod tests {
         assert_eq!(fmt_delta(&d(89.6, 9.6)), "9.6× better");
         assert_eq!(fmt_delta(&d(-31.4, 1.0 / 1.314)), "\u{2212}31.4%");
         assert_eq!(fmt_delta(&d(50.0, 2.0)), "2.0× better");
+    }
+
+    #[test]
+    fn tooltip_interval_matches_the_pairing() {
+        use crate::compare::Delta;
+        let d = |ci, paired_rounds, unmatched_rounds| Delta {
+            median: -6.0,
+            ci,
+            ratio: 0.94,
+            paired_rounds,
+            unmatched_rounds,
+            paired_spread_pp: None,
+        };
+        assert_eq!(interval_text(&d(None, Some(2), false)), "paired over 2 round(s): no interval (needs ≥3 rounds)");
+        assert!(interval_text(&d(Some((-8.0, -4.0)), Some(5), false)).starts_with("paired over 5 rounds"));
+        assert_eq!(interval_text(&d(None, None, false)), "too few runs for an interval");
+        assert!(interval_text(&d(None, None, true)).contains("descriptive"));
     }
 
     #[test]
