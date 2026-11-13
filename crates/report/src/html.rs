@@ -39,11 +39,15 @@ details.help p { color: var(--ink-2); margin: 6px 0 0; padding-left: 12px; borde
 footer { color: var(--ink-muted); margin-top: 40px; font-size: 12px; }
 "#;
 
-/// Text for a change cell: value, and a class that only marks a win/loss
-/// when the bootstrap interval excludes zero.
 /// Text for a change cell and its class. Coloured only when `highlight`:
 /// notable (interval excludes zero, magnitude ≥ min effect) and stable.
-fn delta_cell(d: &Delta, highlight: bool, uneven_threshold: f64) -> (String, &'static str) {
+/// `uneven` is `Comparison::held_back_by_unevenness` for the cell.
+fn delta_cell(
+    d: &Delta,
+    highlight: bool,
+    uneven: Option<PairedSpread>,
+    uneven_threshold: f64,
+) -> (String, &'static str) {
     let cls = match () {
         _ if highlight && d.median > 0.0 => "good",
         _ if highlight && d.median < 0.0 => "bad",
@@ -61,8 +65,7 @@ fn delta_cell(d: &Delta, highlight: bool, uneven_threshold: f64) -> (String, &'s
         (None, Some(n)) => format!("{} (paired, {n} round(s): no interval){paired}", fmt_delta(d)),
         (None, None) => format!("{} (n&lt;{MIN_RUNS_FOR_CI}){paired}", fmt_delta(d)),
     };
-    let uneven = d
-        .uneven(uneven_threshold)
+    let uneven = uneven
         .map(|spread| {
             let what = match spread {
                 PairedSpread::Relative(_) => format!(
@@ -279,7 +282,12 @@ pub fn report(c: &Comparison) -> String {
             if i != c.baseline {
                 match r.improvement(c.baseline, i) {
                     Some(d) => {
-                        let (text, cls) = delta_cell(&d, highlighted(c, r, i, &d), c.opts.unstable_spread_pct);
+                        let (text, cls) = delta_cell(
+                            &d,
+                            highlighted(c, r, i, &d),
+                            c.held_back_by_unevenness(r, i, &d),
+                            c.opts.unstable_spread_pct,
+                        );
                         let _ = write!(td, "<br><span class={cls}>{text}</span>");
                     }
                     None if !cell.comparable => td.push_str("<br><span class=m>params differ</span>"),
@@ -387,7 +395,7 @@ pub fn text_table(c: &Comparison) -> String {
                                     "*"
                                 } else if d.undefined_rounds > 0 {
                                     "?"
-                                } else if d.uneven(c.opts.unstable_spread_pct).is_some() {
+                                } else if c.held_back_by_unevenness(r, i, &d).is_some() {
                                     "≠"
                                 } else {
                                     ""

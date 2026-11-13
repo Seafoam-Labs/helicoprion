@@ -453,6 +453,22 @@ impl Comparison {
             && d.notable(self.opts.min_effect_pct)
     }
 
+    /// The change would be clear (`clear`), were its rounds not uneven:
+    /// unevenness is the one reason it is not scored. The report tags
+    /// exactly these and the summary counts exactly these, so the two
+    /// agree. Not so for a single-sample extreme, a change without an
+    /// interval or with one that includes zero, one below the minimum
+    /// effect, a minor population, or rounds with an undefined change:
+    /// there something else already keeps the change from being scored,
+    /// and an "uneven" tag would explain nothing.
+    pub fn held_back_by_unevenness(&self, r: &MetricRow, i: usize, d: &Delta) -> Option<PairedSpread> {
+        if r.extreme || !d.notable(self.opts.min_effect_pct) || r.minor_pair(self.baseline, i) || d.undefined_rounds > 0
+        {
+            return None;
+        }
+        d.uneven(self.opts.unstable_spread_pct)
+    }
+
     /// Per candidate and workload, how many compared metrics are clearly
     /// better or worse than the baseline. Workloads the candidate cannot
     /// be compared on (missing, or different parameters) are left out.
@@ -485,10 +501,7 @@ impl Comparison {
                             s.worse += 1;
                         }
                         s.top.push((r.metric.clone(), d));
-                    } else if d.uneven(self.opts.unstable_spread_pct).is_some()
-                        && d.notable(self.opts.min_effect_pct)
-                        && !r.minor_pair(self.baseline, i)
-                    {
+                    } else if self.held_back_by_unevenness(r, i, &d).is_some() {
                         s.uneven += 1;
                     }
                 }
@@ -1469,6 +1482,79 @@ mod tests {
         }
         let s = &c.summary()[0];
         assert_eq!((s.verdict(), s.better, s.worse, s.uneven), (Verdict::Mixed, 1, 1, 0));
+    }
+
+    /// The uneven tag explains why a change that looks clear is not scored,
+    /// so it is shown only where unevenness is the one reason, and the
+    /// summary counts the same changes.
+    #[test]
+    fn uneven_tag_is_shown_only_where_it_is_the_reason() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Case {
+            Plain,
+            Extreme,
+            TwoRounds,
+            IntervalIncludesZero,
+            BelowMinEffect,
+            Minor,
+            UndefinedRound,
+        }
+        let session = |case: Case| {
+            let mut files = drifting_session();
+            // Candidate's extra factor in even and odd rounds, on top of the
+            // helper's steady 0.9 (10% better).
+            let (even, odd) = match case {
+                Case::IntervalIncludesZero => (0.6, 1.6),
+                _ => (0.5 / 0.9, 1.0),
+            };
+            for (f, cand) in files.iter_mut().zip([false, true]) {
+                if case == Case::TwoRounds {
+                    f.workloads[0].runs.retain(|r| r.round.is_some_and(|k| k < 2));
+                }
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    let round = k / 2;
+                    let m = r.metrics.get_mut("p99").unwrap();
+                    if cand {
+                        m.value *= if round % 2 == 0 { even } else { odd };
+                    }
+                    m.extreme = case == Case::Extreme;
+                    if case == Case::Minor {
+                        m.share = Some(0.001);
+                    }
+                    if case == Case::UndefinedRound && !cand && round == 0 {
+                        m.value = 0.0;
+                    }
+                }
+            }
+            let opts = Options {
+                // 10% vs 50% better: a median of 30%, below a 40% minimum.
+                min_effect_pct: if case == Case::BelowMinEffect { 40.0 } else { 5.0 },
+                ..Options::default()
+            };
+            Comparison::build_with(files, 0, opts)
+        };
+        for case in [
+            Case::Plain,
+            Case::Extreme,
+            Case::TwoRounds,
+            Case::IntervalIncludesZero,
+            Case::BelowMinEffect,
+            Case::Minor,
+            Case::UndefinedRound,
+        ] {
+            let c = session(case);
+            let d = c.rows[0].improvement(0, 1).unwrap();
+            // The rule itself sees the unevenness in every case, and none is scored.
+            assert!(d.uneven(c.opts.unstable_spread_pct).is_some(), "{case:?}: {d:?}");
+            assert!(c.rows[0].unstable_pair(0, 1) && !c.clear(&c.rows[0], 1, &d), "{case:?}");
+            // Tag, terminal mark and summary count agree: only the plain case.
+            let want = case == Case::Plain;
+            assert_eq!(c.held_back_by_unevenness(&c.rows[0], 1, &d).is_some(), want, "{case:?}: {d:?}");
+            assert_eq!(crate::html::report(&c).contains("class=bad title=\"the per-round ratios"), want, "{case:?}");
+            assert_eq!(crate::html::text_table(&c).contains("≠)"), want, "{case:?}");
+            let counted: usize = c.summary().iter().map(|s| s.uneven).sum();
+            assert_eq!(counted, usize::from(want), "{case:?}");
+        }
     }
 
     /// A round where the candidate measured zero has a change (-100%) but
