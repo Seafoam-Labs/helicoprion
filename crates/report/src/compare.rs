@@ -311,15 +311,14 @@ impl Comparison {
                         w.runs.len()
                     ));
                 }
-                if si != baseline {
-                    if let Some(bw) = base.file.workloads.iter().find(|b| b.name == w.name) {
-                        if bw.params != w.params {
-                            warnings.push(format!(
-                                "{}: {} ran with {} but the baseline used {}; not compared",
-                                s.label, w.name, w.params, bw.params
-                            ));
-                        }
-                    }
+                if si != baseline
+                    && let Some(bw) = base.file.workloads.iter().find(|b| b.name == w.name)
+                    && bw.params != w.params
+                {
+                    warnings.push(format!(
+                        "{}: {} ran with {} but the baseline used {}; not compared",
+                        s.label, w.name, w.params, bw.params
+                    ));
                 }
                 let mut counters: BTreeMap<String, u64> = BTreeMap::new();
                 let mut valid_runs = 0;
@@ -369,10 +368,10 @@ impl Comparison {
                         let ms: Vec<_> = with_round.iter().map(|(_, m)| *m).collect();
                         let mut by_round: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
                         for (round, m) in &with_round {
-                            if let Some(r) = round {
-                                if m.value.is_finite() {
-                                    by_round.entry(*r).or_default().push(m.value);
-                                }
+                            if let Some(r) = round
+                                && m.value.is_finite()
+                            {
+                                by_round.entry(*r).or_default().push(m.value);
                             }
                         }
                         let rounds: BTreeMap<u32, f64> =

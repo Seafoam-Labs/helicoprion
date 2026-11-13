@@ -55,10 +55,10 @@ pub fn usable_cpus() -> usize {
 pub fn across_policies(cpufreq: &Path, file: &str) -> Option<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for entry in fs::read_dir(cpufreq).ok()?.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("policy") {
-            if let Some(v) = read_trimmed(entry.path().join(file)) {
-                *counts.entry(v).or_default() += 1;
-            }
+        if entry.file_name().to_string_lossy().starts_with("policy")
+            && let Some(v) = read_trimmed(entry.path().join(file))
+        {
+            *counts.entry(v).or_default() += 1;
         }
     }
     summarize(&counts)

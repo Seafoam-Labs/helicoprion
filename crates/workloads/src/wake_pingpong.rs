@@ -144,10 +144,10 @@ impl Workload for WakePingPong {
         let c = &r.counters;
         let (b, t) = (*c.get("roundtrips_blocked")?, *c.get("roundtrips")?);
         let mut note = format!("blocked={:.0}%", pct_of(b, t)?);
-        if let Some(same) = c.get("roundtrips_blocked_same_cpu") {
-            if let Some(p) = pct_of(*same, b) {
-                note.push_str(&format!(" (same-cpu {p:.0}%)"));
-            }
+        if let Some(same) = c.get("roundtrips_blocked_same_cpu")
+            && let Some(p) = pct_of(*same, b)
+        {
+            note.push_str(&format!(" (same-cpu {p:.0}%)"));
         }
         Some(note)
     }

@@ -246,10 +246,10 @@ fn run(a: RunArgs) -> Result<()> {
 
     eprintln!("scheduler: {sched}");
     eprintln!("kernel:    {}  ({} CPUs)", sys.kernel, sys.usable_cpus);
-    if let Some(l) = sys.loadavg_1m {
-        if l > 0.25 * sys.usable_cpus as f64 {
-            eprintln!("warning:   load average {l:.2} — the system is not idle, results will be noisy");
-        }
+    if let Some(l) = sys.loadavg_1m
+        && l > 0.25 * sys.usable_cpus as f64
+    {
+        eprintln!("warning:   load average {l:.2} — the system is not idle, results will be noisy");
     }
     let per_run = duration + cooldown;
     let total = workloads.len() as f64 * (runs + warmup) as f64 * per_run;
