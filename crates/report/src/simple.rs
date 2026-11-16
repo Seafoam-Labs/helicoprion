@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::compare::{Comparison, Delta, MetricRow, Verdict};
+use crate::compare::{Comparison, Delta, MetricRow, UnclearReason, Verdict};
 use crate::svg::{fmt_value, times};
 
 /// One candidate against the baseline on one workload.
@@ -154,8 +154,8 @@ fn medians(row: &MetricRow, baseline: usize, i: usize) -> Option<(f64, f64)> {
 }
 
 /// "Label: 2.6× longer (14.0 → 36.1 µs)", or "no reliable difference"
-/// where the report does not score the change, however far apart the two
-/// medians look. `words` are (better, worse).
+/// with the reason where the report does not score the change, however
+/// far apart the two medians look. `words` are (better, worse).
 ///
 /// In between is a change the report holds back only because its size
 /// differed from round to round (`Comparison::held_back_by_unevenness`).
@@ -172,16 +172,36 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     let (b, v) = medians(row, c.baseline, i)?;
     let values = format!("{} → {}{}", fmt_value(b), fmt_value(v), unit(&row.unit));
     let word = if d.median > 0.0 { words.0 } else { words.1 };
-    Some(if c.clear(row, i, &d) {
-        format!("{label}: {} {word}{} ({values})", amount(&d), at_least(&d).unwrap_or_default())
-    } else if let (Some(_), Some((lo, hi))) = (c.held_back_by_unevenness(row, i, &d), d.ci) {
-        format!(
+    Some(match (c.unclear_reason(row, i, &d), d.ci) {
+        (None, _) => format!("{label}: {} {word}{} ({values})", amount(&d), at_least(&d).unwrap_or_default()),
+        (Some(UnclearReason::Uneven(_)), Some((lo, hi))) => format!(
             "{label}: {word}; the effect varied too much between rounds to score (estimated effect, 95% interval: {}; {values})",
             amount_range(&d, lo, hi)
-        )
-    } else {
-        format!("{label}: no reliable difference ({values})")
+        ),
+        (Some(reason), _) => format!("{label}: no reliable difference; {} ({values})", why(c, &d, reason)),
     })
+}
+
+/// Why a change is not scored, for a reader who sees "1434 → 42.2 µs" next
+/// to "no reliable difference" and wonders whether the benchmark is broken.
+/// The reason is `Comparison::unclear_reason`'s, the one the scoring
+/// itself went by; this only puts it in words.
+fn why(c: &Comparison, d: &Delta, reason: UnclearReason) -> String {
+    match reason {
+        UnclearReason::SingleSample => "a single extreme value is never scored".into(),
+        UnclearReason::MinorPopulation => "too few relevant wake-ups".into(),
+        UnclearReason::UndefinedRounds => "the baseline measured zero in some rounds".into(),
+        UnclearReason::TooFewRounds if d.paired_rounds.is_some() || d.unmatched_rounds => {
+            "too few paired rounds".into()
+        }
+        UnclearReason::TooFewRounds => "too few runs".into(),
+        UnclearReason::IntervalIncludesNoChange => "the interval includes no change".into(),
+        UnclearReason::BelowThreshold => {
+            format!("difference below the reporting threshold of {}%", c.opts.min_effect_pct)
+        }
+        UnclearReason::Uneven(_) => "the effect varied too much between rounds to score".into(),
+        UnclearReason::Unstable => "results were too unstable to compare reliably".into(),
+    }
 }
 
 /// Work the CPU hogs got done next to the test: the other half of the

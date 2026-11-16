@@ -56,8 +56,8 @@ In short, compared with scx_pandemonium:
 
 scx_cake
   Idle system: WORSE
-    • Round trips completed: no reliable difference (1.25M → 1.26M per second)
-    • Typical wake-up delay: no reliable difference (6.14 → 6.11 µs)
+    • Round trips completed: no reliable difference; the interval includes no change (1.25M → 1.26M per second)
+    • Typical wake-up delay: no reliable difference; the interval includes no change (6.14 → 6.11 µs)
     • Slowest wake-ups (1 in 1000): 75% longer (11.5 → 20.1 µs)
     • Of 11 measurements, 0 clearly better and 2 clearly worse
   Busy system (every CPU kept busy): BETTER
@@ -73,7 +73,12 @@ scheduler; with `--simple`
 the charts, tables and reading notes are folded under "Full report". The
 scoring is the same as in the full report: a line says "more" or "longer"
 only where the table colours the change, and "no reliable difference"
-otherwise, however far apart the two numbers look; a verdict of "no clear
+otherwise, however far apart the two numbers look, with the one reason the
+scoring went by: the interval includes no change, the difference is below
+the reporting threshold, too few paired rounds (or runs), too few relevant
+wake-ups (a minor population), results too unstable to compare, a baseline
+of zero in some rounds. A change that fails several tests names the first
+that applies, in a fixed order; a verdict of "no clear
 difference" means the run could not tell the two apart, not that they are
 equal. Where the estimate of a scored change is far above the cautious end of
 its interval, the line adds that end, cut off rather than rounded: "54×

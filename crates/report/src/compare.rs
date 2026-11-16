@@ -487,15 +487,76 @@ impl Summary {
     }
 }
 
+/// Why a compared change is not scored. One change can fail several
+/// tests; the first that applies, in this order, is the reason given, so
+/// that every part of the report names the same one.
+///
+/// The order goes from what the change is (a kind of number that is never
+/// scored), over whether there is an estimate to speak of, to how good the
+/// estimate is. Unevenness and instability come last: they are named only
+/// for a change that would otherwise be scored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnclearReason {
+    /// A single-sample extreme (a maximum): listed, never scored.
+    SingleSample,
+    /// The population behind the metric is under `min_share_pct` of the
+    /// run's events on one side.
+    MinorPopulation,
+    /// The baseline measured zero in some shared rounds, where a
+    /// percentage change does not exist.
+    UndefinedRounds,
+    /// No interval: fewer than three runs per side, or fewer than three
+    /// rounds measured by both sides of a session.
+    TooFewRounds,
+    /// The 95% interval includes no change.
+    IntervalIncludesNoChange,
+    /// The interval excludes no change, but the change is smaller than
+    /// `min_effect_pct`.
+    BelowThreshold,
+    /// Paired: the per-round results differ too much, and by more than the
+    /// effect (`Delta::uneven`).
+    Uneven(PairedSpread),
+    /// Unpaired: a side's run-to-run spread is above `unstable_spread_pct`.
+    Unstable,
+}
+
 impl Comparison {
+    /// Why the change of series `i` in row `r` is not scored, or `None`
+    /// when it is. The single decision behind `clear`, the uneven tag, the
+    /// summary and the plain-words text.
+    pub fn unclear_reason(&self, r: &MetricRow, i: usize, d: &Delta) -> Option<UnclearReason> {
+        if r.extreme {
+            return Some(UnclearReason::SingleSample);
+        }
+        if r.minor_pair(self.baseline, i) {
+            return Some(UnclearReason::MinorPopulation);
+        }
+        if d.undefined_rounds > 0 {
+            return Some(UnclearReason::UndefinedRounds);
+        }
+        if d.ci.is_none() {
+            return Some(UnclearReason::TooFewRounds);
+        }
+        if !d.ci_excludes_zero() {
+            return Some(UnclearReason::IntervalIncludesNoChange);
+        }
+        if !d.notable(self.opts.min_effect_pct) {
+            return Some(UnclearReason::BelowThreshold);
+        }
+        if r.unstable_pair(self.baseline, i) {
+            return Some(match d.uneven(self.opts.unstable_spread_pct) {
+                Some(spread) => UnclearReason::Uneven(spread),
+                None => UnclearReason::Unstable,
+            });
+        }
+        None
+    }
+
     /// The change of series `i` in row `r` is one the report colours and
     /// stars: not a single-sample extreme, stable, not a minor population
     /// on either side, interval excludes zero, at least the minimum effect.
     pub fn clear(&self, r: &MetricRow, i: usize, d: &Delta) -> bool {
-        !r.extreme
-            && !r.unstable_pair(self.baseline, i)
-            && !r.minor_pair(self.baseline, i)
-            && d.notable(self.opts.min_effect_pct)
+        self.unclear_reason(r, i, d).is_none()
     }
 
     /// The change would be clear (`clear`), were its rounds not uneven:
@@ -507,11 +568,10 @@ impl Comparison {
     /// there something else already keeps the change from being scored,
     /// and an "uneven" tag would explain nothing.
     pub fn held_back_by_unevenness(&self, r: &MetricRow, i: usize, d: &Delta) -> Option<PairedSpread> {
-        if r.extreme || !d.notable(self.opts.min_effect_pct) || r.minor_pair(self.baseline, i) || d.undefined_rounds > 0
-        {
-            return None;
+        match self.unclear_reason(r, i, d) {
+            Some(UnclearReason::Uneven(spread)) => Some(spread),
+            _ => None,
         }
-        d.uneven(self.opts.unstable_spread_pct)
     }
 
     /// Per candidate and workload, how many compared metrics are clearly
@@ -1501,7 +1561,7 @@ mod tests {
         let c = session("wake-pingpong", [545.0e3, 14.1, 45.0, 1.62e6]);
         let text = crate::simple::text(&c);
         assert!(text.contains("\ncand\n  Idle system: NO CLEAR DIFFERENCE\n"), "{text}");
-        assert!(text.contains("• Round trips completed: no reliable difference ("), "{text}");
+        assert!(text.contains("• Round trips completed: no reliable difference; "), "{text}");
         assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
         assert!(!text.contains("fewer") && !text.contains("longer"), "{text}");
         // Background work is left out unless both sides are comparable.
@@ -1578,7 +1638,7 @@ mod tests {
         );
         assert!(text.contains("\ncand\n  Busy system (every CPU kept busy): NO CLEAR DIFFERENCE\n"), "{text}");
         assert!(text.contains("• Of 2 measurements, 0 clearly better and 0 clearly worse"), "{text}");
-        assert!(text.contains("• Typical wake-up delay: no reliable difference ("), "{text}");
+        assert!(text.contains("• Typical wake-up delay: no reliable difference; "), "{text}");
 
         // Two workloads of one scheduler share a card: the scheduler once,
         // then a part per workload.
@@ -1695,6 +1755,153 @@ mod tests {
             assert!(!said.contains("54× shorter"), "{case:?} must not read as scored: {said}");
             assert!(!crate::simple::text(&c).contains(explained) && !crate::html::report(&c).contains(explained));
         }
+    }
+
+    /// `clear` is "no reason not to score", and the reasons cover exactly
+    /// what the scoring rule excludes: checked against the rule written
+    /// out, for every compared cell of sessions of every kind.
+    #[test]
+    fn unclear_reasons_agree_with_the_scoring_rule() {
+        let mut comparisons = vec![
+            Comparison::build(drifting_session(), 0),
+            Comparison::build(vec![populations("base", 500, 10.0, true), populations("cand", 995, 5.0, true)], 0),
+            Comparison::build(vec![sub_populations("base", 450, true), sub_populations("cand", 4, true)], 0),
+            Comparison::build(
+                vec![
+                    file("base", &[100.0, 101.0, 99.0, 100.5, 99.5], 1),
+                    file("same", &[100.2, 100.8, 99.4, 100.1, 99.9], 1),
+                    file("slow", &[150.0, 151.0, 149.0, 150.5, 149.5], 1),
+                    // Far from the baseline in every run, but all over the place.
+                    file("wild", &[400.0, 900.0, 450.0, 1200.0, 700.0], 1),
+                    file("short", &[150.0, 151.0], 1),
+                ],
+                0,
+            ),
+        ];
+        // An uneven session, and one with a round the baseline measured as zero.
+        let mut uneven = drifting_session();
+        for (k, r) in uneven[1].workloads[0].runs.iter_mut().enumerate() {
+            if (k / 2) % 2 == 0 {
+                r.metrics.get_mut("p99").unwrap().value *= 0.5 / 0.9;
+            }
+        }
+        comparisons.push(Comparison::build(uneven, 0));
+        let mut undefined = drifting_session();
+        undefined[0].workloads[0].runs[0].metrics.get_mut("p99").unwrap().value = 0.0;
+        undefined[0].workloads[0].runs[1].metrics.get_mut("p99").unwrap().value = 0.0;
+        comparisons.push(Comparison::build(undefined, 0));
+
+        let mut seen = Vec::new();
+        let mut scored = 0;
+        for c in &comparisons {
+            for r in &c.rows {
+                for i in (0..c.series.len()).filter(|i| *i != c.baseline) {
+                    let Some(d) = r.improvement(c.baseline, i) else { continue };
+                    let rule = !r.extreme
+                        && !r.unstable_pair(c.baseline, i)
+                        && !r.minor_pair(c.baseline, i)
+                        && d.notable(c.opts.min_effect_pct);
+                    let reason = c.unclear_reason(r, i, &d);
+                    assert_eq!(reason.is_none(), rule, "{} {}: {reason:?}", r.metric, c.series[i].label);
+                    assert_eq!(c.clear(r, i, &d), rule);
+                    assert_eq!(
+                        c.held_back_by_unevenness(r, i, &d).is_some(),
+                        matches!(reason, Some(UnclearReason::Uneven(_)))
+                    );
+                    match reason {
+                        Some(reason) => seen.push(std::mem::discriminant(&reason)),
+                        None => scored += 1,
+                    }
+                }
+            }
+        }
+        // The sessions above reach every reason but a single-sample extreme
+        // (covered by the uneven-tag test), and scored changes too.
+        assert!(scored > 0);
+        for reason in [
+            UnclearReason::MinorPopulation,
+            UnclearReason::UndefinedRounds,
+            UnclearReason::TooFewRounds,
+            UnclearReason::IntervalIncludesNoChange,
+            UnclearReason::Uneven(PairedSpread::Relative(0.0)),
+            UnclearReason::Unstable,
+        ] {
+            assert!(seen.contains(&std::mem::discriminant(&reason)), "no case reached {reason:?}");
+        }
+    }
+
+    /// Every reason has its own words in the plain view, and they are the
+    /// reason the scoring went by.
+    #[test]
+    fn in_short_says_why_a_change_is_not_scored() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Case {
+            IncludesNoChange,
+            BelowThreshold,
+            Minor,
+            TwoRounds,
+            UndefinedRound,
+        }
+        let session = |case: Case| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "wake-pingpong".into();
+                if case == Case::TwoRounds {
+                    f.workloads[0].runs.retain(|r| r.round.is_some_and(|k| k < 2));
+                }
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    let round = k / 2;
+                    let longer = match (case, is_cand) {
+                        (_, false) => 1.0,
+                        // 34× shorter in most rounds, longer in others.
+                        (Case::IncludesNoChange, true) => [1.0 / 34.0, 1.3, 1.0 / 34.0, 1.2, 1.0 / 34.0, 1.4][round],
+                        (Case::BelowThreshold, true) => 1.03,
+                        (_, true) => 2.0,
+                    };
+                    let mut v = 1434.0 * wobble * longer;
+                    if case == Case::UndefinedRound && !is_cand && round == 0 {
+                        v = 0.0;
+                    }
+                    let m = Metric::lower(v, "us");
+                    r.metrics.clear();
+                    r.metrics.insert("rtt_blocked_p99.9".into(), if case == Case::Minor { m.share(0.001) } else { m });
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        for (case, reason, words) in [
+            (Case::IncludesNoChange, UnclearReason::IntervalIncludesNoChange, "the interval includes no change"),
+            (Case::BelowThreshold, UnclearReason::BelowThreshold, "difference below the reporting threshold of 5%"),
+            (Case::Minor, UnclearReason::MinorPopulation, "too few relevant wake-ups"),
+            (Case::TwoRounds, UnclearReason::TooFewRounds, "too few paired rounds"),
+            (Case::UndefinedRound, UnclearReason::UndefinedRounds, "the baseline measured zero in some rounds"),
+        ] {
+            let c = session(case);
+            let d = c.rows[0].improvement(0, 1).unwrap();
+            assert_eq!(c.unclear_reason(&c.rows[0], 1, &d), Some(reason), "{case:?}: {d:?}");
+            let text = crate::simple::text(&c);
+            let line = text.lines().find(|l| l.contains("Slowest wake-ups")).unwrap().trim();
+            assert!(
+                line.starts_with(&format!("• Slowest wake-ups (1 in 1000): no reliable difference; {words} (")),
+                "{case:?}: {line}"
+            );
+            assert!(!line.contains("longer") && !line.contains("shorter"), "{case:?}: {line}");
+        }
+
+        // Unpaired files: too few runs, and a side too unstable to compare.
+        let c = Comparison::build(
+            vec![
+                file("base", &[100.0, 101.0, 99.0, 100.5, 99.5], 1),
+                file("short", &[150.0, 151.0], 1),
+                file("wild", &[400.0, 900.0, 450.0, 1200.0, 700.0], 1),
+            ],
+            0,
+        );
+        let row = c.rows.iter().find(|r| r.metric == "p99").unwrap();
+        let reason = |i: usize| c.unclear_reason(row, i, &row.improvement(0, i).unwrap());
+        assert_eq!(reason(1), Some(UnclearReason::TooFewRounds));
+        assert_eq!(reason(2), Some(UnclearReason::Unstable));
     }
 
     /// The summary's largest changes read largest first: multiples before
@@ -2096,6 +2303,19 @@ mod tests {
             // The rule itself sees the unevenness in every case, and none is scored.
             assert!(d.uneven(c.opts.unstable_spread_pct).is_some(), "{case:?}: {d:?}");
             assert!(c.rows[0].unstable_pair(0, 1) && !c.clear(&c.rows[0], 1, &d), "{case:?}");
+            // One reason each, the first that applies, and the same one
+            // wherever the report gives it.
+            let reason = c.unclear_reason(&c.rows[0], 1, &d).expect("not scored");
+            let expected = match case {
+                Case::Plain => matches!(reason, UnclearReason::Uneven(PairedSpread::Relative(_))),
+                Case::Extreme => reason == UnclearReason::SingleSample,
+                Case::TwoRounds => reason == UnclearReason::TooFewRounds,
+                Case::IntervalIncludesZero => reason == UnclearReason::IntervalIncludesNoChange,
+                Case::BelowMinEffect => reason == UnclearReason::BelowThreshold,
+                Case::Minor => reason == UnclearReason::MinorPopulation,
+                Case::UndefinedRound => reason == UnclearReason::UndefinedRounds,
+            };
+            assert!(expected, "{case:?}: {reason:?}");
             // Tag, terminal mark and summary count agree: only the plain case.
             let want = case == Case::Plain;
             assert_eq!(c.held_back_by_unevenness(&c.rows[0], 1, &d).is_some(), want, "{case:?}: {d:?}");
