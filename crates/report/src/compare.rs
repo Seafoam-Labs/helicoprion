@@ -442,6 +442,30 @@ pub struct Mix {
     pub share: f64,
 }
 
+/// Metrics that results written by earlier versions carry with a better
+/// direction and that are informational now: read as such, so that old
+/// files are scored like new ones and can be compared with them (a metric
+/// whose direction differs between files is otherwise not compared).
+///
+/// `woken_per_s` of wake-pingpong, the threads actually woken per second,
+/// was "higher is better". It is the rate of real wake-ups, and it follows
+/// the mix of round trips: where most replies arrive before the pinger
+/// sleeps, fewer threads are woken while more round trips complete.
+/// Scored, that made a scheduler "worse" for not having to put its tasks
+/// to sleep.
+fn informational_in_older_files(f: &mut ResultFile) {
+    for w in &mut f.workloads {
+        if w.name != "wake-pingpong" && !w.name.starts_with("wake-pingpong/") {
+            continue;
+        }
+        for r in &mut w.runs {
+            if let Some(m) = r.metrics.get_mut("woken_per_s") {
+                m.better = Better::Neither;
+            }
+        }
+    }
+}
+
 /// Spread of positive ratios relative to one another, in percent: half the
 /// IQR of their logarithms, turned back into a factor. Ratios of 1.00 and
 /// 1.10 are as far apart as 20 and 22.
@@ -669,7 +693,10 @@ impl Comparison {
         Self::build_with(files, baseline, Options::default())
     }
 
-    pub fn build_with(files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
+    pub fn build_with(mut files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
+        for f in &mut files {
+            informational_in_older_files(f);
+        }
         let series: Vec<Series> = disambiguate(files)
             .into_iter()
             .enumerate()
@@ -2061,6 +2088,64 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let notes: Vec<(usize, bool)> =
             crate::simple::briefs(&c).iter().map(|b| (b.series, b.note.is_some())).collect();
         assert_eq!(notes, [(1, false), (2, true)]);
+    }
+
+    /// `woken_per_s` is listed, not scored: a scheduler under which most
+    /// round trips need no sleep wakes fewer threads, and that alone must
+    /// not make it "worse". Also for files that still call it "higher is
+    /// better", alone or next to new ones.
+    #[test]
+    fn woken_throughput_is_informational() {
+        // 1000 round trips per run at the same latencies and the same rate;
+        // `blocked` of them sleep, and each of those wakes two threads.
+        let run = |label: &str, blocked: u64, direction: Option<Better>, workload: &str| {
+            let mut f = populations(label, blocked, 10.0, true);
+            f.workloads[0].name = workload.into();
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let jitter = 1.0 + k as f64 * 1e-3;
+                r.metrics.insert("roundtrips_per_s".into(), Metric::higher(1.0e6 * jitter, "1/s"));
+                if let Some(better) = direction {
+                    let mut m = Metric::info(2.0e3 * blocked as f64 * jitter, "1/s");
+                    m.better = better;
+                    r.metrics.insert("woken_per_s".into(), m);
+                }
+            }
+            f
+        };
+        let (old, new) = (Some(Better::Higher), Some(Better::Neither));
+        for (base, cand) in [(new, new), (old, old), (old, new), (new, old)] {
+            for workload in ["wake-pingpong", "wake-pingpong/loaded"] {
+                // 90% of the baseline's round trips sleep, 30% of the candidate's.
+                let c = Comparison::build(vec![run("base", 900, base, workload), run("cand", 300, cand, workload)], 0);
+                assert!(c.warnings.iter().all(|w| !w.contains("not compared")), "{:?}", c.warnings);
+                let row = c.rows.iter().find(|r| r.metric == "woken_per_s").expect("still listed");
+                assert_eq!(row.better, Better::Neither);
+                assert!(row.improvement(0, 1).is_none(), "no change to score");
+                // Its values are in the table, three times apart.
+                let (b, s) = (row.cells[0].as_ref().unwrap(), row.cells[1].as_ref().unwrap());
+                assert!((b.spread.median / s.spread.median - 3.0).abs() < 1e-9);
+
+                // The shift in the mix is reported, and nothing is worse.
+                assert!(c.mixes.iter().any(|m| m.population == "rtt_fast"));
+                let s = &c.summary()[0];
+                assert_eq!((s.verdict(), s.better, s.worse), (Verdict::NoClearDifference, 0, 0), "{base:?} {cand:?}");
+                // Round trips, the two p50 and the helper's p99 and ops.
+                assert_eq!(s.compared, 5, "woken_per_s is not among them");
+                assert!(s.top.iter().all(|(m, _)| m != "woken_per_s"));
+                let text = crate::simple::text(&c);
+                assert!(text.contains(": NO CLEAR DIFFERENCE"), "{text}");
+                assert!(text.contains("Of 5 measurements, 0 clearly better and 0 clearly worse"), "{text}");
+                let html = crate::html::report(&c);
+                assert!(html.contains("woken_per_s") && !html.contains("woken_per_s 3.0×"), "listed, not ranked");
+            }
+        }
+
+        // The reading is this workload's: elsewhere a metric of that name
+        // keeps the direction its file gives it.
+        let c = Comparison::build(vec![run("base", 900, old, "other"), run("cand", 300, old, "other")], 0);
+        let row = c.rows.iter().find(|r| r.metric == "woken_per_s").unwrap();
+        assert_eq!(row.better, Better::Higher);
+        assert_eq!(c.summary()[0].verdict(), Verdict::Worse);
     }
 
     /// The summary's largest changes read largest first: multiples before

@@ -739,8 +739,12 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
     let m = &mut r.metrics;
     m.insert("roundtrips_per_s".into(), Metric::higher(roundtrips as f64 / window, "1/s"));
     // Threads FUTEX_WAKE actually woke, not an assumed two per round trip.
+    // Informational: the rate of real wake-ups, but one that follows the
+    // mix of round trips. A scheduler under which the reply mostly arrives
+    // before the pinger sleeps wakes fewer threads while completing more
+    // round trips; fewer wake-ups is then not "worse".
     let woken = ping_c.woken + pong_c.woken;
-    m.insert("woken_per_s".into(), Metric::higher(woken as f64 / window, "1/s"));
+    m.insert("woken_per_s".into(), Metric::info(woken as f64 / window, "1/s"));
     r.windows.insert("latency".into(), Window { start_s: 0.0, end_s: window });
     if let Some(h) = hog {
         let secs = (h.t1 - h.t0).as_secs_f64();
@@ -889,6 +893,11 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(r.metrics["hog_work_per_s"].value > 0.0);
+        // Rates that say how the run went, not how good it was.
+        for info in ["hog_work_per_s", "woken_per_s"] {
+            assert_eq!(r.metrics[info].better, helicoprion_core::Better::Neither, "{info}");
+        }
+        assert_eq!(r.metrics["roundtrips_per_s"].better, helicoprion_core::Better::Higher);
         let hog = r.windows["hog"];
         let lat = r.windows["latency"];
         // Ordering only; actual offsets are host-dependent and recorded in the

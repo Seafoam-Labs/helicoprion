@@ -186,7 +186,7 @@ and both `run` and `compare` warn about it.
 
 | Name | What it does | Metrics |
 |---|---|---|
-| `wake-pingpong` | N/2 thread pairs pass a token through a private futex | per population: p50/p99/p99.9/max (µs); round trips/s; threads actually woken/s |
+| `wake-pingpong` | N/2 thread pairs pass a token through a private futex | per population: p50/p99/p99.9/max (µs); round trips/s; threads actually woken/s (informational) |
 | `wake-pingpong/loaded` | the same, while N CPU-hog threads keep every CPU busy | as above + hog work/s |
 
 ### Two populations: `rtt_blocked` and `rtt_fast`
@@ -344,9 +344,14 @@ compared with each other.
   that the same events got slower or faster. Results written before the
   share was recorded get it from the `roundtrips_*` counters, so they
   re-render the same way. `--min-share 0` turns this off.
-* Single-sample extremes (`*_max`) and informational metrics
-  (`hog_work_per_s`, which only says how CPU time was split between the
-  hogs and the ping/pong threads) are listed but never scored or charted.
+* Single-sample extremes (`*_max`) and informational metrics are listed but
+  never scored or charted. Informational are `hog_work_per_s`, which only
+  says how CPU time was split between the hogs and the ping/pong threads,
+  and `woken_per_s`, the rate of real wake-ups: it follows the mix of round
+  trips, so a scheduler under which most replies arrive before the pinger
+  sleeps wakes fewer threads while completing more round trips, and is not
+  worse for it. Results written when `woken_per_s` was still scored are read
+  the same way.
 * Changes of 2× or more are written as multiples ("34× worse"). So is any
   end of an interval that far from no change, with its direction, since a
   percentage hides it: "−2819.1% … +97.2%" for a latency is "29× worse …
