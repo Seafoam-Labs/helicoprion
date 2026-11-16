@@ -2004,6 +2004,51 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             )]
         );
 
+        // Several populations differ: blocked round trips are named whenever
+        // they are among them; otherwise the one whose share moved the most,
+        // not the first in a fixed order. Shares per side, in the order
+        // blocked, same CPU, cross CPU, fast.
+        let mixed = |label: &str, shares: [f64; 4]| {
+            let mut f = file(label, &[1.0; 5], 1);
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let names = ["rtt_blocked", "rtt_blocked_same_cpu", "rtt_blocked_cross_cpu", "rtt_fast"];
+                for (pop, share) in names.into_iter().zip(shares) {
+                    let m = Metric::lower(10.0 * (1.0 + k as f64 * 1e-3), "us").share(share);
+                    r.metrics.insert(format!("{pop}_p50"), m);
+                }
+            }
+            f
+        };
+        let named = |base: [f64; 4], cand: [f64; 4]| {
+            let c = Comparison::build(vec![mixed("base", base), mixed("cand", cand)], 0);
+            let populations: Vec<String> = c.mixes.iter().map(|m| m.population.clone()).collect();
+            (populations.len(), note(&c)[0].clone().unwrap())
+        };
+        // cake under load: cross CPU 5.3% → 81% (76 points), same CPU 87% →
+        // 16% (71), fast 8.6% → 1.9% (6.7). Fast used to be named.
+        let (n, said) = named([0.914, 0.87, 0.053, 0.086], [0.981, 0.16, 0.81, 0.019]);
+        assert_eq!(n, 3);
+        assert!(
+            said.starts_with("81% of round trips needed a wake-up with the two tasks on different CPUs, versus 5.3%"),
+            "{said}"
+        );
+        // The larger move wins either way round: here fast, 5% → 60%,
+        // against cross CPU, 5% → 15%.
+        let (n, said) = named([0.95, 0.90, 0.05, 0.05], [0.40, 0.25, 0.15, 0.60]);
+        assert_eq!(n, 4, "blocked differs too");
+        assert!(
+            said.starts_with("Only 40% of round trips needed a wake-up, versus 95%"),
+            "blocked comes first: {said}"
+        );
+        let (n, said) = named([0.95, 0.90, 0.05, 0.05], [0.60, 0.50, 0.10, 0.40]);
+        assert_eq!(n, 2, "cross CPU and fast");
+        assert!(said.starts_with("40% of round trips needed no wake-up, versus 5.0%"), "{said}");
+        // Equal moves (half of all round trips each, exact in binary): the
+        // fixed order decides, cross CPU before same CPU.
+        let (n, said) = named([0.875, 0.75, 0.125, 0.125], [0.875, 0.25, 0.625, 0.125]);
+        assert_eq!(n, 2);
+        assert!(said.starts_with("62% of round trips needed a wake-up with the two tasks on different CPUs"), "{said}");
+
         // Per scheduler and workload: a note in one card says nothing in another.
         let c = Comparison::build(
             vec![

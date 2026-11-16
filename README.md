@@ -98,7 +98,10 @@ follows is said about the numbers shown, which are the delays of all round
 trips that needed a wake-up: if only the share of round trips without a
 wake-up differs, the note asks to read throughput and delays together; if
 only the split between one CPU and two differs, it says that the delays
-shown cover both kinds, in different proportions. If the full report has warnings, or the results
+shown cover both kinds, in different proportions. A part gets one note:
+about round trips that needed a wake-up whenever their share differs,
+otherwise about the kind whose share of all round trips moved the most. It
+names a difference in behaviour, not the cause of a delay. If the full report has warnings, or the results
 were not all taken on the same setup (kernel, CPUs, governor), `--simple`
 says so above the folded part and in the terminal. So the whole benchmark
 for someone who just wants an answer is

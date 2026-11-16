@@ -264,7 +264,16 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
 /// for the baseline" changes what "wake-up delay 2× shorter" means, and a
 /// reader of the plain view does not open the warnings. Nothing is
 /// detected here: this puts `Comparison::mixes` in words, one population
-/// per part, the one the points above are about first.
+/// per part.
+///
+/// Which one: round trips that needed a wake-up (`rtt_blocked`) whenever
+/// their share differs, since the delays shown are theirs. Otherwise the
+/// population whose share moved the most, in percentage points of all
+/// round trips: with 5.3% against 81% of round trips woken across CPUs
+/// and 8.6% against 1.9% needing no wake-up, the first is what the two
+/// runs differ in. Equal moves keep the order of the table below. The
+/// note names a difference in behaviour; it does not say that the
+/// difference causes the delays.
 ///
 /// What follows from the finding is said about the numbers the part
 /// shows, which are the delays of all round trips that needed a wake-up
@@ -298,7 +307,15 @@ for the two.",
     let of = |population: &str| {
         c.mixes.iter().find(|m| m.series == series && m.workload == workload && m.population == population)
     };
-    let (m, did, means) = KINDS.iter().find_map(|(p, did, means)| Some((of(p)?, *did, *means)))?;
+    let moved = |m: &crate::compare::Mix| (m.share - m.baseline_share).abs();
+    let mut found = KINDS.iter().filter_map(|(p, did, means)| Some((of(p)?, *did, *means)));
+    let first = found.next()?;
+    let (m, did, means) = if first.0.population == KINDS[0].0 {
+        first
+    } else {
+        // The largest move; the earlier in `KINDS` of equal ones.
+        found.fold(first, |best, next| if moved(next.0) > moved(best.0) { next } else { best })
+    };
     let share = crate::svg::fmt_share;
     Some(format!(
         "{}{} of round trips {did}, versus {} for {}. {means}",
