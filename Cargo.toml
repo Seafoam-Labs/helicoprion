@@ -9,7 +9,6 @@ rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["Piotr Gorski <lucjan.lucjanov@gmail.com>"]
 repository = "https://github.com/Seafoam-Labs/helicoprion"
-homepage = "https://github.com/Seafoam-Labs/helicoprion"
 keywords = ["scheduler", "benchmark", "sched-ext", "eevdf", "linux"]
 categories = ["command-line-utilities", "development-tools::profiling"]
 
