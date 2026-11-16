@@ -142,6 +142,62 @@ pub fn resolve(labels: &[String], ctl: &dyn Control, timeout: Duration) -> Resul
         .collect()
 }
 
+/// Most schedulers one matrix takes: the report has one colour each.
+pub const MAX_SCHEDS: usize = 8;
+
+/// The schedulers scxcli recommends, as `--sched` values for a matrix.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Preset {
+    /// The kernel's own scheduler first, as the baseline a new user wants
+    /// the others compared with, whether or not the catalog lists it; then
+    /// the catalog's order.
+    pub scheds: Vec<String>,
+    /// Recommended, but its scheduler is not installed.
+    pub not_installed: Vec<String>,
+    /// Available, but beyond `MAX_SCHEDS`.
+    pub over_limit: Vec<String>,
+}
+
+/// Pick the matrix from `scxcli list --json`: the kernel's own scheduler
+/// (`default`, which scxcli can always start) and every recommended entry
+/// that is available. The catalog is the distribution's (and the admin's)
+/// list of what is worth trying, so a new user need not choose.
+pub fn recommended(listing: &Value) -> Result<Preset> {
+    let entries = listing
+        .get("recommended")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("`scxcli list --json` has no `recommended` list"))?;
+    let mut scheds = Vec::new();
+    let mut not_installed = Vec::new();
+    for e in entries {
+        let Some(id) = e.get("id").and_then(Value::as_str) else { continue };
+        if scheds.iter().chain(&not_installed).any(|s| s == id) {
+            continue;
+        }
+        if e.get("available").and_then(Value::as_bool) == Some(false) {
+            not_installed.push(id.to_string());
+        } else {
+            scheds.push(id.to_string());
+        }
+    }
+    // The baseline does not depend on the catalog listing it.
+    scheds.retain(|s| s != "default");
+    not_installed.retain(|s| s != "default");
+    if scheds.is_empty() {
+        bail!(
+            "scxcli recommends no scheduler that is installed here{}; there is nothing to compare the kernel's own scheduler with. Install one, or name schedulers with --sched",
+            if not_installed.is_empty() {
+                String::new()
+            } else {
+                format!(" (not installed: {})", not_installed.join(", "))
+            }
+        );
+    }
+    scheds.insert(0, "default".to_string());
+    let over_limit = scheds.split_off(scheds.len().min(MAX_SCHEDS));
+    Ok(Preset { scheds, not_installed, over_limit })
+}
+
 // ---------------------------------------------------------------------------
 // Bounded external commands
 
@@ -1271,6 +1327,64 @@ mod tests {
         assert!(e.starts_with("scx_panda did not settle within 50ms: "), "{e}");
         assert!(e.ends_with(&format!("last scxcli call: {hung}")), "{e}");
         assert_eq!(ctl.limits.borrow().len(), 1);
+    }
+
+    #[test]
+    fn recommended_preset_follows_the_catalog() {
+        // The simulator's catalog: default, a profile, and one not installed.
+        let sim = Sim::new(false, false, None);
+        let t = Duration::from_secs(1);
+        let p = recommended(&sim.list(t).unwrap()).unwrap();
+        assert_eq!(p.scheds, ["default", "latency"]);
+        assert_eq!(p.not_installed, ["missing"]);
+        assert!(p.over_limit.is_empty());
+        // What it picks resolves like the same names given with --sched.
+        let targets = resolve(&p.scheds, &sim, t).unwrap();
+        assert_eq!(targets[0].spec, Spec::Default);
+        assert_eq!(
+            (targets[1].process.as_str(), targets[1].spec.clone()),
+            ("scx_eevdf", Spec::Start("latency".into()))
+        );
+
+        // Catalog order, with the kernel's scheduler moved to the front as
+        // the baseline; entries without `available` count as available;
+        // duplicates are taken once.
+        let entry = |id: &str| json!({ "id": id });
+        let listing = json!({ "version": 2, "recommended": [
+            entry("scx_cosmos"), entry("scx_lavd"), entry("default"), entry("scx_lavd"),
+            { "id": "scx_cake", "available": false },
+        ]});
+        let p = recommended(&listing).unwrap();
+        assert_eq!(p.scheds, ["default", "scx_cosmos", "scx_lavd"]);
+        assert_eq!(p.not_installed, ["scx_cake"]);
+
+        // More than a report can show: the baseline and the first seven, the rest named.
+        let many: Vec<Value> = (0..10).map(|k| entry(&format!("scx_{k}"))).collect();
+        let p = recommended(&json!({ "recommended": many })).unwrap();
+        assert_eq!(p.scheds.len(), MAX_SCHEDS);
+        assert_eq!(p.scheds[..2], ["default", "scx_0"]);
+        assert_eq!(p.over_limit, ["scx_7", "scx_8", "scx_9"]);
+
+        // A catalog that does not list the kernel's scheduler, or lists it
+        // as unavailable: it is the baseline all the same.
+        for listing in [
+            json!({ "recommended": [entry("scx_cosmos"), entry("scx_lavd")] }),
+            json!({ "recommended": [entry("scx_cosmos"), { "id": "default", "available": false }, entry("scx_lavd")] }),
+        ] {
+            let p = recommended(&listing).unwrap();
+            assert_eq!(p.scheds, ["default", "scx_cosmos", "scx_lavd"]);
+            assert!(p.not_installed.is_empty());
+        }
+
+        // Nothing to compare the kernel's scheduler with.
+        let one = json!({ "recommended": [entry("default"), { "id": "scx_lavd", "available": false }] });
+        let e = recommended(&one).unwrap_err().to_string();
+        assert!(
+            e.contains("no scheduler that is installed here (not installed: scx_lavd)") && e.contains("--sched"),
+            "{e}"
+        );
+        assert!(recommended(&json!({ "recommended": [] })).unwrap_err().to_string().contains("installed here;"));
+        assert!(recommended(&json!({ "version": 2 })).unwrap_err().to_string().contains("no `recommended` list"));
     }
 
     #[test]

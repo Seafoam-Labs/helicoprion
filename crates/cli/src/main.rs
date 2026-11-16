@@ -67,8 +67,15 @@ enum Cmd {
         /// a scheduler (`scx_lavd`), a catalog profile id, or a scheduler
         /// with options in one argument (`"scx_bpfland -s 5000"`). Repeat;
         /// the first one is the report's baseline.
-        #[arg(long = "sched", required = true)]
+        #[arg(long = "sched", required_unless_present = "recommended")]
         scheds: Vec<String>,
+        /// Compare the schedulers scxcli recommends (`scxcli list
+        /// recommended`), instead of naming them with --sched: every
+        /// recommended scheduler that is installed, with the kernel's own
+        /// scheduler as the baseline. With the other defaults this is the
+        /// whole benchmark: `sudo helicoprion matrix --recommended`.
+        #[arg(long, conflicts_with = "scheds")]
+        recommended: bool,
         /// Rounds; each visits every scheduler once.
         #[arg(long, default_value_t = 5)]
         rounds: u32,
@@ -150,6 +157,7 @@ fn main() -> Result<()> {
         }),
         Cmd::Matrix {
             scheds,
+            recommended,
             rounds,
             suite,
             runs_per_visit,
@@ -167,6 +175,7 @@ fn main() -> Result<()> {
             thresholds,
         } => matrix_cmd(MatrixArgs {
             scheds,
+            recommended,
             rounds,
             suite,
             runs_per_visit,
@@ -378,6 +387,7 @@ fn progress(ev: Event<'_>) {
 
 struct MatrixArgs {
     scheds: Vec<String>,
+    recommended: bool,
     rounds: u32,
     suite: String,
     runs_per_visit: usize,
@@ -414,14 +424,31 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     if !(a.cooldown.is_finite() && a.cooldown >= 0.0) {
         bail!("--cooldown must be >= 0");
     }
-    if a.scheds.len() > 8 {
-        bail!("at most 8 schedulers per matrix (one report colour each)");
+    if a.scheds.len() > matrix::MAX_SCHEDS {
+        bail!("at most {} schedulers per matrix (one report colour each)", matrix::MAX_SCHEDS);
     }
     let cmd_timeout = Duration::from_secs_f64(a.command_timeout);
     let ctl = ScxCli { bin: a.scxcli.clone(), systemctl: a.systemctl.clone() };
     let initial = ctl.get(cmd_timeout).context("is scxcli installed? (--scxcli PATH)")?;
     let prior = Prior::plan(&initial)?;
-    let targets = resolve(&a.scheds, &ctl, cmd_timeout)?;
+    let scheds = if a.recommended {
+        let preset = matrix::recommended(&ctl.list(cmd_timeout)?)?;
+        eprintln!("preset:    recommended by scxcli: {}", preset.scheds.join(", "));
+        if !preset.not_installed.is_empty() {
+            eprintln!("           left out, not installed: {}", preset.not_installed.join(", "));
+        }
+        if !preset.over_limit.is_empty() {
+            eprintln!(
+                "           left out, over the limit of {}: {}",
+                matrix::MAX_SCHEDS,
+                preset.over_limit.join(", ")
+            );
+        }
+        preset.scheds
+    } else {
+        a.scheds.clone()
+    };
+    let targets = resolve(&scheds, &ctl, cmd_timeout)?;
     let sys = SystemInfo::collect();
     let workloads = suite(&a.suite, sys.usable_cpus, a.suite_opts).context("unknown suite")?;
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());

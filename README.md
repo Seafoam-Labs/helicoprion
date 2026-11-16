@@ -37,6 +37,18 @@ sudo helicoprion matrix --sched default --sched scx_lavd --sched scx_cosmos \
     --sched "scx_bpfland -s 5000" --rounds 5 -o lavd-vs-cosmos/
 ```
 
+Not sure which schedulers to compare? Let scxcli choose:
+
+```sh
+sudo helicoprion matrix --recommended
+```
+
+This takes every scheduler `scxcli list recommended` offers that is
+installed, with the kernel's own scheduler as the baseline, and runs the
+default 5 rounds (about 11 minutes for five schedulers). The list comes from
+the scx catalog, so a distribution or an admin decides what is in it.
+`--recommended` cannot be combined with `--sched`; all other options apply.
+
 Every round visits each scheduler once, in alternating order (A B C, C B A,
 A B C, …), and runs every workload during each visit, so slow drift
 (thermal state, background activity) hits every scheduler alike. Switching
