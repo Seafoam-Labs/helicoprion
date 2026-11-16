@@ -241,6 +241,12 @@ compared with each other.
   at all; the estimate then covers the other rounds only, the change is
   tagged *n of m rounds undefined* (`?` in the terminal table) and is not
   scored.
+* **Different mix.** When a population is a very different part of the
+  run on the two sides (its share of round trips differs by 2× or more,
+  e.g. blocked round trips are 99.9% of one scheduler's and 40% of the
+  other's), the report warns at the top. The latencies are still compared
+  and scored, but they describe different parts of the two runs: read them
+  together with `roundtrips_per_s`, which covers all round trips.
 * **Summary.** The report opens with one line per scheduler and workload:
   *better*, *worse*, *mixed* or *no clear difference* against the baseline,
   with the number of compared metrics that are clearly better, clearly

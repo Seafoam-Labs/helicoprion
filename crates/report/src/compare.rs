@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use helicoprion_core::{Better, ResultFile, RunResult, SystemInfo};
 
 use crate::stats::{MIN_ROUNDS_FOR_CI, Spread, bootstrap_ci, bootstrap_median_ci, median};
+use crate::svg::fmt_share;
 
 /// One input file as it appears in the report.
 #[derive(Debug, Clone)]
@@ -391,6 +392,11 @@ fn relative_spread_pct(ratios: &[f64]) -> Option<f64> {
     Some((((s.q3 - s.q1) / 2.0).exp() - 1.0) * 100.0)
 }
 
+/// A population whose share of the run's events differs between the two
+/// sides by this factor or more gets a warning: its metrics are compared
+/// and scored as usual, but they describe different parts of the two runs.
+const MIX_FACTOR: f64 = 2.0;
+
 /// How a candidate's clear changes on one workload add up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -695,6 +701,44 @@ impl Comparison {
                     "{}: same matrix session as the baseline but some metrics share no round with it; those are \
 descriptive comparisons of medians only, not paired, without intervals",
                     ser.label
+                ));
+            }
+            // Populations that are a very different part of the run on the
+            // two sides, e.g. blocked round trips: nearly all of one
+            // scheduler's, under half of the other's. Their latencies are
+            // then not the same events, however stable each side is. This
+            // is about latencies that are compared: a population one side
+            // lacks altogether has no comparison to qualify, and none here.
+            let mut mixes: BTreeMap<&str, BTreeMap<&str, (f64, f64)>> = BTreeMap::new();
+            for r in &rows {
+                let share = |k: usize| r.cells.get(k).and_then(Option::as_ref).and_then(|c| c.share);
+                let (Some(b), Some(s), Some((population, _stat))) =
+                    (share(baseline), share(i), r.metric.rsplit_once('_'))
+                else {
+                    continue;
+                };
+                if r.improvement(baseline, i).is_some()
+                    && !r.minor_pair(baseline, i)
+                    // Not two empty populations (possible with --min-share 0).
+                    && b.max(s) > 0.0
+                    && b.max(s) >= MIX_FACTOR * b.min(s)
+                {
+                    mixes.entry(&r.workload).or_default().insert(population, (b, s));
+                }
+            }
+            for (workload, populations) in mixes {
+                let list: Vec<String> = populations
+                    .iter()
+                    .map(|(p, (b, s))| {
+                        format!("{p} ({} of the baseline's round trips, {} here)", fmt_share(*b), fmt_share(*s))
+                    })
+                    .collect();
+                warnings.push(format!(
+                    "{}: in {workload} the two schedulers produce a different mix of round trips: {}. Latencies of \
+such a population describe different parts of the two runs; read them together with roundtrips_per_s, which covers \
+all round trips",
+                    ser.label,
+                    list.join(", ")
                 ));
             }
             let undefined = deltas.iter().filter(|d| d.undefined_rounds > 0).count();
@@ -1288,6 +1332,65 @@ mod tests {
             assert_eq!(s("rtt_blocked_same_cpu_p50"), Some(0.001), "share={share}");
             assert_eq!(s("rtt_blocked_same_cpu_p99"), Some(0.001), "share={share}: not 4% from the one run");
             assert_eq!(s("p99"), None);
+        }
+    }
+
+    #[test]
+    fn a_different_mix_of_populations_is_warned_about() {
+        let mix = |c: &Comparison| c.warnings.iter().find(|w| w.contains("different mix")).cloned();
+        for share in [true, false] {
+            // Blocked round trips: 30% of the baseline's, 90% of the candidate's.
+            let c =
+                Comparison::build(vec![populations("base", 300, 10.0, share), populations("cand", 900, 5.0, share)], 0);
+            let w = mix(&c).expect("warning");
+            assert!(w.starts_with("cand: in w the two schedulers produce a different mix"), "{w}");
+            assert!(w.contains("rtt_blocked (30% of the baseline's round trips, 90% here)"), "{w}");
+            assert!(w.contains("rtt_fast (70% of the baseline's round trips, 10% here)"), "{w}");
+            // A warning only: the change is still scored.
+            let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_p50").unwrap();
+            assert!(c.clear(row, 1, &row.improvement(0, 1).unwrap()));
+
+            // A similar mix, and a population that is minor on one side
+            // (tagged as such already), raise nothing.
+            for (b, s) in [(500, 600), (500, 995)] {
+                let c =
+                    Comparison::build(vec![populations("base", b, 10.0, share), populations("cand", s, 5.0, share)], 0);
+                assert_eq!(mix(&c), None, "{b} vs {s}");
+            }
+
+            // The threshold is a factor of exactly 2, inclusive: 20% vs 40%
+            // warns (the other population, 80% vs 60%, does not), 20% vs
+            // 39.9% does not.
+            let at = |b, s| {
+                mix(&Comparison::build(
+                    vec![populations("base", b, 10.0, share), populations("cand", s, 5.0, share)],
+                    0,
+                ))
+            };
+            let w = at(200, 400).expect("exactly 2x");
+            assert!(
+                w.contains("rtt_blocked (20% of the baseline's round trips, 40% here)") && !w.contains("rtt_fast"),
+                "{w}"
+            );
+            assert_eq!(at(200, 399), None);
+
+            // With --min-share 0 nothing is minor, so a zero share gets this
+            // far: zero on both sides is the same mix, zero on one side only
+            // is as different as a mix gets. This holds where the latency
+            // is compared at all, as with this helper, which writes a p50
+            // even for an empty population. The workload does not: a
+            // population with no round trips in any run has no quantiles,
+            // so no row is compared and nothing is warned about. A zero
+            // median share with the metric present comes from a population
+            // that is empty in most runs but not all.
+            let no_minor = Options { min_share_pct: 0.0, ..Options::default() };
+            let at = |b, s| {
+                let files = vec![populations("base", b, 10.0, share), populations("cand", s, 5.0, share)];
+                mix(&Comparison::build_with(files, 0, no_minor))
+            };
+            assert_eq!(at(0, 0), None);
+            let w = at(0, 300).expect("zero share on one side only, metric present");
+            assert!(w.contains("rtt_blocked (0.00% of the baseline's round trips, 30% here)"), "{w}");
         }
     }
 
