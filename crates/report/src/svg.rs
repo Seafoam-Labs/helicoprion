@@ -95,11 +95,21 @@ pub fn fmt_delta(d: &crate::compare::Delta) -> String {
 /// "+82.5% … 8.5×", which looked like an interval on one side.
 ///
 /// An end without a usable ratio (the candidate at zero, or an overflow)
-/// stays a percentage. Representation only: the ends are the ones given.
+/// stays a percentage.
+///
+/// Of an interval that excludes no change, the end nearer to it is the
+/// cautious one: the least the change is estimated to be. It is cut off at
+/// the digits shown instead of rounded, so that it never reads larger
+/// than it is, and agrees with the plain-words "at least": 4.87× is
+/// "4.8×" in both, not "4.9×" here next to "at least 4.8×" there. The far
+/// end, and both ends of an interval across no change, are rounded.
+///
+/// Representation only: the ends are the ones given.
 pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
     // `Some(true)`: the estimate is "N× better"; `Some(false)`: "N× worse".
     let estimate = multiple(d.ratio);
-    let end = |c: f64| {
+    let end = |c: f64, cautious: bool| {
+        let times = |x: f64| if cautious { times_cut(x) } else { times(x) };
         let r = d.ratio_of(c);
         // On the estimate's side, as a bare multiple even below 2×.
         if let Some(better) = estimate {
@@ -111,11 +121,12 @@ pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
         let text = match multiple(r) {
             Some(true) => format!("{}× better", times(r)),
             Some(false) if (1.0 / r).is_finite() => format!("{}× worse", times(1.0 / r)),
+            _ if cautious => pct_cut(c),
             _ => pct(c),
         };
         (text, false)
     };
-    let ((mut worse, worse_bare), (mut better, better_bare)) = (end(lo), end(hi));
+    let ((mut worse, worse_bare), (mut better, better_bare)) = (end(lo, lo > 0.0), end(hi, hi < 0.0));
     // A bare multiple next to an end that names its direction would leave
     // the reader to work out its side: name it too.
     if let Some(is_better) = estimate
@@ -131,6 +142,24 @@ pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
 
 pub(crate) fn times(x: f64) -> String {
     if x >= 10.0 { format!("{x:.0}") } else { format!("{x:.1}") }
+}
+
+/// A number cut off after `digits` decimals, towards zero. The epsilon
+/// keeps a value that is a decimal already where it is (80.1 * 10 is
+/// 800.9999999999999); it is far below anything shown.
+fn cut(x: f64, digits: i32) -> f64 {
+    let scale = 10f64.powi(digits);
+    (x * scale + 1e-9 * x.signum()).trunc() / scale
+}
+
+/// `times` for a cautious end: cut off, not rounded.
+fn times_cut(x: f64) -> String {
+    if x >= 10.0 { format!("{:.0}", cut(x, 0)) } else { format!("{:.1}", cut(x, 1)) }
+}
+
+/// `pct` for a cautious end: cut off towards no change, not rounded.
+fn pct_cut(v: f64) -> String {
+    pct(cut(v, 1))
 }
 
 /// How the interval of a change came about, for tooltips; worded like the
@@ -665,6 +694,30 @@ mod tests {
         assert_eq!(fmt_interval(&d(-80.0, 0.2, Better::Higher), -100.0, -60.0), "2.5× worse … \u{2212}100.0%");
         let tiny = 100.0 * (f64::MIN_POSITIVE / 4.0 - 1.0);
         assert_eq!(fmt_interval(&d(-20.0, 0.8, Better::Higher), tiny, 10.0), "\u{2212}100.0% … +10.0%");
+        // The cautious end of an interval that excludes no change is cut
+        // off, the far end rounded. 124 -> 2834 us, ends 4.87× and 52.6×:
+        // "at least 4.8×" in plain words must not meet "4.9×" here.
+        let c = |x: f64| -(x - 1.0) * 100.0; // lower is better: x times worse
+        assert_eq!(fmt_interval(&d(c(23.0), 1.0 / 23.0, Better::Lower), c(52.6), c(4.87)), "4.8× … 53×");
+        assert_eq!(fmt_interval(&d(c(23.0), 1.0 / 23.0, Better::Lower), c(52.6), c(10.9)), "10× … 53×");
+        // Better: the cautious end is the low one. 3.1× better, 1.57× to 16.6×.
+        let b = |x: f64| (1.0 - 1.0 / x) * 100.0; // lower is better: x times better
+        assert_eq!(fmt_interval(&d(b(3.1), 3.1, Better::Lower), b(1.57), b(16.6)), "1.5× … 17×");
+        // Percentages too, towards no change on either side.
+        assert_eq!(fmt_interval(&d(20.3, 1.25, Better::Lower), 7.16, 35.36), "+7.1% … +35.4%");
+        assert_eq!(fmt_interval(&d(-11.4, 0.886, Better::Higher), -12.26, -9.37), "\u{2212}12.3% … \u{2212}9.3%");
+        // A cautious end that is a labelled multiple.
+        assert_eq!(fmt_interval(&d(40.0, 1.4, Better::Higher), 109.0, 190.0), "2.0× better … 2.9× better");
+        // What is shown already is not cut further.
+        assert_eq!(fmt_interval(&d(-91.4, 1.0 / 1.914, Better::Lower), -115.3, -80.1), "2.2× worse … \u{2212}80.1%");
+        // Across no change neither end is the cautious one: both rounded.
+        assert_eq!(fmt_interval(&d(-21.4, 1.0 / 1.214, Better::Lower), c(4.87), b(2.37)), "4.9× worse … 2.4× better");
+        // An end exactly at no change: "1.0×" next to a multiple, "0.0%"
+        // next to a percentage; such an interval does not exclude no change.
+        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 0.0), "1.0× … 6.0×");
+        assert_eq!(fmt_interval(&d(66.7, 3.0, Better::Lower), 0.0, 83.3), "1.0× … 6.0×");
+        assert_eq!(fmt_interval(&d(2.8, 1.03, Better::Lower), 0.0, 6.8), "0.0% … +6.8%");
+        assert_eq!(fmt_interval(&d(-2.8, 0.97, Better::Higher), -6.8, 0.0), "\u{2212}6.8% … 0.0%");
         // Every conversion inverts change().
         for better in [Better::Lower, Better::Higher] {
             for (base, v) in [(10.0, 354.0), (1.14, 0.13), (1614.0, 586.0)] {

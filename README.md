@@ -355,7 +355,9 @@ compared with each other.
 * Changes of 2× or more are written as multiples ("34× worse"). So is any
   end of an interval that far from no change, with its direction, since a
   percentage hides it: "−2819.1% … +97.2%" for a latency is "29× worse …
-  36× better", an interval that includes no change. The change
+  36× better", an interval that includes no change. Of an interval that
+  excludes no change, the end nearer to it is cut off rather than rounded
+  (4.87× reads "4.8×"), as in the plain-words "at least". The change
   axis is capped at ±100%; larger changes are drawn clipped.
 * `compare` refuses to compute a change, and leaves the series out of the
   latency charts, when the workload parameters (`pairs`, `hogs`, …) differ
