@@ -50,11 +50,13 @@ fn amount_of(ratio: f64, change_pct: f64) -> String {
         format!("{}×", times(ratio))
     } else if ratio > 0.0 && ratio <= 0.5 {
         format!("{}×", times(1.0 / ratio))
-    } else if change_pct.abs() < 10.0 {
-        format!("{:.1}%", change_pct.abs())
     } else {
-        format!("{:.0}%", change_pct.abs())
+        percent(change_pct)
     }
+}
+
+fn percent(change_pct: f64) -> String {
+    if change_pct.abs() < 10.0 { format!("{:.1}%", change_pct.abs()) } else { format!("{:.0}%", change_pct.abs()) }
 }
 
 fn amount(d: &Delta) -> String {
@@ -65,11 +67,23 @@ fn amount(d: &Delta) -> String {
 /// 2.9×", "39% to 97%". For an interval that lies on one side of no change.
 /// This is the uncertainty of the estimate (the 95% interval of the median
 /// effect), not the smallest and largest effect seen in single rounds.
+///
+/// Both ends are in one unit. Where one end is a multiple (2× or more),
+/// the other is given as a multiple too, even below 2×: "1.2× to 62×", not
+/// "19% to 62×", which reads as two different things.
 fn amount_range(d: &Delta, lo: f64, hi: f64) -> String {
     let mut ends = [(d.ratio_of(lo), lo), (d.ratio_of(hi), hi)];
-    let size = |r: f64| if r > 0.0 && r.is_finite() { r.ln().abs() } else { f64::INFINITY };
+    let usable = |r: f64| r > 0.0 && r.is_finite();
+    let size = |r: f64| if usable(r) { r.ln().abs() } else { f64::INFINITY };
     ends.sort_by(|a, b| size(a.0).total_cmp(&size(b.0)));
-    format!("{} to {}", amount_of(ends[0].0, ends[0].1), amount_of(ends[1].0, ends[1].1))
+    let is_multiple = |r: f64| usable(r) && !(0.5 < r && r < 2.0);
+    let as_multiples = ends.iter().any(|e| is_multiple(e.0)) && ends.iter().all(|e| usable(e.0));
+    // Otherwise percentages for both: either neither end is a multiple, or
+    // one end has no ratio at all (nothing left: 100% fewer).
+    let end = |(ratio, change): (f64, f64)| {
+        if as_multiples { format!("{}×", times(ratio.max(1.0 / ratio))) } else { percent(change) }
+    };
+    format!("{} to {}", end(ends[0]), end(ends[1]))
 }
 
 fn unit(u: &str) -> &str {
@@ -264,6 +278,33 @@ mod tests {
             verdict: Verdict::NoClearDifference,
             points: Vec::new(),
         }
+    }
+
+    #[test]
+    fn interval_ends_share_one_unit() {
+        use helicoprion_core::Better;
+        let d = |better| Delta {
+            median: 0.0,
+            ci: None,
+            ratio: 1.0,
+            paired_rounds: None,
+            unmatched_rounds: false,
+            paired_spread: None,
+            undefined_rounds: 0,
+            better,
+        };
+        // Lower is better. 1434 -> 27.0 µs: about 16% to 98.4% shorter.
+        assert_eq!(amount_range(&d(Better::Lower), 16.7, 98.39), "1.2× to 62×");
+        // 1434 -> 2802 µs: 73.6% to 8254.3% longer.
+        assert_eq!(amount_range(&d(Better::Lower), -8254.3, -73.6), "1.7× to 84×");
+        // Both below 2×: percentages, as before.
+        assert_eq!(amount_range(&d(Better::Lower), -83.9, -42.6), "43% to 84%");
+        // Both multiples, higher is better: 1.23M -> 521.2k round trips.
+        assert_eq!(amount_range(&d(Better::Higher), -65.5, -50.0), "2.0× to 2.9×");
+        assert_eq!(amount_range(&d(Better::Higher), 40.0, 250.0), "1.4× to 3.5×");
+        // An end with no usable ratio (nothing left: -100%) cannot be a
+        // multiple, so the range stays in percent.
+        assert_eq!(amount_range(&d(Better::Higher), -100.0, -60.0), "60% to 100%");
     }
 
     /// `briefs()` yields a scheduler's workloads one after another, but the
