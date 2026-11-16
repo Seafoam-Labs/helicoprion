@@ -79,9 +79,12 @@ pub fn fmt_delta(d: &crate::compare::Delta) -> String {
 
 /// An interval of changes `lo … hi` (percent, worse to better), in the
 /// same terms as `fmt_delta` puts the estimate: next to "8.7× worse" it
-/// reads "9.1× … 8.1×", not "−89.0% … −87.7%". A bound on the other side
-/// of no change, where that multiple would fall below 1×, stays a
-/// percentage.
+/// reads "8.1× … 9.1×", not "−89.0% … −87.7%". Multiples run from the
+/// smaller to the larger, so for "N× worse" the bounds swap places: the
+/// reader sees how many times worse at least, then at most. A bound on
+/// the other side of no change, where that multiple would fall below 1×,
+/// stays a percentage and keeps the small end ("+10.0% … 6.0×" next to
+/// "3.0× worse").
 pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
     let Some(better) = multiple(d.ratio) else {
         return format!("{} … {}", pct(lo), pct(hi));
@@ -91,7 +94,9 @@ pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
         let x = if better { r } else { 1.0 / r };
         if x.is_finite() && x >= 1.0 { format!("{}×", times(x)) } else { pct(c) }
     };
-    format!("{} … {}", bound(lo), bound(hi))
+    // `lo … hi` is worse to better: ascending multiples for "better",
+    // descending for "worse".
+    if better { format!("{} … {}", bound(lo), bound(hi)) } else { format!("{} … {}", bound(hi), bound(lo)) }
 }
 
 fn times(x: f64) -> String {
@@ -589,13 +594,15 @@ mod tests {
         };
         // Numbers from a default vs scx_pandemonium matrix.
         // Higher is better: 1.14M -> 130k round trips/s.
-        assert_eq!(fmt_interval(&d(-88.6, 1.0 / 8.7, Better::Higher), -89.0, -87.7), "9.1× … 8.1×");
+        assert_eq!(fmt_interval(&d(-88.6, 1.0 / 8.7, Better::Higher), -89.0, -87.7), "8.1× … 9.1×");
         // Lower is better: 9.66 -> 354 us.
-        assert_eq!(fmt_interval(&d(-3564.0, 1.0 / 40.0, Better::Lower), -4485.4, -2525.3), "46× … 26×");
+        assert_eq!(fmt_interval(&d(-3564.0, 1.0 / 40.0, Better::Lower), -4485.4, -2525.3), "26× … 46×");
         // Better, lower is better: 1614 -> 586 us.
         assert_eq!(fmt_interval(&d(63.7, 2.75, Better::Lower), 63.2, 68.7), "2.7× … 3.2×");
         // A bound across no change stays a percentage.
-        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "6.0× … +10.0%");
+        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "+10.0% … 6.0×");
+        // The same for a better estimate: the small end first.
+        assert_eq!(fmt_interval(&d(66.7, 3.0, Better::Lower), -10.0, 83.3), "\u{2212}10.0% … 6.0×");
         // No multiple, no conversion.
         assert_eq!(fmt_interval(&d(-11.4, 0.886, Better::Higher), -12.2, -9.3), "\u{2212}12.2% … \u{2212}9.3%");
         // Every conversion inverts change().
