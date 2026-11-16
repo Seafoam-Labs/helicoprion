@@ -41,6 +41,7 @@ details.help { margin: 0 0 16px; font-size: 13px; }
 .brief h4 { margin: 10px 0 4px; font-size: 14px; font-weight: 600; }
 .brief h4:first-of-type { margin-top: 0; }
 .brief ul { margin: 0; padding-left: 20px; } .brief li { margin: 2px 0; }
+.brief .note { margin: 6px 0 0; padding-left: 8px; border-left: 3px solid var(--grid); font-size: 13px; color: var(--ink-2); }
 details.full { margin-top: 24px; } details.full > summary { font-weight: 600; color: var(--ink-1); padding: 8px 0; }
 details.help summary { color: var(--ink-muted); }
 details.help p { color: var(--ink-2); margin: 6px 0 0; padding-left: 12px; border-left: 3px solid var(--grid); }
@@ -207,6 +208,9 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
                 let _ = write!(h, "<li>{}</li>", esc(p));
             }
             h.push_str("</ul>");
+            if let Some(note) = &b.note {
+                let _ = write!(h, "<p class=note>{}</p>", esc(note));
+            }
         }
         h.push_str("</div>");
     }

@@ -420,6 +420,26 @@ pub struct Comparison {
     pub warnings: Vec<String>,
     /// Environment differences vs the baseline (informational).
     pub env_notes: Vec<String>,
+    /// Populations that are a very different part of the run for a
+    /// candidate than for the baseline. Each is also among `warnings`.
+    pub mixes: Vec<Mix>,
+}
+
+/// A population of events (e.g. `rtt_blocked`, round trips that slept)
+/// whose share of the run differs by `MIX_FACTOR` or more between the
+/// baseline and a candidate, and is minor on neither side. Its latencies
+/// are compared, but are not the same events on the two sides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mix {
+    /// Index into `Comparison::series`.
+    pub series: usize,
+    pub workload: String,
+    /// The metric name without its statistic: `rtt_blocked`.
+    pub population: String,
+    /// Share of the baseline's events, 0 to 1.
+    pub baseline_share: f64,
+    /// Share of the candidate's.
+    pub share: f64,
 }
 
 /// Spread of positive ratios relative to one another, in percent: half the
@@ -661,6 +681,7 @@ impl Comparison {
         let mut order: Vec<(String, String)> = Vec::new();
         let mut meta: BTreeMap<(String, String), (String, Better, bool)> = BTreeMap::new();
         let mut warnings = Vec::new();
+        let mut all_mixes = Vec::new();
         let mut diagnostics = Vec::new();
 
         for (si, s) in series.iter().enumerate() {
@@ -846,6 +867,14 @@ descriptive comparisons of medians only, not paired, without intervals",
                         format!("{p} ({} of the baseline's round trips, {} here)", fmt_share(*b), fmt_share(*s))
                     })
                     .collect();
+                // The same finding as data, for the plain-words view.
+                all_mixes.extend(populations.iter().map(|(p, (b, s))| Mix {
+                    series: i,
+                    workload: workload.to_string(),
+                    population: p.to_string(),
+                    baseline_share: *b,
+                    share: *s,
+                }));
                 warnings.push(format!(
                     "{}: in {workload} the two schedulers produce a different mix of round trips: {}. Latencies of \
 such a population describe different parts of the two runs; read them together with roundtrips_per_s, which covers \
@@ -901,7 +930,7 @@ change is undefined; those rounds are left out of the estimate, so these metrics
             })
             .collect();
 
-        Comparison { series, baseline, opts, rows, distributions, diagnostics, warnings, env_notes }
+        Comparison { series, baseline, opts, rows, distributions, diagnostics, warnings, env_notes, mixes: all_mixes }
     }
 }
 
@@ -1902,6 +1931,91 @@ mod tests {
         let reason = |i: usize| c.unclear_reason(row, i, &row.improvement(0, i).unwrap());
         assert_eq!(reason(1), Some(UnclearReason::TooFewRounds));
         assert_eq!(reason(2), Some(UnclearReason::Unstable));
+    }
+
+    /// The mix warning is repeated, in plain words, in the part of "In
+    /// short" whose numbers it qualifies: there and nowhere else, from the
+    /// detection the warning itself comes from.
+    #[test]
+    fn in_short_notes_a_different_mix_where_it_applies() {
+        let note = |c: &Comparison| crate::simple::briefs(c).into_iter().map(|b| b.note).collect::<Vec<_>>();
+        for share in [true, false] {
+            let build = |b, s| {
+                Comparison::build(vec![populations("base", b, 10.0, share), populations("cand", s, 5.0, share)], 0)
+            };
+
+            // Blocked round trips: 99% of the baseline's, 11% of the candidate's.
+            let c = build(990, 110);
+            assert_eq!(c.mixes.len(), 2, "{:?}", c.mixes);
+            assert!(c.mixes.iter().all(|m| m.series == 1 && m.workload == "w"));
+            let said = "Only 11% of round trips needed a wake-up, versus 99% for base. The wake-up delays here do \
+not describe the same mix of round trips.";
+            assert_eq!(note(&c), [Some(said.to_string())]);
+            let text = crate::simple::text(&c);
+            assert!(text.contains(&format!("    Note: {said}\n")), "{text}");
+            // After the points it is about, within the part.
+            assert!(text.find("Typical wake-up delay").unwrap() < text.find("Note:").unwrap());
+            assert!(crate::html::report(&c).contains(&format!("<p class=note>{said}</p>")));
+            // The full report's warning is still there.
+            assert!(c.warnings.iter().any(|w| w.contains("different mix")));
+
+            // The other way round, without "Only".
+            let c = build(300, 900);
+            assert_eq!(
+                note(&c)[0].as_deref().map(|n| n.split('.').next().unwrap()),
+                Some("90% of round trips needed a wake-up, versus 30% for base")
+            );
+
+            // No warning, no note: a similar mix, and a population minor on
+            // one side (which is tagged, and not scored, already).
+            for (b, s) in [(500, 600), (500, 995)] {
+                let c = build(b, s);
+                assert!(c.mixes.is_empty() && note(&c) == [None], "{b} vs {s}");
+                assert!(!crate::simple::text(&c).contains("Note:"));
+                assert!(!crate::html::report(&c).contains("<p class=note>"));
+            }
+
+            // Only the fast population differs by the factor (20% vs 60%
+            // blocked is 3×; here 80% vs 60% blocked, 20% vs 40% fast).
+            let c = build(800, 600);
+            assert_eq!(c.mixes.len(), 1);
+            let n = note(&c)[0].clone().unwrap();
+            // The delays this part shows are those of blocked round trips,
+            // so the note does not call them, or any others, incomparable.
+            assert_eq!(
+                n,
+                "40% of round trips needed no wake-up, versus 20% for base. The mix of round trips differs, so read \
+the round trips completed and the wake-up delays together."
+            );
+        }
+
+        // Same-CPU and cross-CPU wake-ups are both inside the delays shown:
+        // the note says that, not that some other delays are incomparable.
+        // Blocked as a whole is 90% on both sides and raises nothing; of
+        // 1000 round trips 400 vs 100 are on the same CPU.
+        let c = Comparison::build(vec![sub_populations("base", 400, true), sub_populations("cand", 100, true)], 0);
+        assert_eq!(c.mixes.iter().map(|m| m.population.as_str()).collect::<Vec<_>>(), ["rtt_blocked_same_cpu"]);
+        assert_eq!(
+            note(&c),
+            [Some(
+                "Only 10% of round trips needed a wake-up with the two tasks on one CPU, versus 40% for base. The \
+wake-up delays here cover wake-ups on one CPU and across CPUs together, in different proportions for the two."
+                    .to_string()
+            )]
+        );
+
+        // Per scheduler and workload: a note in one card says nothing in another.
+        let c = Comparison::build(
+            vec![
+                populations("base", 900, 10.0, true),
+                populations("same", 880, 5.0, true),
+                populations("other", 110, 5.0, true),
+            ],
+            0,
+        );
+        let notes: Vec<(usize, bool)> =
+            crate::simple::briefs(&c).iter().map(|b| (b.series, b.note.is_some())).collect();
+        assert_eq!(notes, [(1, false), (2, true)]);
     }
 
     /// The summary's largest changes read largest first: multiples before

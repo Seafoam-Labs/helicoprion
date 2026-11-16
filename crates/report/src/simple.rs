@@ -21,6 +21,9 @@ pub struct Brief {
     pub verdict: Verdict,
     /// One line per thing a reader cares about, most important first.
     pub points: Vec<String>,
+    /// What changes how the points should be read: the two schedulers did
+    /// not produce the same mix of round trips.
+    pub note: Option<String>,
 }
 
 /// What a workload measures, for someone who has not read the README.
@@ -250,9 +253,60 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 "Of {} measurements, {} clearly better and {} clearly worse",
                 s.compared, s.better, s.worse
             ));
-            Brief { series: i, workload: s.workload.clone(), title: title(w), verdict: s.verdict(), points }
+            let note = mix_note(c, w, i);
+            Brief { series: i, workload: s.workload.clone(), title: title(w), verdict: s.verdict(), points, note }
         })
         .collect()
+}
+
+/// The full report's warning about a different mix of round trips, next
+/// to the result it qualifies: "11% of round trips needed a wake-up, 99%
+/// for the baseline" changes what "wake-up delay 2× shorter" means, and a
+/// reader of the plain view does not open the warnings. Nothing is
+/// detected here: this puts `Comparison::mixes` in words, one population
+/// per part, the one the points above are about first.
+///
+/// What follows from the finding is said about the numbers the part
+/// shows, which are the delays of all round trips that needed a wake-up
+/// (`rtt_blocked`). Only a different share of exactly those makes the
+/// delays shown "not the same mix". A different share of round trips
+/// without a wake-up is about throughput and delays together, and the
+/// same-CPU and cross-CPU kinds are both inside the delays shown, in
+/// different proportions.
+fn mix_note(c: &Comparison, workload: &str, series: usize) -> Option<String> {
+    // (population, what such a round trip did, what it means for the part)
+    const KINDS: [(&str, &str, &str); 4] = [
+        ("rtt_blocked", "needed a wake-up", "The wake-up delays here do not describe the same mix of round trips."),
+        (
+            "rtt_fast",
+            "needed no wake-up",
+            "The mix of round trips differs, so read the round trips completed and the wake-up delays together.",
+        ),
+        (
+            "rtt_blocked_cross_cpu",
+            "needed a wake-up with the two tasks on different CPUs",
+            "The wake-up delays here cover wake-ups on one CPU and across CPUs together, in different proportions \
+for the two.",
+        ),
+        (
+            "rtt_blocked_same_cpu",
+            "needed a wake-up with the two tasks on one CPU",
+            "The wake-up delays here cover wake-ups on one CPU and across CPUs together, in different proportions \
+for the two.",
+        ),
+    ];
+    let of = |population: &str| {
+        c.mixes.iter().find(|m| m.series == series && m.workload == workload && m.population == population)
+    };
+    let (m, did, means) = KINDS.iter().find_map(|(p, did, means)| Some((of(p)?, *did, *means)))?;
+    let share = crate::svg::fmt_share;
+    Some(format!(
+        "{}{} of round trips {did}, versus {} for {}. {means}",
+        if m.share < m.baseline_share { "Only " } else { "" },
+        share(m.share),
+        share(m.baseline_share),
+        c.series[c.baseline].label
+    ))
 }
 
 /// For `--simple`, where warnings are folded away with the full report:
@@ -344,6 +398,9 @@ pub fn text(c: &Comparison) -> String {
             for p in &b.points {
                 let _ = writeln!(out, "    • {p}");
             }
+            if let Some(note) = &b.note {
+                let _ = writeln!(out, "    Note: {note}");
+            }
         }
     }
     if let Some(note) = at_least_note(&briefs) {
@@ -364,6 +421,7 @@ mod tests {
             title: title(workload),
             verdict: Verdict::NoClearDifference,
             points: Vec::new(),
+            note: None,
         }
     }
 

@@ -90,7 +90,15 @@ between rounds to score (estimated effect, 95% interval: 2.0× to 2.9×)".
 The interval is the uncertainty of the estimate, not the range of the
 rounds. The verdict and the tally leave such a change out, as the full
 report does. Background CPU work is informational and marked "observed, not
-scored". If the full report has warnings, or the results
+scored". Where the two schedulers produced a different mix of round trips
+(the full report's warning), the part it concerns says so under its points:
+"Note: Only 11% of round trips needed a wake-up, versus 99% for default.
+The wake-up delays here do not describe the same mix of round trips." What
+follows is said about the numbers shown, which are the delays of all round
+trips that needed a wake-up: if only the share of round trips without a
+wake-up differs, the note asks to read throughput and delays together; if
+only the split between one CPU and two differs, it says that the delays
+shown cover both kinds, in different proportions. If the full report has warnings, or the results
 were not all taken on the same setup (kernel, CPUs, governor), `--simple`
 says so above the folded part and in the terminal. So the whole benchmark
 for someone who just wants an answer is
