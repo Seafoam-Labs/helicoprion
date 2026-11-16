@@ -77,26 +77,56 @@ pub fn fmt_delta(d: &crate::compare::Delta) -> String {
     }
 }
 
-/// An interval of changes `lo … hi` (percent, worse to better), in the
-/// same terms as `fmt_delta` puts the estimate: next to "8.7× worse" it
-/// reads "8.1× … 9.1×", not "−89.0% … −87.7%". Multiples run from the
-/// smaller to the larger, so for "N× worse" the bounds swap places: the
-/// reader sees how many times worse at least, then at most. A bound on
-/// the other side of no change, where that multiple would fall below 1×,
-/// stays a percentage and keeps the small end ("+10.0% … 6.0×" next to
-/// "3.0× worse").
+/// An interval of changes `lo … hi` (percent, worse to better), so that
+/// each end says how large it is and on which side of no change.
+///
+/// Next to an estimate given as a multiple, the ends on the estimate's
+/// side are bare multiples and run from the smaller to the larger: "8.7×
+/// worse [8.1× … 9.1×]", how many times worse at least, then at most. So
+/// for "N× worse" the bounds swap places.
+///
+/// Anything else names its direction. An end 2× or more away from no
+/// change is a multiple with "better" or "worse": a percentage hides it,
+/// since "worse" has no floor at −100% ("−2819.1%" is 29× worse) and
+/// "better" for a latency has a ceiling there ("+97.2%" is 36× better).
+/// A nearer end is a signed percentage, whose sign is its direction. So
+/// an interval across no change reads "29× worse … 36× better", and
+/// "7.5× worse" comes with "5.7× better … 8.5× worse" rather than with
+/// "+82.5% … 8.5×", which looked like an interval on one side.
+///
+/// An end without a usable ratio (the candidate at zero, or an overflow)
+/// stays a percentage. Representation only: the ends are the ones given.
 pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
-    let Some(better) = multiple(d.ratio) else {
-        return format!("{} … {}", pct(lo), pct(hi));
-    };
-    let bound = |c: f64| {
+    // `Some(true)`: the estimate is "N× better"; `Some(false)`: "N× worse".
+    let estimate = multiple(d.ratio);
+    let end = |c: f64| {
         let r = d.ratio_of(c);
-        let x = if better { r } else { 1.0 / r };
-        if x.is_finite() && x >= 1.0 { format!("{}×", times(x)) } else { pct(c) }
+        // On the estimate's side, as a bare multiple even below 2×.
+        if let Some(better) = estimate {
+            let x = if better { r } else { 1.0 / r };
+            if x.is_finite() && x >= 1.0 {
+                return (format!("{}×", times(x)), true);
+            }
+        }
+        let text = match multiple(r) {
+            Some(true) => format!("{}× better", times(r)),
+            Some(false) if (1.0 / r).is_finite() => format!("{}× worse", times(1.0 / r)),
+            _ => pct(c),
+        };
+        (text, false)
     };
+    let ((mut worse, worse_bare), (mut better, better_bare)) = (end(lo), end(hi));
+    // A bare multiple next to an end that names its direction would leave
+    // the reader to work out its side: name it too.
+    if let Some(is_better) = estimate
+        && worse_bare != better_bare
+    {
+        let bare = if worse_bare { &mut worse } else { &mut better };
+        bare.push_str(if is_better { " better" } else { " worse" });
+    }
     // `lo … hi` is worse to better: ascending multiples for "better",
     // descending for "worse".
-    if better { format!("{} … {}", bound(lo), bound(hi)) } else { format!("{} … {}", bound(hi), bound(lo)) }
+    if estimate == Some(false) { format!("{better} … {worse}") } else { format!("{worse} … {better}") }
 }
 
 pub(crate) fn times(x: f64) -> String {
@@ -599,12 +629,42 @@ mod tests {
         assert_eq!(fmt_interval(&d(-3564.0, 1.0 / 40.0, Better::Lower), -4485.4, -2525.3), "26× … 46×");
         // Better, lower is better: 1614 -> 586 us.
         assert_eq!(fmt_interval(&d(63.7, 2.75, Better::Lower), 63.2, 68.7), "2.7× … 3.2×");
-        // A bound across no change stays a percentage.
-        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "+10.0% … 6.0×");
+        // An end across no change, nearer than 2×, is a signed percentage;
+        // the multiple beside it then says which side it is on.
+        assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "+10.0% … 6.0× worse");
         // The same for a better estimate: the small end first.
-        assert_eq!(fmt_interval(&d(66.7, 3.0, Better::Lower), -10.0, 83.3), "\u{2212}10.0% … 6.0×");
+        assert_eq!(fmt_interval(&d(66.7, 3.0, Better::Lower), -10.0, 83.3), "\u{2212}10.0% … 6.0× better");
         // No multiple, no conversion.
         assert_eq!(fmt_interval(&d(-11.4, 0.886, Better::Higher), -12.2, -9.3), "\u{2212}12.2% … \u{2212}9.3%");
+        // Both sides of no change, both ends far: seen in one matrix.
+        // Lower is better, 33.5 -> 42.2 us: "−21.4% [−2819.1% … +97.2%]".
+        assert_eq!(fmt_interval(&d(-21.4, 1.0 / 1.214, Better::Lower), -2819.1, 97.2), "29× worse … 36× better");
+        // 33.5 -> 255 us: "7.5× worse [+82.5% … 8.5×]" looked one-sided.
+        assert_eq!(fmt_interval(&d(-650.0, 1.0 / 7.5, Better::Lower), -750.0, 82.5), "5.7× better … 8.5× worse");
+        // The same for a better estimate, small end first.
+        assert_eq!(fmt_interval(&d(60.0, 2.5, Better::Lower), -57.4, 82.1), "\u{2212}57.4% … 5.6× better");
+        assert_eq!(fmt_interval(&d(74.4, 3.9, Better::Lower), -1265.1, 89.6), "14× worse … 9.6× better");
+        // Higher is better: worse has its floor at −100%, better has none.
+        assert_eq!(fmt_interval(&d(10.0, 1.1, Better::Higher), -80.0, 400.0), "5.0× worse … 5.0× better");
+        assert_eq!(fmt_interval(&d(-60.0, 0.4, Better::Higher), -75.0, 150.0), "2.5× better … 4.0× worse");
+        // A percentage estimate with a far end on its own side: the end is
+        // a multiple, and says its direction. 11.7 -> 22.9 us.
+        assert_eq!(fmt_interval(&d(-91.4, 1.0 / 1.914, Better::Lower), -115.3, -80.1), "2.2× worse … \u{2212}80.1%");
+        assert_eq!(fmt_interval(&d(40.0, 1.4, Better::Higher), 30.0, 110.0), "+30.0% … 2.1× better");
+        // The boundary is 2×, inclusive, on either side and for either
+        // direction: a change of +50% or −100% for a latency, +100% or
+        // −50% for a rate.
+        assert_eq!(fmt_interval(&d(0.0, 1.0, Better::Lower), -100.0, 50.0), "2.0× worse … 2.0× better");
+        assert_eq!(fmt_interval(&d(0.0, 1.0, Better::Lower), -99.0, 49.0), "\u{2212}99.0% … +49.0%");
+        assert_eq!(fmt_interval(&d(0.0, 1.0, Better::Higher), -50.0, 100.0), "2.0× worse … 2.0× better");
+        assert_eq!(fmt_interval(&d(0.0, 1.0, Better::Higher), -49.0, 99.0), "\u{2212}49.0% … +99.0%");
+        // No finite ratio: a latency of zero (+100%), a rate of zero
+        // (−100%), a ratio whose inverse overflows. Percentages, as given.
+        assert_eq!(fmt_interval(&d(20.0, 1.25, Better::Lower), -10.0, 100.0), "\u{2212}10.0% … +100.0%");
+        assert_eq!(fmt_interval(&d(-20.0, 0.8, Better::Higher), -100.0, 10.0), "\u{2212}100.0% … +10.0%");
+        assert_eq!(fmt_interval(&d(-80.0, 0.2, Better::Higher), -100.0, -60.0), "2.5× worse … \u{2212}100.0%");
+        let tiny = 100.0 * (f64::MIN_POSITIVE / 4.0 - 1.0);
+        assert_eq!(fmt_interval(&d(-20.0, 0.8, Better::Higher), tiny, 10.0), "\u{2212}100.0% … +10.0%");
         // Every conversion inverts change().
         for better in [Better::Lower, Better::Higher] {
             for (base, v) in [(10.0, 354.0), (1.14, 0.13), (1614.0, 586.0)] {

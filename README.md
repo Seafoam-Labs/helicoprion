@@ -347,7 +347,10 @@ compared with each other.
 * Single-sample extremes (`*_max`) and informational metrics
   (`hog_work_per_s`, which only says how CPU time was split between the
   hogs and the ping/pong threads) are listed but never scored or charted.
-* Changes of 2× or more are written as multiples ("34× worse"). The change
+* Changes of 2× or more are written as multiples ("34× worse"). So is any
+  end of an interval that far from no change, with its direction, since a
+  percentage hides it: "−2819.1% … +97.2%" for a latency is "29× worse …
+  36× better", an interval that includes no change. The change
   axis is capped at ±100%; larger changes are drawn clipped.
 * `compare` refuses to compute a change, and leaves the series out of the
   latency charts, when the workload parameters (`pairs`, `hogs`, …) differ
