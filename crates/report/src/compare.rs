@@ -511,9 +511,23 @@ impl Comparison {
                         s.uneven += 1;
                     }
                 }
-                // Largest first, by how far the ratio is from 1 either way.
-                let size = |d: &Delta| if d.ratio > 0.0 && d.ratio.is_finite() { d.ratio.ln().abs() } else { 0.0 };
-                s.top.sort_by(|a, b| size(&b.1).total_cmp(&size(&a.1)));
+                // Largest first, as the reader sees them: changes shown as a
+                // multiple (2× or more) before those shown as a percentage,
+                // multiples by their factor, percentages by their size. By
+                // ratio alone "-20.4%" of a rate outranks "-25.1%" of a
+                // latency, and the list looks unsorted.
+                let size = |d: &Delta| {
+                    let r = d.ratio;
+                    if r.is_finite() && r > 0.0 && !(0.5 < r && r < 2.0) {
+                        (1, r.ln().abs())
+                    } else {
+                        (0, d.median.abs())
+                    }
+                };
+                s.top.sort_by(|a, b| {
+                    let (a, b) = (size(&a.1), size(&b.1));
+                    b.0.cmp(&a.0).then(b.1.total_cmp(&a.1))
+                });
                 s.top.truncate(3);
                 if s.compared > 0 {
                     out.push(s);
@@ -1392,6 +1406,34 @@ mod tests {
             let w = at(0, 300).expect("zero share on one side only, metric present");
             assert!(w.contains("rtt_blocked (0.00% of the baseline's round trips, 30% here)"), "{w}");
         }
+    }
+
+    /// The summary's largest changes read largest first: multiples before
+    /// percentages, each by the number shown.
+    #[test]
+    fn largest_clear_changes_are_in_the_order_they_read() {
+        let mut files = drifting_session();
+        for (f, cand) in files.iter_mut().zip([false, true]) {
+            for r in &mut f.workloads[0].runs {
+                let v = r.metrics["p99"].value;
+                // Candidate: latency 25.1% higher, rate 20.4% lower, wait 3× longer.
+                let (p99, ops, wait) = if cand { (1.251 / 0.9, 0.796 / 0.9, 3.0 / 0.9) } else { (1.0, 1.0, 1.0) };
+                r.metrics.insert("p99".into(), Metric::lower(v * p99, "us"));
+                r.metrics.insert("ops".into(), Metric::higher(v * ops, "1/s"));
+                r.metrics.insert("wait".into(), Metric::lower(v * wait, "us"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let s = &c.summary()[0];
+        let top: Vec<(&str, String)> = s.top.iter().map(|(m, d)| (m.as_str(), crate::svg::fmt_delta(d))).collect();
+        assert_eq!(
+            top,
+            [
+                ("wait", "3.0× worse".to_string()),
+                ("p99", "\u{2212}25.1%".to_string()),
+                ("ops", "\u{2212}20.4%".to_string())
+            ]
+        );
     }
 
     #[test]
