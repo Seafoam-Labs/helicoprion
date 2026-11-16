@@ -111,17 +111,36 @@ fn interval_text(d: &crate::compare::Delta) -> String {
 }
 
 /// A share (0–1) as a percentage with enough digits to tell 0.05% from 0.5%.
+/// Cut off, not rounded: a share is shown next to the threshold it is
+/// under, and 0.96% must not read "1.0%, under the 1% threshold". The
+/// number shown is never above the share itself.
 pub fn fmt_share(share: f64) -> String {
     let p = share * 100.0;
-    if p > 0.0 && p < 0.01 {
+    let cut = |digits: usize| {
+        let scale = 10f64.powi(digits as i32);
+        // The epsilon keeps 0.29 * 100 = 28.999999999999996 at 29...
+        let mut n = (p * scale + 1e-9).floor() as u64;
+        // ...and must not lift a share onto a value above it: 0.009999999999
+        // is under 1%. `n` at `digits` decimals of a percent is the fraction
+        // n·10^-(digits+2); parsed as a decimal it is the nearest double,
+        // the same one the literal 0.29 gives.
+        let shown: f64 = format!("{n}e-{}", digits + 2).parse().unwrap_or(f64::INFINITY);
+        if shown > share && n > 0 {
+            n -= 1;
+        }
+        format!("{:.digits$}%", n as f64 / scale)
+    };
+    // The digits follow the share itself, not `p`: the product can land on
+    // the next step (the double just under 0.1, times 100, is 10).
+    if share > 0.0 && share < 0.0001 {
         // Not "0.00%": the population is tiny, not empty.
         "<0.01%".into()
-    } else if p < 0.1 {
-        format!("{p:.2}%")
-    } else if p < 10.0 {
-        format!("{p:.1}%")
+    } else if share < 0.001 {
+        cut(2)
+    } else if share < 0.1 {
+        cut(1)
     } else {
-        format!("{p:.0}%")
+        cut(0)
     }
 }
 
@@ -621,6 +640,45 @@ mod tests {
         assert_eq!(fmt_share(0.0004), "0.04%");
         assert_eq!(fmt_share(0.005), "0.5%");
         assert_eq!(fmt_share(0.15), "15%");
+        // Cut off, never rounded up onto or over a threshold.
+        assert_eq!(fmt_share(0.0096), "0.9%");
+        assert_eq!(fmt_share(0.00099), "0.09%");
+        assert_eq!(fmt_share(0.0999), "9.9%");
+        assert_eq!(fmt_share(0.4999), "49%");
+        assert_eq!(fmt_share(0.9996), "99%");
+        assert_eq!(fmt_share(1.0), "100%");
+        // Exactly at a threshold, and the closest a share gets under it:
+        // the epsilon that absorbs binary noise must not lift it across.
+        assert_eq!(fmt_share(0.01), "1.0%");
+        assert_eq!(fmt_share(0.009999999999), "0.9%");
+        assert_eq!(fmt_share(0.01f64.next_down()), "0.9%");
+        assert_eq!(fmt_share(0.1f64.next_down()), "9.9%");
+        assert_eq!(fmt_share(0.001f64.next_down()), "0.09%");
+        assert_eq!(fmt_share(0.5f64.next_down()), "49%");
+        // Never above the share, and never a whole step below it.
+        for k in 1..=20_000u32 {
+            let share = f64::from(k) / 20_000.0;
+            for s in [share.next_down(), share, share.next_up().min(1.0)] {
+                let text = fmt_share(s);
+                let Ok(shown) = text.trim_end_matches('%').parse::<f64>() else {
+                    assert_eq!(text, "<0.01%");
+                    continue;
+                };
+                let step = if s < 0.001 {
+                    0.01
+                } else if s < 0.1 {
+                    0.1
+                } else {
+                    1.0
+                };
+                assert!(shown / 100.0 <= s + 1e-15, "{s} reads {text}");
+                assert!(s * 100.0 - shown < step + 1e-9, "{s} reads {text}: cut too far");
+            }
+        }
+        // Binary noise below a whole value is not a cut.
+        for (share, text) in [(0.29, "29%"), (0.07, "7.0%"), (0.57, "57%"), (0.003, "0.3%"), (0.0007, "0.07%")] {
+            assert_eq!(fmt_share(share), text);
+        }
     }
 
     #[test]
