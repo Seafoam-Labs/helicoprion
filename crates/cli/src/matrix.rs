@@ -542,12 +542,33 @@ pub fn switch_and_settle(
     let left = || deadline.saturating_duration_since(Instant::now()).min(cfg.cmd_timeout);
     ctl.scxcli(&t.spec.scxcli_args(), left())?;
     let mut stable_since: Option<(Instant, Scheduler)> = None;
-    let mut why;
+    // Why the last state read was not the target, for the timeout message.
+    let mut why: Option<String> = None;
+    let unsettled = |why: Option<String>| {
+        format!(
+            "{} did not settle within {:?}: {}",
+            t.label,
+            cfg.timeout,
+            why.unwrap_or_else(|| "still changing".into())
+        )
+    };
     loop {
         if interrupted() {
             bail!("interrupted while switching to {}", t.label);
         }
-        let state = ctl.get(left())?;
+        // The deadline can pass during the poll sleep. Asking scxcli with no
+        // time left would only report "scxcli get did not finish within
+        // 0ns" and hide what the scheduler was doing.
+        let remaining = left();
+        if remaining.is_zero() {
+            bail!(unsettled(why));
+        }
+        let state = match ctl.get(remaining) {
+            Ok(state) => state,
+            // Cut short by the switch deadline, not by its own limit.
+            Err(e) if Instant::now() >= deadline => bail!("{}; last scxcli call: {e:#}", unsettled(why)),
+            Err(e) => return Err(e.context(format!("while switching to {}", t.label))),
+        };
         if let Some(f) = state.get("failure").filter(|f| !f.is_null()) {
             let msg = f.get("message").and_then(Value::as_str).unwrap_or("unknown failure");
             bail!("{} failed to start: {msg}", t.label);
@@ -565,12 +586,7 @@ pub fn switch_and_settle(
             (_, Some(_)) => stable_since = None,
         }
         if now >= deadline {
-            bail!(
-                "{} did not settle within {:?}: {}",
-                t.label,
-                cfg.timeout,
-                why.unwrap_or_else(|| "still changing".into())
-            );
+            bail!(unsettled(why));
         }
         std::thread::sleep(cfg.poll);
     }
@@ -1183,6 +1199,78 @@ mod tests {
         let state = json!({ "scheduler": "scx_eevdf", "running": { "sched": "scx_eevdf", "args": [] } });
         let k = Scheduler::Ext { name: "eevdf".into(), ops: "eevdf".into(), enable_seq: Some(1) };
         assert!(mismatch(&t, &state, &k, false).unwrap().contains("running with"));
+    }
+
+    /// A scheduler that never comes up, as scxcli would show it. Records
+    /// the time limit of every `get`.
+    struct Stuck {
+        limits: RefCell<Vec<Duration>>,
+        /// `get` uses up its whole time limit and then fails this way, as a
+        /// hung scxcli killed by `run_bounded` would.
+        hangs: Option<&'static str>,
+    }
+
+    impl Control for Stuck {
+        fn get(&self, limit: Duration) -> Result<Value> {
+            self.limits.borrow_mut().push(limit);
+            if let Some(e) = self.hangs {
+                std::thread::sleep(limit);
+                bail!("{e}");
+            }
+            Ok(json!({ "version": 2, "scheduler": null, "failure": null }))
+        }
+        fn list(&self, _: Duration) -> Result<Value> {
+            unreachable!()
+        }
+        fn scxcli(&self, _: &[String], _: Duration) -> Result<()> {
+            Ok(())
+        }
+        fn systemctl(&self, _: &str, _: Duration) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// The switch deadline usually passes during a poll sleep. The error
+    /// must then say what the scheduler was doing, not "scxcli get --json
+    /// did not finish within 0ns".
+    #[test]
+    fn switch_timeout_reports_why_not_a_zero_time_limit() {
+        let target = Target {
+            label: "scx_panda".into(),
+            spec: Spec::Start("scx_panda".into()),
+            process: "scx_panda".into(),
+            args: None,
+        };
+        let cfg = SwitchCfg {
+            timeout: Duration::from_millis(50),
+            settle: Duration::from_millis(5),
+            // Longer than what is left after a few polls: the deadline falls in a sleep.
+            poll: Duration::from_millis(20),
+            cmd_timeout: Duration::from_secs(1),
+            allow_ops_mismatch: false,
+        };
+        let detect = || Scheduler::Fair { class: "EEVDF".into(), scx_capable: true, bore: None };
+        let switch =
+            |ctl: &Stuck| format!("{:#}", switch_and_settle(ctl, &detect, &|| false, &target, &cfg).unwrap_err());
+
+        let ctl = Stuck { limits: RefCell::default(), hangs: None };
+        let e = switch(&ctl);
+        assert!(e.contains("scx_panda did not settle within 50ms"), "{e}");
+        assert!(e.contains("scxcli reports None, expected \"scx_panda\""), "{e}");
+        assert!(!e.contains("0ns"), "{e}");
+        // However many state reads fit in (a loaded machine may manage only
+        // one before the deadline), none was started with no time at all.
+        let limits = ctl.limits.borrow();
+        assert!(!limits.is_empty() && limits.iter().all(|l| !l.is_zero()), "{limits:?}");
+
+        // scxcli itself hangs until the switch deadline cuts it short: still
+        // the settle message, with the scxcli error after it.
+        let hung = "scxcli get --json did not finish within 50ms; killed";
+        let ctl = Stuck { limits: RefCell::default(), hangs: Some(hung) };
+        let e = switch(&ctl);
+        assert!(e.starts_with("scx_panda did not settle within 50ms: "), "{e}");
+        assert!(e.ends_with(&format!("last scxcli call: {hung}")), "{e}");
+        assert_eq!(ctl.limits.borrow().len(), 1);
     }
 
     #[test]
