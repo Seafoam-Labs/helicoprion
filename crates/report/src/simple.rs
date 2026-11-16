@@ -86,6 +86,60 @@ fn amount_range(d: &Delta, lo: f64, hi: f64) -> String {
     format!("{} to {}", end(ends[0]), end(ends[1]))
 }
 
+/// A factor for an "at least" claim: cut off at the digits shown, never
+/// rounded, so that the claim holds ("at least 1.49×" for 1.4993, not
+/// "1.5×"). Two decimals below 2×, where one would often leave "1.0×".
+fn floor_times(x: f64) -> String {
+    let cut = |digits: i32| {
+        let scale = 10f64.powi(digits);
+        (x * scale).floor() / scale
+    };
+    if x >= 10.0 {
+        format!("{:.0}×", cut(0))
+    } else if x >= 2.0 {
+        format!("{:.1}×", cut(1))
+    } else {
+        format!("{:.2}×", cut(2))
+    }
+}
+
+/// The same for a percentage.
+fn floor_percent(change_pct: f64) -> String {
+    let p = change_pct.abs();
+    if p < 10.0 { format!("{:.1}%", (p * 10.0).floor() / 10.0) } else { format!("{:.0}%", p.floor()) }
+}
+
+/// ", at least 1.49×" for a scored change whose estimate is far above the
+/// cautious end of its 95% interval: "54× shorter" alone sounds surer than
+/// an interval of 1.5× to 55× allows. Far means that the estimate is at
+/// least twice as far from no change as the cautious end (as a factor
+/// minus one: 54× is 53 away, 1.5× is 0.5 away). In the unit of the
+/// estimate: a multiple next to a multiple, a percentage next to a
+/// percentage; cut off, not rounded, since "at least" must not overstate
+/// the end. `None` where the interval is tight on that side, or where
+/// there is none or an end has no usable ratio.
+fn at_least(d: &Delta) -> Option<String> {
+    let (lo, hi) = d.ci?;
+    // Distance from no change as a factor of 1 or more. A ratio that is
+    // zero, not finite, or so small that its inverse overflows gives none.
+    let factor = |ratio: f64| {
+        let f = if ratio > 0.0 { ratio.max(1.0 / ratio) } else { f64::NAN };
+        f.is_finite().then_some(f)
+    };
+    let estimate = factor(d.ratio)?;
+    let cautious = [lo, hi]
+        .into_iter()
+        .map(|change| Some((factor(d.ratio_of(change))?, change)))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))?;
+    if estimate - 1.0 < 2.0 * (cautious.0 - 1.0) {
+        return None;
+    }
+    let shown = if estimate >= 2.0 { floor_times(cautious.0) } else { floor_percent(cautious.1) };
+    Some(format!(", at least {shown}"))
+}
+
 fn unit(u: &str) -> &str {
     match u {
         "us" => " µs",
@@ -119,7 +173,7 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     let values = format!("{} → {}{}", fmt_value(b), fmt_value(v), unit(&row.unit));
     let word = if d.median > 0.0 { words.0 } else { words.1 };
     Some(if c.clear(row, i, &d) {
-        format!("{label}: {} {word} ({values})", amount(&d))
+        format!("{label}: {} {word}{} ({values})", amount(&d), at_least(&d).unwrap_or_default())
     } else if let (Some(_), Some((lo, hi))) = (c.held_back_by_unevenness(row, i, &d), d.ci) {
         format!(
             "{label}: {word}; the effect varied too much between rounds to score (estimated effect, 95% interval: {}; {values})",
@@ -230,6 +284,16 @@ pub fn nothing_to_compare(c: &Comparison) -> String {
 pub const WHAT: &str = "The test makes pairs of tasks wake each other up in turn, as fast as they can: \
 what a snappy desktop, a game or a busy server depends on.";
 
+/// What "at least" stands for, where a line says it: the cautious end of
+/// an estimated interval reads like a promise otherwise.
+pub const AT_LEAST: &str = "\"At least\" is the cautious end of the 95% interval around the estimate: how small \
+the change may plausibly be, not a guaranteed minimum.";
+
+/// `AT_LEAST`, if any of the briefs has such a line.
+pub fn at_least_note(briefs: &[Brief]) -> Option<&'static str> {
+    briefs.iter().flat_map(|b| &b.points).any(|p| p.contains(", at least ")).then_some(AT_LEAST)
+}
+
 /// The briefs of one scheduler together, schedulers in report order: one
 /// card per scheduler, with a part per workload.
 pub fn by_scheduler(briefs: &[Brief]) -> Vec<(usize, Vec<&Brief>)> {
@@ -262,6 +326,9 @@ pub fn text(c: &Comparison) -> String {
             }
         }
     }
+    if let Some(note) = at_least_note(&briefs) {
+        let _ = writeln!(out, "\n{note}");
+    }
     let _ = writeln!(out, "\n{WHAT}");
     out
 }
@@ -278,6 +345,50 @@ mod tests {
             verdict: Verdict::NoClearDifference,
             points: Vec::new(),
         }
+    }
+
+    /// A scored change far above the cautious end of its interval says so.
+    #[test]
+    fn a_wide_interval_adds_the_cautious_end() {
+        use helicoprion_core::Better;
+        let d = |better, median: f64, ratio: f64, ci| Delta {
+            median,
+            ci,
+            ratio,
+            paired_rounds: Some(5),
+            unmatched_rounds: false,
+            paired_spread: None,
+            undefined_rounds: 0,
+            better,
+        };
+        let lower = |median, ratio, ci| at_least(&d(Better::Lower, median, ratio, Some(ci)));
+        let higher = |median, ratio, ci| at_least(&d(Better::Higher, median, ratio, Some(ci)));
+        // 1434 -> 26.8 µs, interval about 1.5× to 55× shorter. A change of
+        // 33.3% is a factor of 1.4993: "at least 1.5×" would overstate it.
+        assert_eq!(lower(98.1, 54.0, (33.3, 98.2)).as_deref(), Some(", at least 1.49×"));
+        assert_eq!(lower(98.1, 54.0, (31.5, 98.2)).as_deref(), Some(", at least 1.45×"));
+        // Close to no change the second decimal keeps the claim useful.
+        assert_eq!(lower(98.1, 54.0, (3.8, 98.2)).as_deref(), Some(", at least 1.03×"));
+        // Larger factors: one decimal, then none, always cut off.
+        assert_eq!(lower(98.1, 54.0, (79.0, 98.2)).as_deref(), Some(", at least 4.7×"));
+        assert_eq!(lower(99.5, 200.0, (94.9, 99.6)).as_deref(), Some(", at least 19×"));
+        // 1434 -> 2802 µs: 98% longer, interval 91% to 68×. The estimate
+        // sits at the cautious end; the wide side is the other one.
+        assert_eq!(lower(-97.7, 1.0 / 1.977, (-6783.1, -91.1)), None);
+        // Tight intervals: 2.2× fewer (1.9× to 2.5×), 13% fewer (12% to 13.5%).
+        assert_eq!(higher(-54.5, 1.0 / 2.2, (-60.0, -47.4)), None);
+        assert_eq!(higher(-12.7, 0.873, (-13.5, -12.0)), None);
+        // In percent next to a percentage: 50% more, interval 6% to 90%.
+        assert_eq!(higher(50.0, 1.5, (6.0, 90.0)).as_deref(), Some(", at least 6.0%"));
+        assert_eq!(higher(50.0, 1.5, (6.79, 90.0)).as_deref(), Some(", at least 6.7%"));
+        assert_eq!(higher(90.0, 1.9, (19.9, 95.0)).as_deref(), Some(", at least 19%"));
+        // 9× better, interval 4.6× to 9.7×: 8 away against 3.6, over twice.
+        assert_eq!(lower(88.9, 9.0, (78.3, 89.7)).as_deref(), Some(", at least 4.6×"));
+        // No interval, or an end without a ratio: nothing to add.
+        assert_eq!(at_least(&d(Better::Lower, 98.1, 54.0, None)), None);
+        assert_eq!(higher(-80.0, 0.2, (-100.0, -20.0)), None);
+        // An estimate so small that its inverse overflows.
+        assert_eq!(higher(-99.9, f64::MIN_POSITIVE / 4.0, (-99.95, -20.0)), None);
     }
 
     #[test]

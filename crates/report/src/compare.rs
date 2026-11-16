@@ -1636,6 +1636,67 @@ mod tests {
         assert!(crate::html::report_with(&apart, true).contains(&why) && crate::simple::text(&apart).contains(&why));
     }
 
+    /// "at least" belongs to a scored change only. Through the whole path:
+    /// a tail 54× shorter in five rounds of six and 1.5× in one is scored,
+    /// with a wide interval; the same numbers on a minor population, or with
+    /// rounds too uneven to score, are not, and must not read as if they were.
+    #[test]
+    fn at_least_is_said_only_for_scored_changes() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Case {
+            Scored,
+            Minor,
+            Uneven,
+        }
+        let session = |case: Case| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "wake-pingpong/loaded".into();
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    let shorter = match (case, k / 2) {
+                        // Half the rounds 54×, half 1.5×: nothing like one factor.
+                        (Case::Uneven, round) if round % 2 == 1 => 1.5,
+                        (Case::Scored | Case::Minor, 2) => 1.5,
+                        _ => 54.0,
+                    };
+                    let v = 1434.0 * wobble / if is_cand { shorter } else { 1.0 };
+                    let m = Metric::lower(v, "us");
+                    r.metrics.clear();
+                    r.metrics.insert("rtt_blocked_p99.9".into(), if case == Case::Minor { m.share(0.001) } else { m });
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let line = |c: &Comparison| {
+            crate::simple::text(c).lines().find(|l| l.contains("Slowest wake-ups")).unwrap().trim().to_string()
+        };
+
+        let c = session(Case::Scored);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert!(c.clear(&c.rows[0], 1, &d), "{d:?}");
+        let said = line(&c);
+        assert!(said.starts_with("• Slowest wake-ups (1 in 1000): 54× shorter, at least "), "{said}");
+        // What is claimed holds for the interval's cautious end.
+        let claimed: f64 = said.split("at least ").nth(1).unwrap().split('×').next().unwrap().parse().unwrap();
+        let (lo, hi) = d.ci.unwrap();
+        let cautious = d.ratio_of(lo).min(d.ratio_of(hi));
+        assert!(claimed <= cautious && cautious < 27.0, "{said} vs {cautious}");
+        // And it is said what "at least" is: an end of an interval, no promise.
+        let explained = "not a guaranteed minimum";
+        assert!(crate::simple::text(&c).contains(explained) && crate::html::report(&c).contains(explained));
+
+        for case in [Case::Minor, Case::Uneven] {
+            let c = session(case);
+            let d = c.rows[0].improvement(0, 1).unwrap();
+            assert!(!c.clear(&c.rows[0], 1, &d), "{case:?}: {d:?}");
+            let said = line(&c);
+            assert!(!said.contains("at least"), "{case:?}: {said}");
+            assert!(!said.contains("54× shorter"), "{case:?} must not read as scored: {said}");
+            assert!(!crate::simple::text(&c).contains(explained) && !crate::html::report(&c).contains(explained));
+        }
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]

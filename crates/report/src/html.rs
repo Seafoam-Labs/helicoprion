@@ -211,6 +211,9 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
         h.push_str("</div>");
     }
     h.push_str("</div>");
+    if let Some(note) = crate::simple::at_least_note(&briefs) {
+        let _ = write!(h, "<p class=cap>{}</p>", esc(note));
+    }
 }
 
 /// The report; with `simple`, everything but the plain-words section is

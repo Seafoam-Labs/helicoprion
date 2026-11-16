@@ -75,7 +75,10 @@ scoring is the same as in the full report: a line says "more" or "longer"
 only where the table colours the change, and "no reliable difference"
 otherwise, however far apart the two numbers look; a verdict of "no clear
 difference" means the run could not tell the two apart, not that they are
-equal. Where a change is held back only because its size differed
+equal. Where the estimate of a scored change is far above the cautious end of
+its interval, the line adds that end, cut off rather than rounded: "54×
+shorter, at least 1.49×". That is an end of an estimated 95% interval, not a
+guaranteed minimum, and the report says so wherever it uses the phrase. Where a change is held back only because its size differed
 from round to round, the line still gives the direction, which the interval
 supports, and says why it is not scored: "fewer; the effect varied too much
 between rounds to score (estimated effect, 95% interval: 2.0× to 2.9×)".
