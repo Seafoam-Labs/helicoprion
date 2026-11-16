@@ -34,6 +34,11 @@ td .m, .m { color: var(--ink-muted); }
 details { margin-top: 8px; } summary { cursor: pointer; color: var(--ink-2); }
 .cap { color: var(--ink-2); margin: 0 0 6px; }
 details.help { margin: 0 0 16px; font-size: 13px; }
+.briefs { display: grid; gap: 12px; margin: -8px 0 20px; }
+.brief { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 16px; }
+.brief h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.brief ul { margin: 0; padding-left: 20px; } .brief li { margin: 2px 0; }
+details.full { margin-top: 24px; } details.full > summary { font-weight: 600; color: var(--ink-1); padding: 8px 0; }
 details.help summary { color: var(--ink-muted); }
 details.help p { color: var(--ink-2); margin: 6px 0 0; padding-left: 12px; border-left: 3px solid var(--grid); }
 footer { color: var(--ink-muted); margin-top: 40px; font-size: 12px; }
@@ -158,6 +163,46 @@ fn summary_section(h: &mut String, c: &Comparison) {
 }
 
 pub fn report(c: &Comparison) -> String {
+    report_with(c, false)
+}
+
+/// "In short": the comparison in plain words (`simple::briefs`).
+fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
+    let briefs = crate::simple::briefs(c);
+    if briefs.is_empty() {
+        // The full report shows what there is. Folded away, it would leave
+        // a page that does not say why there is no result.
+        if simple {
+            let _ = write!(h, "<h2>In short</h2><p class=sub>{}</p>", esc(&crate::simple::nothing_to_compare(c)));
+        }
+        return;
+    }
+    let _ = write!(
+        h,
+        "<h2>In short</h2><p class=sub>Compared with <strong>{}</strong>. {}</p><div class=briefs>",
+        esc(&c.series[c.baseline].label),
+        esc(crate::simple::WHAT)
+    );
+    for b in &briefs {
+        let (_, cls) = verdict_word(b.verdict);
+        let _ = write!(
+            h,
+            "<div class=brief><h3>{} · {}: <span class={cls}>{}</span></h3><ul>",
+            esc(&c.series[b.series].label),
+            esc(&b.title),
+            esc(crate::simple::verdict_phrase(b.verdict))
+        );
+        for p in &b.points {
+            let _ = write!(h, "<li>{}</li>", esc(p));
+        }
+        h.push_str("</ul></div>");
+    }
+    h.push_str("</div>");
+}
+
+/// The report; with `simple`, everything but the plain-words section is
+/// folded into one collapsed block, for readers who only want the outcome.
+pub fn report_with(c: &Comparison, simple: bool) -> String {
     let mut h = String::new();
     let base = &c.series[c.baseline];
     let _ = write!(
@@ -181,6 +226,8 @@ pub fn report(c: &Comparison) -> String {
     }
     h.push_str("</div>");
 
+    // Everything from here to the footer is the full report.
+    let full_from = h.len();
     for w in &c.warnings {
         let _ = write!(h, r#"<div class="warn">⚠ {}</div>"#, esc(w));
     }
@@ -359,6 +406,23 @@ pub fn report(c: &Comparison) -> String {
             }
             h.push_str("</table></details>");
         }
+    }
+
+    let full = h.split_off(full_from);
+    in_short_section(&mut h, c, simple);
+    if simple {
+        if let Some(caution) = crate::simple::caution(c) {
+            let _ = write!(h, r#"<div class="warn">⚠ {}</div>"#, esc(&caution));
+        }
+        if let Some(environment) = crate::simple::environment(c) {
+            let _ = write!(h, r#"<div class="note">{}</div>"#, esc(&environment));
+        }
+        let _ = write!(
+            h,
+            "<details class=full><summary>Full report: charts, every measurement, notes on how to read them</summary>{full}</details>"
+        );
+    } else {
+        h.push_str(&full);
     }
 
     let _ = write!(

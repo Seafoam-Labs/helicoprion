@@ -191,9 +191,10 @@ fn main() -> Result<()> {
             suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag },
             output,
             opts: thresholds.options()?,
+            simple: thresholds.simple,
         }),
         Cmd::Compare { files, baseline, output, svg_dir, thresholds } => {
-            compare(&files, baseline, &output, svg_dir, thresholds.options()?)
+            compare(&files, baseline, &output, svg_dir, thresholds.options()?, thresholds.simple)
         }
     }
 }
@@ -313,6 +314,7 @@ fn compare(
     output: &Path,
     svg_dir: Option<PathBuf>,
     opts: Options,
+    simple: bool,
 ) -> Result<()> {
     const MAX: usize = 8;
     if files.len() > MAX {
@@ -346,7 +348,7 @@ fn compare(
     };
 
     let c = Comparison::build_with(parsed, base, opts);
-    write_report_with(&c, output)?;
+    write_report_with(&c, output, simple)?;
 
     if let Some(dir) = svg_dir {
         fs::create_dir_all(&dir)?;
@@ -403,6 +405,7 @@ struct MatrixArgs {
     suite_opts: SuiteOpts,
     output: Option<PathBuf>,
     opts: Options,
+    simple: bool,
 }
 
 fn matrix_cmd(a: MatrixArgs) -> Result<()> {
@@ -507,8 +510,11 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     if let Some(e) = &out.restore_error {
         eprintln!("error:     the previous scx.service state was NOT restored: {e:#}");
     }
-    let report =
-        if out.files.is_empty() { Ok(()) } else { write_report(out.files, &out_dir.join("report.html"), a.opts) };
+    let report = if out.files.is_empty() {
+        Ok(())
+    } else {
+        write_report(out.files, &out_dir.join("report.html"), a.opts, a.simple)
+    };
     if let Err(e) = &report {
         eprintln!("error:     writing the report failed: {e:#}");
     }
@@ -520,19 +526,31 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     }
 }
 
-fn write_report(files: Vec<ResultFile>, path: &Path, opts: Options) -> Result<()> {
-    write_report_with(&Comparison::build_with(files, 0, opts), path)
+fn write_report(files: Vec<ResultFile>, path: &Path, opts: Options, simple: bool) -> Result<()> {
+    write_report_with(&Comparison::build_with(files, 0, opts), path, simple)
 }
 
-fn write_report_with(c: &Comparison, path: &Path) -> Result<()> {
-    print!("{}", html::text_table(c));
-    for w in &c.warnings {
-        eprintln!("warning: {w}");
+fn write_report_with(c: &Comparison, path: &Path, simple: bool) -> Result<()> {
+    if simple {
+        print!("\n{}", helicoprion_report::simple::text(c));
+        // The warnings and environment notes themselves are in the full
+        // report; that there are some is said here.
+        if let Some(caution) = helicoprion_report::simple::caution(c) {
+            eprintln!("\n⚠ {caution}");
+        }
+        if let Some(environment) = helicoprion_report::simple::environment(c) {
+            eprintln!("note: {environment}");
+        }
+    } else {
+        print!("{}", html::text_table(c));
+        for w in &c.warnings {
+            eprintln!("warning: {w}");
+        }
+        for n in &c.env_notes {
+            eprintln!("note:    {n}");
+        }
     }
-    for n in &c.env_notes {
-        eprintln!("note:    {n}");
-    }
-    fs::write(path, html::report(c)).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(path, html::report_with(c, simple)).with_context(|| format!("writing {}", path.display()))?;
     eprintln!("wrote {}", path.display());
     Ok(())
 }
@@ -554,6 +572,12 @@ struct Thresholds {
     /// but never highlighted or charted. 0 turns this off.
     #[arg(long, default_value_t = 1.0)]
     min_share: f64,
+    /// Plain-words result for readers who only want to know which
+    /// scheduler did better: the terminal shows a short "In short" instead
+    /// of the metric table, and the HTML report opens with it and folds
+    /// the charts and tables away. The numbers and the scoring are the same.
+    #[arg(long)]
+    simple: bool,
 }
 
 impl Thresholds {

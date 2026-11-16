@@ -99,7 +99,7 @@ pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
     if better { format!("{} … {}", bound(lo), bound(hi)) } else { format!("{} … {}", bound(hi), bound(lo)) }
 }
 
-fn times(x: f64) -> String {
+pub(crate) fn times(x: f64) -> String {
     if x >= 10.0 { format!("{x:.0}") } else { format!("{x:.1}") }
 }
 

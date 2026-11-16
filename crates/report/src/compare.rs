@@ -1408,6 +1408,129 @@ mod tests {
         }
     }
 
+    /// The plain-words view says what the full report scores, no more.
+    #[test]
+    fn in_short_says_it_in_plain_words() {
+        // A busy-system session shaped like scx_cake vs scx_pandemonium.
+        let session = |workload: &str, cand: [f64; 4]| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = workload.into();
+                for r in &mut f.workloads[0].runs {
+                    // The helper's own drift and jitter, without its 10% effect.
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    let x = |base: f64, k: usize| (if is_cand { cand[k] } else { base }) * wobble;
+                    r.metrics.clear();
+                    r.metrics.insert("roundtrips_per_s".into(), Metric::higher(x(542.4e3, 0), "1/s"));
+                    r.metrics.insert("rtt_blocked_p50".into(), Metric::lower(x(14.0, 1), "us"));
+                    r.metrics.insert("rtt_blocked_p99.9".into(), Metric::lower(x(45.6, 2), "us"));
+                    r.metrics.insert("hog_work_per_s".into(), Metric::info(x(1.61e6, 3), "units/s"));
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let c = session("wake-pingpong/loaded", [216.5e3, 36.1, 1335.0, 2.18e6]);
+        let text = crate::simple::text(&c);
+        for want in [
+            "In short, compared with base:",
+            "cand · Busy system (every CPU kept busy): WORSE",
+            "• Round trips completed: 2.5× fewer (",
+            "• Typical wake-up delay: 2.6× longer (",
+            "• Slowest wake-ups (1 in 1000): 29× longer (",
+            " µs)",
+            " per second)",
+            "• Background CPU work: 35% higher (observed, not scored)",
+            "• Of 3 measurements, 0 clearly better and 3 clearly worse",
+        ] {
+            assert!(text.contains(want), "missing {want:?} in:\n{text}");
+        }
+        // The same words open the HTML report; --simple folds the rest away.
+        let full = crate::html::report(&c);
+        let simple = crate::html::report_with(&c, true);
+        for html in [&full, &simple] {
+            let (short, summary) = (html.find("<h2>In short</h2>").unwrap(), html.find("<h2>Summary</h2>").unwrap());
+            assert!(short < summary && html.contains("<li>Typical wake-up delay: 2.6× longer ("));
+        }
+        assert!(!full.contains("<details class=full>"));
+        let folded = simple.find("<details class=full>").unwrap();
+        assert!(
+            simple.find("<h2>In short</h2>").unwrap() < folded && folded < simple.find("<h2>Summary</h2>").unwrap()
+        );
+        assert!(simple.contains("</details><footer>"), "everything up to the footer is folded");
+
+        // No clear change is said as such, never as a small "better".
+        let c = session("wake-pingpong", [545.0e3, 14.1, 45.0, 1.62e6]);
+        let text = crate::simple::text(&c);
+        assert!(text.contains("cand · Idle system: NO CLEAR DIFFERENCE"), "{text}");
+        assert!(text.contains("• Round trips completed: no reliable difference ("), "{text}");
+        assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
+        assert!(!text.contains("fewer") && !text.contains("longer"), "{text}");
+        // Background work is left out unless both sides are comparable.
+        let mut files = drifting_session();
+        for f in &mut files {
+            f.workloads[0].name = "wake-pingpong/loaded".into();
+            for r in &mut f.workloads[0].runs {
+                r.metrics.insert("hog_work_per_s".into(), Metric::info(1.0e6, "units/s"));
+            }
+        }
+        files[0].workloads[0].runs.iter_mut().for_each(|r| {
+            r.metrics.insert("hog_work_per_s".into(), Metric::info(1.0e6, "other-unit"));
+        });
+        assert!(!crate::simple::text(&Comparison::build(files, 0)).contains("Background CPU work"));
+
+        // Warnings are folded away with the full report, but not silently.
+        let mut c = session("wake-pingpong/loaded", [216.5e3, 36.1, 1335.0, 2.18e6]);
+        assert_eq!(crate::simple::caution(&c), None);
+        assert!(!crate::html::report_with(&c, true).contains("require caution"));
+        c.warnings.push("cand: something to know".into());
+        let caution = crate::simple::caution(&c).unwrap();
+        assert_eq!(caution, "Some measurements require caution: see the 1 warning in the full report.");
+        let simple = crate::html::report_with(&c, true);
+        let (said, folded) = (simple.find(&caution).unwrap(), simple.find("<details class=full>").unwrap());
+        assert!(said < folded && folded < simple.find("something to know").unwrap());
+        assert!(!crate::html::report(&c).contains("require caution"), "the full report shows the warnings themselves");
+
+        // The same for results taken on different setups, said apart from
+        // the warnings: it is not a flaw in a measurement.
+        assert_eq!(crate::simple::environment(&c), None);
+        c.env_notes.extend(["cand: kernel differs".to_string(), "cand: governor differs".to_string()]);
+        let environment = crate::simple::environment(&c).unwrap();
+        assert_eq!(
+            environment,
+            "The results were not all taken on the same setup: see the 2 notes in the full report."
+        );
+        assert_eq!(crate::simple::caution(&c).unwrap(), caution, "notes are not counted as warnings");
+        let simple = crate::html::report_with(&c, true);
+        let (said, folded) = (simple.find(&environment).unwrap(), simple.find("<details class=full>").unwrap());
+        assert!(said < folded && folded < simple.find("governor differs").unwrap());
+        assert!(!crate::html::report(&c).contains("not all taken on the same setup"));
+
+        // A workload without plain words still gets its largest changes.
+        let c = Comparison::build(drifting_session(), 0);
+        let text = crate::simple::text(&c);
+        assert!(text.contains("cand · w: BETTER") && text.contains("• p99: +10.0%"), "{text}");
+        assert!(text.contains("• Of 1 measurements, 1 clearly better and 0 clearly worse"), "{text}");
+
+        // One file: nothing to compare, said plainly.
+        let one = Comparison::build(vec![file("solo", &[1.0; 5], 1)], 0);
+        let why = "Nothing to compare with solo yet: a comparison needs results from two schedulers.";
+        assert_eq!(crate::simple::text(&one).trim_end(), why);
+        // --simple folds the full report away, so the page says it too; the
+        // full report shows what there is and needs no such line.
+        let simple = crate::html::report_with(&one, true);
+        let said = simple.find(&format!("<h2>In short</h2><p class=sub>{why}</p>")).expect("explained");
+        assert!(said < simple.find("<details class=full>").unwrap());
+        assert!(!crate::html::report(&one).contains("In short"));
+
+        // Two files that share nothing comparable (other workload
+        // parameters): a different reason, not "needs two schedulers".
+        let apart = Comparison::build(vec![file("one", &[1.0; 5], 1), file("other", &[2.0; 5], 8)], 0);
+        assert!(crate::simple::briefs(&apart).is_empty());
+        let why = crate::simple::nothing_to_compare(&apart);
+        assert!(why.starts_with("The results cannot be compared with one: they were not measured the same way."));
+        assert!(crate::html::report_with(&apart, true).contains(&why) && crate::simple::text(&apart).contains(&why));
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]

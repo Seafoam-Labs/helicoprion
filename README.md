@@ -49,6 +49,32 @@ default 5 rounds (about 11 minutes for five schedulers). The list comes from
 the scx catalog, so a distribution or an admin decides what is in it.
 `--recommended` cannot be combined with `--sched`; all other options apply.
 
+Add `--simple` for a result in plain words (also for `compare`):
+
+```
+In short, compared with default:
+
+scx_cake · Busy system (every CPU kept busy): BETTER
+  • Round trips completed: 2.5× more (216.5k → 542.4k per second)
+  • Typical wake-up delay: 2.6× shorter (36.1 → 14.0 µs)
+  • Slowest wake-ups (1 in 1000): 29× shorter (1335 → 45.6 µs)
+  • Background CPU work: 26% lower (observed, not scored)
+  • Of 12 measurements, 11 clearly better and 0 clearly worse
+```
+
+The HTML report always opens with this "In short" section; with `--simple`
+the charts, tables and reading notes are folded under "Full report". The
+scoring is the same as in the full report: a line says "more" or "longer"
+only where the table colours the change, and "no reliable difference"
+otherwise, however far apart the two numbers look; a verdict of "no clear
+difference" means the run could not tell the two apart, not that they are
+equal. Background CPU work is informational and marked "observed, not
+scored". If the full report has warnings, or the results
+were not all taken on the same setup (kernel, CPUs, governor), `--simple`
+says so above the folded part and in the terminal. So the whole benchmark
+for someone who just wants an answer is
+`sudo helicoprion matrix --recommended --simple`.
+
 Every round visits each scheduler once, in alternating order (A B C, C B A,
 A B C, …), and runs every workload during each visit, so slow drift
 (thermal state, background activity) hits every scheduler alike. Switching

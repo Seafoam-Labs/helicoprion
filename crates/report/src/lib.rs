@@ -3,6 +3,7 @@
 
 pub mod compare;
 pub mod html;
+pub mod simple;
 pub mod stats;
 pub mod svg;
 mod theme;
