@@ -77,7 +77,7 @@ fn delta_cell(
         .map(|spread| {
             let what = match spread {
                 PairedSpread::Relative(_) => format!(
-                    "the per-round ratios between the two schedulers differ from one another by more than ±{uneven_threshold}%"
+                    "the per-round ratios between the two schedulers differ from one another by more than ±{uneven_threshold}%, and by more than the cautious end of the interval is away from no change"
                 ),
                 PairedSpread::Points(_) => format!(
                     "in some round the ratio between the two schedulers is zero or not finite (typically a zero value); the per-round changes differ by more than ±{uneven_threshold} percentage points"
@@ -269,9 +269,10 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
 
     if let Some(svg) = delta_chart(c) {
         let paired_note = if c.any_paired() {
-            " <strong>Paired:</strong> files from one <code>matrix</code> session are compared round by round: the change is computed within each round (both schedulers measured under the same conditions), the bar is the median of those per-round changes and the interval resamples whole rounds, so drift between rounds cancels. Cells marked ⇄N were paired over N rounds. Runs of one session are never treated as independent samples: with fewer than 3 shared rounds there is a point estimate and no interval."
+            " <strong>Paired:</strong> files from one <code>matrix</code> session are compared round by round: the change is computed within each round (both schedulers measured under the same conditions), the bar is the median of those per-round changes and the interval resamples whole rounds, so drift between rounds cancels. Cells marked ⇄N were paired over N rounds. Runs of one session are never treated as independent samples: with fewer than 3 shared rounds there is a point estimate and no interval. For paired changes the stability rule above is applied to the rounds, not to the raw spread of a cell: a change is left off the chart (and tagged <em>uneven</em> in the table) when its per-round ratios differ by more than ±{us}% and by more than the effect itself. An effect large enough that even the cautious end of its interval is farther from no change than that spread outweighs it and is charted."
+                .replace("{us}", &c.opts.unstable_spread_pct.to_string())
         } else {
-            ""
+            String::new()
         };
         let _ = write!(
             h,
@@ -296,7 +297,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. A change tagged <em>n of m rounds undefined</em> comes from a session where the baseline measured zero in some rounds: a percentage change does not exist there, the estimate covers the other rounds only, and it is not scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has no usable ratio, typically a zero value, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>), so it is not coloured or charted even when its interval excludes zero.</p></details><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. A change tagged <em>n of m rounds undefined</em> comes from a session where the baseline measured zero in some rounds: a percentage change does not exist there, the estimate covers the other rounds only, and it is not scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has no usable ratio, typically a zero value, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>) and by more than the effect itself, and the change is not coloured or charted even when its interval excludes zero. More than the effect itself means more than the cautious end of the interval is away from no change: <em>2.2× worse</em> with an interval of 1.9× to 2.5× and rounds ±14% apart is scored, <em>16× better</em> with an interval of 1.2× to 60× and rounds ±530% apart is not.</p></details><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct
@@ -521,7 +522,7 @@ pub fn text_table(c: &Comparison) -> String {
         );
         let _ = writeln!(
             out,
-            "≠ uneven: the per-round ratios differ from one another by more than ±{}% (in percentage points of the change where a round has no usable ratio), never starred\n? baseline measured zero in some shared rounds: the change is undefined there and those rounds are left out, never starred",
+            "≠ uneven: the per-round ratios differ from one another by more than ±{}% and by more than the effect's cautious end (in percentage points of the change where a round has no usable ratio), never starred\n? baseline measured zero in some shared rounds: the change is undefined there and those rounds are left out, never starred",
             c.opts.unstable_spread_pct
         );
     }

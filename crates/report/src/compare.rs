@@ -119,10 +119,49 @@ impl Delta {
 
     /// Paired only: the per-round results disagree by more than
     /// `threshold` (`PairedSpread`, returned; percent or percentage points
-    /// alike). The schedulers then did not differ by one factor under the
-    /// session's conditions, so the median change is not scored.
+    /// alike), and by too much for the size of the effect. The schedulers
+    /// then did not differ by one factor under the session's conditions,
+    /// so the median change is not scored.
+    ///
+    /// "Too much for the effect" matters for large effects. With a
+    /// baseline that wobbles by 9% from round to round, "2.2× fewer, 95%
+    /// interval 1.9× to 2.5×" has a spread of 14%, over a 10% threshold,
+    /// and the same measurement read "clear" in one session and "unclear"
+    /// in the next. A spread that the effect outweighs (`outweighs`) is
+    /// not a reason to withhold the direction.
     pub fn uneven(&self, threshold: f64) -> Option<PairedSpread> {
-        self.paired_spread.filter(|s| s.value() > threshold)
+        self.paired_spread.filter(|s| s.value() > threshold && !self.outweighs(*s))
+    }
+
+    /// The effect is larger than its own unevenness: even the cautious end
+    /// of the 95% interval is farther from no change than the per-round
+    /// spread. Both are on the same relative scale, as a factor minus one,
+    /// in percent: a cautious end of "1.9× worse" is 90% away, against a
+    /// spread of ±14%.
+    ///
+    /// Never without an interval, nor with one that includes no change.
+    /// Never when an end of the interval has no usable ratio (zero or not
+    /// finite): there is no distance to compare then, and the cautious
+    /// reading stays. And never for a spread in percentage points: that is
+    /// the fallback for sessions with a round that has no usable ratio (a
+    /// zero on one side), where a relative distance does not exist for
+    /// every round. An effect exactly as large as the spread does not
+    /// outweigh it.
+    fn outweighs(&self, spread: PairedSpread) -> bool {
+        let (PairedSpread::Relative(spread_pct), Some((lo, hi))) = (spread, self.ci) else {
+            return false;
+        };
+        if !self.ci_excludes_zero() {
+            return false;
+        }
+        let distance_pct = |change: f64| {
+            let r = self.ratio_of(change);
+            (r > 0.0 && r.is_finite()).then(|| (r.max(1.0 / r) - 1.0) * 100.0)
+        };
+        match (distance_pct(lo), distance_pct(hi)) {
+            (Some(a), Some(b)) => a.min(b) > spread_pct,
+            _ => false,
+        }
     }
 
     /// The goodness ratio (like `ratio`) that a change of `change_pct`
@@ -1506,9 +1545,10 @@ mod tests {
         assert!(!crate::html::report(&c).contains("not all taken on the same setup"));
 
         // A change held back only because its size varied between rounds
-        // (here 2× to 3× fewer round trips, alternating) has a certain
-        // direction: it is said with its range, not as "no reliable
-        // difference". It stays out of the verdict and the tally.
+        // by more than the effect's cautious end (here 1.2× to 3× fewer
+        // round trips, alternating) still has a supported direction: it is
+        // said with its interval, not as "no reliable difference". It stays
+        // out of the verdict and the tally.
         let mut files = drifting_session();
         for (f, is_cand) in files.iter_mut().zip([false, true]) {
             f.workloads[0].name = "wake-pingpong/loaded".into();
@@ -1516,7 +1556,7 @@ mod tests {
                 let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
                 let factor = match (is_cand, (k / 2) % 2 == 0) {
                     (false, _) => 1.0,
-                    (true, true) => 1.0 / 2.0,
+                    (true, true) => 1.0 / 1.2,
                     (true, false) => 1.0 / 3.0,
                 };
                 r.metrics.clear();
@@ -1532,7 +1572,7 @@ mod tests {
         assert!(
             text.contains(
                 "• Round trips completed: fewer; the effect varied too much between rounds to score \
-                 (estimated effect, 95% interval: 2.0× to 3.0×; "
+                 (estimated effect, 95% interval: 1.2× to 3.0×; "
             ),
             "{text}"
         );
@@ -1815,6 +1855,121 @@ mod tests {
         }
         let s = &c.summary()[0];
         assert_eq!((s.verdict(), s.better, s.worse, s.uneven), (Verdict::Mixed, 1, 1, 0));
+    }
+
+    /// An effect larger than its own unevenness is scored. The same
+    /// measurement must not read "clear" in one session and "unclear" in
+    /// the next only because the baseline wobbled a little more.
+    #[test]
+    fn an_effect_larger_than_its_unevenness_is_scored() {
+        // Round trips per second, higher is better: the candidate has `a`
+        // times fewer in even rounds and `b` times fewer in odd ones.
+        let session = |a: f64, b: f64| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    let factor = match (is_cand, (k / 2) % 2 == 0) {
+                        (false, _) => 1.0,
+                        (true, true) => 1.0 / a,
+                        (true, false) => 1.0 / b,
+                    };
+                    r.metrics.clear();
+                    r.metrics.insert("roundtrips_per_s".into(), Metric::higher(1.2e6 * factor * wobble, "1/s"));
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let threshold = Options::default().unstable_spread_pct;
+
+        // 2× to 3× fewer: the rounds differ by about ±22%, over the
+        // threshold, but the cautious end is 2×, 100% away from no change.
+        let c = session(2.0, 3.0);
+        let row = &c.rows[0];
+        let d = row.improvement(0, 1).unwrap();
+        assert!(matches!(d.paired_spread, Some(PairedSpread::Relative(s)) if (20.0..25.0).contains(&s)), "{d:?}");
+        assert_eq!(d.uneven(threshold), None, "{d:?}");
+        assert!(!row.unstable_pair(0, 1) && c.clear(row, 1, &d) && row.chartable(0, 1));
+        assert_eq!(c.held_back_by_unevenness(row, 1, &d), None);
+        let s = &c.summary()[0];
+        assert_eq!((s.verdict(), s.worse, s.uneven), (Verdict::Worse, 1, 0));
+        assert!(!crate::html::report(&c).contains("class=bad title=\"the per-round ratios"));
+        assert!(crate::simple::text(&c).contains("• Round trips completed: 2.4× fewer ("));
+        // The chart's own help says so too, with the session's threshold.
+        assert!(crate::html::report(&c).contains("differ by more than ±10% and by more than the effect itself"));
+
+        // 1.2× to 3× fewer: about ±58%, against a cautious end of 1.2×,
+        // 20% away. The size is anyone's guess: still held back.
+        let c = session(1.2, 3.0);
+        let row = &c.rows[0];
+        let d = row.improvement(0, 1).unwrap();
+        assert!(d.notable(c.opts.min_effect_pct), "{d:?}");
+        assert!(matches!(d.uneven(threshold), Some(PairedSpread::Relative(s)) if s > 50.0), "{d:?}");
+        assert!(row.unstable_pair(0, 1) && !c.clear(row, 1, &d));
+        assert_eq!(c.summary()[0].uneven, 1);
+
+        // A steady effect has nothing to outweigh.
+        let c = session(2.0, 2.0);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert_eq!(d.uneven(threshold), None);
+        assert!(c.clear(&c.rows[0], 1, &d));
+    }
+
+    /// The edges of "the effect outweighs its unevenness", on `Delta`
+    /// itself: both directions of metric, an interval across no change, an
+    /// effect exactly as large as the spread, and ends without a ratio.
+    #[test]
+    fn outweighing_is_cautious_at_its_edges() {
+        let d = |better, ci: (f64, f64), spread| Delta {
+            median: (ci.0 + ci.1) / 2.0,
+            ci: Some(ci),
+            ratio: 1.0,
+            paired_rounds: Some(5),
+            unmatched_rounds: false,
+            paired_spread: Some(spread),
+            undefined_rounds: 0,
+            better,
+        };
+        let rel = PairedSpread::Relative;
+        let uneven = |d: &Delta| d.uneven(10.0).is_some();
+
+        // Higher is better. 1.9× to 2.5× fewer is -47.4% to -60%.
+        assert!(!uneven(&d(Better::Higher, (-60.0, -47.4), rel(14.6))));
+        // Lower is better: 1.9× to 2.5× longer is -90% to -150%; the
+        // cautious end is 90% away. Shorter by 20% to 60% is 25% away.
+        assert!(!uneven(&d(Better::Lower, (-150.0, -90.0), rel(14.6))));
+        assert!(uneven(&d(Better::Lower, (-150.0, -12.0), rel(14.6))), "cautious end only 12% away");
+        assert!(!uneven(&d(Better::Lower, (20.0, 60.0), rel(14.6))));
+        assert!(uneven(&d(Better::Lower, (20.0, 60.0), rel(30.0))), "25% away against ±30%");
+        // The same change of a rate and of a latency is not the same
+        // distance: -20% of a rate is 25% away (1/0.8), -20% of a latency 20%.
+        assert!(!uneven(&d(Better::Higher, (-40.0, -20.0), rel(22.0))));
+        assert!(uneven(&d(Better::Lower, (-40.0, -20.0), rel(22.0))));
+
+        // An interval across no change supports no direction.
+        assert!(uneven(&d(Better::Higher, (-10.0, 300.0), rel(14.6))));
+        assert!(uneven(&d(Better::Lower, (-300.0, 10.0), rel(14.6))));
+        assert!(uneven(&d(Better::Higher, (0.0, 300.0), rel(14.6))));
+
+        // Exactly as far as the spread: not outweighed. +25% of a rate is
+        // a factor of 1.25, 25% away.
+        assert!(uneven(&d(Better::Higher, (25.0, 80.0), rel(25.0))));
+        assert!(!uneven(&d(Better::Higher, (25.0, 80.0), rel(24.9))));
+
+        // An end without a usable ratio (a rate down by 100%: nothing left;
+        // a latency down by 100%: an infinite ratio) gives no distance.
+        assert!(uneven(&d(Better::Higher, (-100.0, -60.0), rel(14.6))));
+        assert!(uneven(&d(Better::Lower, (60.0, 100.0), rel(14.6))));
+        assert!(uneven(&d(Better::Lower, (f64::NAN, 60.0), rel(14.6))));
+
+        // A spread in percentage points is never outweighed, and a spread
+        // under the threshold never holds anything back.
+        assert!(uneven(&d(Better::Higher, (-60.0, -47.4), PairedSpread::Points(14.6))));
+        assert!(!uneven(&d(Better::Lower, (-150.0, -12.0), rel(9.9))));
+        // No interval, nothing to outweigh with.
+        let mut no_ci = d(Better::Higher, (-60.0, -47.4), rel(14.6));
+        no_ci.ci = None;
+        assert!(uneven(&no_ci));
     }
 
     /// The uneven tag explains why a change that looks clear is not scored,

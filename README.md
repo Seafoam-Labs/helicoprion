@@ -282,9 +282,15 @@ compared with each other.
   per-round results, not the raw spread. When the ratio between the two
   schedulers differs from round to round by more than `--unstable-spread`
   percent (half the interquartile range of the per-round ratios, on a
-  relative scale, so a steady "26× better" counts as even), the change is
-  tagged *uneven ±x%* (`≠` in the terminal table): listed, but not
-  highlighted or charted even if its interval excludes zero. The summary
+  relative scale, so a steady "26× better" counts as even), and by more
+  than the effect itself, the change is tagged *uneven ±x%* (`≠` in the
+  terminal table): listed, but not highlighted or charted even if its
+  interval excludes zero. "More than the effect itself" means more than the
+  cautious end of the 95% interval is away from no change: "2.2× worse,
+  interval 1.9× to 2.5×" with rounds ±14% apart is scored (1.9× is 90%
+  away), "16× better, interval 1.2× to 60×" with rounds ±530% apart is not.
+  Without this, a large effect read "clear" in one session and "unclear" in
+  the next whenever the baseline wobbled a few percent more. The summary
   counts these separately among the unclear ones. A round without a usable
   ratio (typically the candidate measured zero) is not dropped: the
   per-round changes are then compared in percentage points (*uneven ±x
