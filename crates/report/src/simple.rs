@@ -216,6 +216,19 @@ pub fn nothing_to_compare(c: &Comparison) -> String {
 pub const WHAT: &str = "The test makes pairs of tasks wake each other up in turn, as fast as they can: \
 what a snappy desktop, a game or a busy server depends on.";
 
+/// The briefs of one scheduler together, schedulers in report order: one
+/// card per scheduler, with a part per workload.
+pub fn by_scheduler(briefs: &[Brief]) -> Vec<(usize, Vec<&Brief>)> {
+    let mut groups: Vec<(usize, Vec<&Brief>)> = Vec::new();
+    for b in briefs {
+        match groups.iter_mut().find(|(series, _)| *series == b.series) {
+            Some((_, of)) => of.push(b),
+            None => groups.push((b.series, vec![b])),
+        }
+    }
+    groups
+}
+
 /// For the terminal.
 pub fn text(c: &Comparison) -> String {
     let briefs = briefs(c);
@@ -226,13 +239,57 @@ pub fn text(c: &Comparison) -> String {
         return out;
     }
     let _ = writeln!(out, "In short, compared with {base}:");
-    for b in &briefs {
-        let _ =
-            writeln!(out, "\n{} · {}: {}", c.series[b.series].label, b.title, verdict_phrase(b.verdict).to_uppercase());
-        for p in &b.points {
-            let _ = writeln!(out, "  • {p}");
+    for (series, of) in by_scheduler(&briefs) {
+        let _ = writeln!(out, "\n{}", c.series[series].label);
+        for b in of {
+            let _ = writeln!(out, "  {}: {}", b.title, verdict_phrase(b.verdict).to_uppercase());
+            for p in &b.points {
+                let _ = writeln!(out, "    • {p}");
+            }
         }
     }
     let _ = writeln!(out, "\n{WHAT}");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brief(series: usize, workload: &str) -> Brief {
+        Brief {
+            series,
+            workload: workload.into(),
+            title: title(workload),
+            verdict: Verdict::NoClearDifference,
+            points: Vec::new(),
+        }
+    }
+
+    /// `briefs()` yields a scheduler's workloads one after another, but the
+    /// grouping must not depend on that: entries of two schedulers that
+    /// arrive interleaved still end up one card each, schedulers and their
+    /// workloads in order of first appearance.
+    #[test]
+    fn interleaved_briefs_are_grouped_by_scheduler() {
+        let (cake, lavd) = (2, 1);
+        let briefs = [
+            brief(cake, "wake-pingpong"),
+            brief(lavd, "wake-pingpong"),
+            brief(cake, "wake-pingpong/loaded"),
+            brief(lavd, "wake-pingpong/loaded"),
+        ];
+        let groups: Vec<(usize, Vec<&str>)> = by_scheduler(&briefs)
+            .into_iter()
+            .map(|(series, of)| (series, of.into_iter().map(|b| b.workload.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                (cake, vec!["wake-pingpong", "wake-pingpong/loaded"]),
+                (lavd, vec!["wake-pingpong", "wake-pingpong/loaded"]),
+            ]
+        );
+        assert!(by_scheduler(&[]).is_empty());
+    }
 }

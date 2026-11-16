@@ -52,17 +52,24 @@ the scx catalog, so a distribution or an admin decides what is in it.
 Add `--simple` for a result in plain words (also for `compare`):
 
 ```
-In short, compared with default:
+In short, compared with scx_pandemonium:
 
-scx_cake · Busy system (every CPU kept busy): BETTER
-  • Round trips completed: 2.5× more (216.5k → 542.4k per second)
-  • Typical wake-up delay: 2.6× shorter (36.1 → 14.0 µs)
-  • Slowest wake-ups (1 in 1000): 29× shorter (1335 → 45.6 µs)
-  • Background CPU work: 26% lower (observed, not scored)
-  • Of 12 measurements, 11 clearly better and 0 clearly worse
+scx_cake
+  Idle system: WORSE
+    • Round trips completed: no reliable difference (1.25M → 1.26M per second)
+    • Typical wake-up delay: no reliable difference (6.14 → 6.11 µs)
+    • Slowest wake-ups (1 in 1000): 75% longer (11.5 → 20.1 µs)
+    • Of 11 measurements, 0 clearly better and 2 clearly worse
+  Busy system (every CPU kept busy): BETTER
+    • Round trips completed: 2.5× more (216.5k → 542.4k per second)
+    • Typical wake-up delay: 2.6× shorter (36.1 → 14.0 µs)
+    • Slowest wake-ups (1 in 1000): 29× shorter (1335 → 45.6 µs)
+    • Background CPU work: 26% lower (observed, not scored)
+    • Of 12 measurements, 11 clearly better and 0 clearly worse
 ```
 
-The HTML report always opens with this "In short" section; with `--simple`
+The HTML report always opens with this "In short" section, one card per
+scheduler; with `--simple`
 the charts, tables and reading notes are folded under "Full report". The
 scoring is the same as in the full report: a line says "more" or "longer"
 only where the table colours the change, and "no reliable difference"

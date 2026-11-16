@@ -1433,7 +1433,7 @@ mod tests {
         let text = crate::simple::text(&c);
         for want in [
             "In short, compared with base:",
-            "cand · Busy system (every CPU kept busy): WORSE",
+            "\ncand\n  Busy system (every CPU kept busy): WORSE\n",
             "• Round trips completed: 2.5× fewer (",
             "• Typical wake-up delay: 2.6× longer (",
             "• Slowest wake-ups (1 in 1000): 29× longer (",
@@ -1461,7 +1461,7 @@ mod tests {
         // No clear change is said as such, never as a small "better".
         let c = session("wake-pingpong", [545.0e3, 14.1, 45.0, 1.62e6]);
         let text = crate::simple::text(&c);
-        assert!(text.contains("cand · Idle system: NO CLEAR DIFFERENCE"), "{text}");
+        assert!(text.contains("\ncand\n  Idle system: NO CLEAR DIFFERENCE\n"), "{text}");
         assert!(text.contains("• Round trips completed: no reliable difference ("), "{text}");
         assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
         assert!(!text.contains("fewer") && !text.contains("longer"), "{text}");
@@ -1536,14 +1536,44 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("cand · Busy system (every CPU kept busy): NO CLEAR DIFFERENCE"), "{text}");
+        assert!(text.contains("\ncand\n  Busy system (every CPU kept busy): NO CLEAR DIFFERENCE\n"), "{text}");
         assert!(text.contains("• Of 2 measurements, 0 clearly better and 0 clearly worse"), "{text}");
         assert!(text.contains("• Typical wake-up delay: no reliable difference ("), "{text}");
+
+        // Two workloads of one scheduler share a card: the scheduler once,
+        // then a part per workload.
+        let mut files = drifting_session();
+        for f in &mut files {
+            let mut idle = f.workloads[0].clone();
+            idle.name = "wake-pingpong".into();
+            f.workloads[0].name = "wake-pingpong/loaded".into();
+            f.workloads.insert(0, idle);
+        }
+        let c = Comparison::build(files, 0);
+        let briefs = crate::simple::briefs(&c);
+        assert_eq!(briefs.len(), 2);
+        let groups = crate::simple::by_scheduler(&briefs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].1.iter().map(|b| b.title.as_str()).collect::<Vec<_>>(),
+            ["Idle system", "Busy system (every CPU kept busy)"]
+        );
+        let text = crate::simple::text(&c);
+        assert_eq!(text.matches("\ncand\n").count(), 1, "{text}");
+        let (idle, busy) = (
+            text.find("  Idle system: BETTER\n").unwrap(),
+            text.find("  Busy system (every CPU kept busy): BETTER\n").unwrap(),
+        );
+        assert!(idle < busy && text[idle..busy].contains("    • p99: +10.0%"), "{text}");
+        let html = crate::html::report(&c);
+        assert_eq!(html.matches("<div class=brief>").count(), 1);
+        assert_eq!(html.matches("<h4>").count(), 2);
+        assert!(html.contains("</i>cand</h3><h4>Idle system: <span class=good>better</span></h4>"), "{html}");
 
         // A workload without plain words still gets its largest changes.
         let c = Comparison::build(drifting_session(), 0);
         let text = crate::simple::text(&c);
-        assert!(text.contains("cand · w: BETTER") && text.contains("• p99: +10.0%"), "{text}");
+        assert!(text.contains("\ncand\n  w: BETTER\n") && text.contains("• p99: +10.0%"), "{text}");
         assert!(text.contains("• Of 1 measurements, 1 clearly better and 0 clearly worse"), "{text}");
 
         // One file: nothing to compare, said plainly.

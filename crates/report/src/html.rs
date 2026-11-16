@@ -36,7 +36,10 @@ details { margin-top: 8px; } summary { cursor: pointer; color: var(--ink-2); }
 details.help { margin: 0 0 16px; font-size: 13px; }
 .briefs { display: grid; gap: 12px; margin: -8px 0 20px; }
 .brief { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 16px; }
-.brief h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.brief h3 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+.brief h3 i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 8px; }
+.brief h4 { margin: 10px 0 4px; font-size: 14px; font-weight: 600; }
+.brief h4:first-of-type { margin-top: 0; }
 .brief ul { margin: 0; padding-left: 20px; } .brief li { margin: 2px 0; }
 details.full { margin-top: 24px; } details.full > summary { font-weight: 600; color: var(--ink-1); padding: 8px 0; }
 details.help summary { color: var(--ink-muted); }
@@ -183,19 +186,29 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
         esc(&c.series[c.baseline].label),
         esc(crate::simple::WHAT)
     );
-    for b in &briefs {
-        let (_, cls) = verdict_word(b.verdict);
+    // One card per scheduler, a part per workload.
+    for (series, of) in crate::simple::by_scheduler(&briefs) {
+        let s = &c.series[series];
         let _ = write!(
             h,
-            "<div class=brief><h3>{} · {}: <span class={cls}>{}</span></h3><ul>",
-            esc(&c.series[b.series].label),
-            esc(&b.title),
-            esc(crate::simple::verdict_phrase(b.verdict))
+            r#"<div class=brief><h3><i style="background:{}"></i>{}</h3>"#,
+            series_var(s.slot),
+            esc(&s.label)
         );
-        for p in &b.points {
-            let _ = write!(h, "<li>{}</li>", esc(p));
+        for b in of {
+            let (_, cls) = verdict_word(b.verdict);
+            let _ = write!(
+                h,
+                "<h4>{}: <span class={cls}>{}</span></h4><ul>",
+                esc(&b.title),
+                esc(crate::simple::verdict_phrase(b.verdict))
+            );
+            for p in &b.points {
+                let _ = write!(h, "<li>{}</li>", esc(p));
+            }
+            h.push_str("</ul>");
         }
-        h.push_str("</ul></div>");
+        h.push_str("</div>");
     }
     h.push_str("</div>");
 }
