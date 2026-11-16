@@ -31,9 +31,19 @@ crates/cli        the helicoprion binary
 Adding a workload: implement `helicoprion_workloads::Workload` and register it
 in `suite()`.
 
+## Install
+
+From crates.io:
+
+```sh
+cargo install helicoprion
+```
+
+Packages for Arch, Fedora and openSUSE are in [packages/](packages).
+
 ## Quick start
 
-Build the binary and inspect the active scheduler:
+Or build the binary from a checkout, and inspect the active scheduler:
 
 ```sh
 cargo build --release
