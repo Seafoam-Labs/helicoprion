@@ -68,7 +68,13 @@ scoring is the same as in the full report: a line says "more" or "longer"
 only where the table colours the change, and "no reliable difference"
 otherwise, however far apart the two numbers look; a verdict of "no clear
 difference" means the run could not tell the two apart, not that they are
-equal. Background CPU work is informational and marked "observed, not
+equal. Where a change is held back only because its size differed
+from round to round, the line still gives the direction, which the interval
+supports, and says why it is not scored: "fewer; the effect varied too much
+between rounds to score (estimated effect, 95% interval: 2.0× to 2.9×)".
+The interval is the uncertainty of the estimate, not the range of the
+rounds. The verdict and the tally leave such a change out, as the full
+report does. Background CPU work is informational and marked "observed, not
 scored". If the full report has warnings, or the results
 were not all taken on the same setup (kernel, CPUs, governor), `--simple`
 says so above the folded part and in the terminal. So the whole benchmark

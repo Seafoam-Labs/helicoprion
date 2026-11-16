@@ -43,18 +43,33 @@ pub fn verdict_phrase(v: Verdict) -> &'static str {
     }
 }
 
-/// The size of a change the way one says it: "2.5×" or "37%".
-fn amount(d: &Delta) -> String {
-    let r = d.ratio;
-    if r.is_finite() && r >= 2.0 {
-        format!("{}×", times(r))
-    } else if r > 0.0 && r <= 0.5 {
-        format!("{}×", times(1.0 / r))
-    } else if d.median.abs() < 10.0 {
-        format!("{:.1}%", d.median.abs())
+/// The size of a change the way one says it: "2.5×" or "37%", from its
+/// goodness ratio and its percentage.
+fn amount_of(ratio: f64, change_pct: f64) -> String {
+    if ratio.is_finite() && ratio >= 2.0 {
+        format!("{}×", times(ratio))
+    } else if ratio > 0.0 && ratio <= 0.5 {
+        format!("{}×", times(1.0 / ratio))
+    } else if change_pct.abs() < 10.0 {
+        format!("{:.1}%", change_pct.abs())
     } else {
-        format!("{:.0}%", d.median.abs())
+        format!("{:.0}%", change_pct.abs())
     }
+}
+
+fn amount(d: &Delta) -> String {
+    amount_of(d.ratio, d.median)
+}
+
+/// The interval of a change as a range of sizes, smaller first: "2.0× to
+/// 2.9×", "39% to 97%". For an interval that lies on one side of no change.
+/// This is the uncertainty of the estimate (the 95% interval of the median
+/// effect), not the smallest and largest effect seen in single rounds.
+fn amount_range(d: &Delta, lo: f64, hi: f64) -> String {
+    let mut ends = [(d.ratio_of(lo), lo), (d.ratio_of(hi), hi)];
+    let size = |r: f64| if r > 0.0 && r.is_finite() { r.ln().abs() } else { f64::INFINITY };
+    ends.sort_by(|a, b| size(a.0).total_cmp(&size(b.0)));
+    format!("{} to {}", amount_of(ends[0].0, ends[0].1), amount_of(ends[1].0, ends[1].1))
 }
 
 fn unit(u: &str) -> &str {
@@ -73,14 +88,29 @@ fn medians(row: &MetricRow, baseline: usize, i: usize) -> Option<(f64, f64)> {
 /// "Label: 2.6× longer (14.0 → 36.1 µs)", or "no reliable difference"
 /// where the report does not score the change, however far apart the two
 /// medians look. `words` are (better, worse).
+///
+/// In between is a change the report holds back only because its size
+/// differed from round to round (`Comparison::held_back_by_unevenness`).
+/// Its interval excludes no change, so the direction has the same support
+/// as a scored one's; only the size is not one number. Saying "no reliable
+/// difference" next to "1.23M → 521.2k" would be false. The line gives
+/// three things without mixing them up: the direction, that the effect
+/// was too uneven between rounds to score, and the estimate's 95%
+/// interval, named as such, since it is not the range of the rounds. This
+/// does not score the change: the verdict and the tally still leave it out.
 fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, words: (&str, &str)) -> Option<String> {
     let row = c.rows.iter().find(|r| r.workload == workload && r.metric == metric)?;
     let d = row.improvement(c.baseline, i)?;
     let (b, v) = medians(row, c.baseline, i)?;
     let values = format!("{} → {}{}", fmt_value(b), fmt_value(v), unit(&row.unit));
+    let word = if d.median > 0.0 { words.0 } else { words.1 };
     Some(if c.clear(row, i, &d) {
-        let word = if d.median > 0.0 { words.0 } else { words.1 };
         format!("{label}: {} {word} ({values})", amount(&d))
+    } else if let (Some(_), Some((lo, hi))) = (c.held_back_by_unevenness(row, i, &d), d.ci) {
+        format!(
+            "{label}: {word}; the effect varied too much between rounds to score (estimated effect, 95% interval: {}; {values})",
+            amount_range(&d, lo, hi)
+        )
     } else {
         format!("{label}: no reliable difference ({values})")
     })

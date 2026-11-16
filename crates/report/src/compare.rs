@@ -1505,6 +1505,41 @@ mod tests {
         assert!(said < folded && folded < simple.find("governor differs").unwrap());
         assert!(!crate::html::report(&c).contains("not all taken on the same setup"));
 
+        // A change held back only because its size varied between rounds
+        // (here 2× to 3× fewer round trips, alternating) has a certain
+        // direction: it is said with its range, not as "no reliable
+        // difference". It stays out of the verdict and the tally.
+        let mut files = drifting_session();
+        for (f, is_cand) in files.iter_mut().zip([false, true]) {
+            f.workloads[0].name = "wake-pingpong/loaded".into();
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                let factor = match (is_cand, (k / 2) % 2 == 0) {
+                    (false, _) => 1.0,
+                    (true, true) => 1.0 / 2.0,
+                    (true, false) => 1.0 / 3.0,
+                };
+                r.metrics.clear();
+                r.metrics.insert("roundtrips_per_s".into(), Metric::higher(1.2e6 * factor * wobble, "1/s"));
+                r.metrics.insert("rtt_blocked_p50".into(), Metric::lower(10.0 * wobble, "us"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let row = c.rows.iter().find(|r| r.metric == "roundtrips_per_s").unwrap();
+        let d = row.improvement(0, 1).unwrap();
+        assert!(!c.clear(row, 1, &d) && c.held_back_by_unevenness(row, 1, &d).is_some(), "{d:?}");
+        let text = crate::simple::text(&c);
+        assert!(
+            text.contains(
+                "• Round trips completed: fewer; the effect varied too much between rounds to score \
+                 (estimated effect, 95% interval: 2.0× to 3.0×; "
+            ),
+            "{text}"
+        );
+        assert!(text.contains("cand · Busy system (every CPU kept busy): NO CLEAR DIFFERENCE"), "{text}");
+        assert!(text.contains("• Of 2 measurements, 0 clearly better and 0 clearly worse"), "{text}");
+        assert!(text.contains("• Typical wake-up delay: no reliable difference ("), "{text}");
+
         // A workload without plain words still gets its largest changes.
         let c = Comparison::build(drifting_session(), 0);
         let text = crate::simple::text(&c);
