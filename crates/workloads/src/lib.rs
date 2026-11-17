@@ -2,6 +2,7 @@
 //! downloaded assets. Each one stresses a specific scheduler behaviour.
 
 pub mod burst;
+pub mod cgroup;
 mod clock;
 mod futex;
 pub mod hog;
@@ -75,13 +76,26 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
         })
     };
     let bursts = || vec![burst("half", cpus / 2), burst("full", cpus), burst("double", cpus * 2)];
+    // Two groups that could each use the whole machine. Once the same
+    // weight and three times the threads, once the same threads and three
+    // times the weight: a scheduler that treats every thread alike fails
+    // the first, one that knows groups and ignores weights the second.
+    let cgroups = || -> Vec<Box<dyn Workload>> {
+        let n = cpus.max(1);
+        vec![
+            Box::new(cgroup::CgroupFair { case: "equal", weights: (100, 100), threads: (n, 3 * n), cpus: n }),
+            Box::new(cgroup::CgroupFair { case: "weighted", weights: (100, 300), threads: (n, n), cpus: n }),
+        ]
+    };
     match name {
         "quick" => Some(vec![pingpong(0), pingpong(cpus)]),
         "periodic" => Some(vec![periodic(0), periodic(cpus)]),
         "bursts" => Some(bursts()),
+        "cgroups" => Some(cgroups()),
         "all" => {
             let mut all = vec![pingpong(0), pingpong(cpus), periodic(0), periodic(cpus)];
             all.extend(bursts());
+            all.extend(cgroups());
             Some(all)
         }
         _ => None,
@@ -90,8 +104,9 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
 
 /// `quick` is what it has always been, so that results stay comparable
 /// with earlier ones; `periodic` is the timer-driven workload alone,
-/// `bursts` the group wake-ups alone, and `all` runs everything.
-pub const SUITES: &[&str] = &["quick", "periodic", "bursts", "all"];
+/// `bursts` the group wake-ups alone, `cgroups` the split between control
+/// groups alone, and `all` runs everything.
+pub const SUITES: &[&str] = &["quick", "periodic", "bursts", "cgroups", "all"];
 
 #[cfg(test)]
 mod tests {
@@ -106,7 +121,8 @@ mod tests {
         assert_eq!(names("quick", 16), ["wake-pingpong", "wake-pingpong/loaded"]);
         assert_eq!(names("periodic", 16), ["periodic-wake", "periodic-wake/loaded"]);
         assert_eq!(names("bursts", 16), ["wake-burst/half", "wake-burst/full", "wake-burst/double"]);
-        assert_eq!(names("all", 16).len(), 7);
+        assert_eq!(names("cgroups", 16), ["cgroup-fair/equal", "cgroup-fair/weighted"]);
+        assert_eq!(names("all", 16).len(), 9);
         assert_eq!(names("all", 16)[..4], [names("quick", 16), names("periodic", 16)].concat());
         // Sizes follow the machine, and a single CPU still has a task.
         let tasks = |cpus: usize| -> Vec<u64> {
@@ -115,6 +131,11 @@ mod tests {
         };
         assert_eq!(tasks(16), [8, 16, 32]);
         assert_eq!(tasks(1), [1, 1, 2]);
+        // Both groups can use every CPU; what differs is one thing each.
+        let groups = super::suite("cgroups", 16, SuiteOpts::default()).unwrap();
+        let p = |k: usize, name: &str| groups[k].params()[name].as_u64().unwrap();
+        assert_eq!([p(0, "weight_a"), p(0, "weight_b"), p(0, "threads_a"), p(0, "threads_b")], [100, 100, 16, 48]);
+        assert_eq!([p(1, "weight_a"), p(1, "weight_b"), p(1, "threads_a"), p(1, "threads_b")], [100, 300, 16, 16]);
         for name in SUITES {
             assert!(super::suite(name, 2, SuiteOpts::default()).is_some(), "{name}");
         }

@@ -85,9 +85,12 @@ the output directory still has all the data and charts.
 pairs of threads as fast as it goes, `periodic` wakes a few threads on a
 timer for a short piece of work, as a frame or an audio buffer would,
 `bursts` wakes a whole group of threads at once, as a thread pool given a
-batch would, and `all` runs all three. The first two come idle and with
-every CPU kept busy, the bursts with half as many threads as CPUs, as many
-and twice as many.
+batch would, `cgroups` runs two control groups of busy threads and checks
+that the CPUs are split between them by their weights, and `all` runs all
+four. The first two come idle and with every CPU kept busy, the bursts with
+half as many threads as CPUs, as many and twice as many, and the control
+groups once with unequal thread counts and once with unequal weights.
+`cgroups` needs root and cgroup v2 with the `cpu` controller.
 
 ### Compare existing result files
 

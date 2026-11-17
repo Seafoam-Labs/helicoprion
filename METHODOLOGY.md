@@ -123,15 +123,17 @@ about it.
 The same holds for where the benchmark itself runs. The control groups of
 the process are read when the session starts and after every run, and a run
 after which they differ is invalid, as is every later one: its limits and
-weights are no longer those of the runs before.
+weights are no longer those of the runs before. `cgroup-fair` moves the
+process for its own runs and puts it back, and this is what notices if that
+ever fails.
 
 ## What is measured
 
 The `quick` suite has two workloads, both with one thread pair for every two
 CPUs. The `periodic` suite has the two timer-driven ones, `bursts` the three
-sizes of a group woken at once, and `all` runs all seven. `quick` is the
-default and stays as it is, so that its results remain comparable with
-earlier ones.
+sizes of a group woken at once, `cgroups` the two cases of a split between
+control groups, and `all` runs all nine. `quick` is the default and stays as
+it is, so that its results remain comparable with earlier ones.
 
 | Name | What it does | Metrics |
 |---|---|---|
@@ -142,6 +144,8 @@ earlier ones.
 | `wake-burst/half` | One thread wakes a group of sleeping threads with one call every 2 ms, half as many as there are CPUs; each works for 200 µs of CPU time and sleeps again | p50, p99, p99.9 and max in µs of the time until a task runs, until the whole group runs and until the whole group is done, and the share of wake-ups that found the task still at work |
 | `wake-burst/full` | The same with as many tasks as CPUs | The same |
 | `wake-burst/double` | The same with twice as many tasks as CPUs | The same |
+| `cgroup-fair/equal` | Two control groups of busy threads with the same `cpu.weight`, one with as many threads as CPUs and one with three times as many | How closely the split of CPU time follows the weights, the share of all CPU time that was used, the first group's share, and work per second |
+| `cgroup-fair/weighted` | The same with as many threads as CPUs in both groups and three times the weight for the second | The same |
 
 ### Blocked and fast round trips
 
@@ -299,6 +303,78 @@ been handed less work.
 The start and the handling of failures are those of `periodic-wake`: all
 tasks report ready before the first burst, and a run that cannot start or
 in which a thread fails ends as invalid after every thread has been joined.
+
+### Control groups
+
+The workloads above ask how soon a task runs. `cgroup-fair` asks who gets
+the CPUs when there are not enough of them, and by which rule. The kernel
+tells a desktop session from a build, or one service from another, as
+control groups, and `cpu.weight` says how the CPUs are to be split between
+them. A scheduler can follow that, split by group and ignore the weights,
+or know nothing of groups and treat every thread alike. Two cases tell
+these apart:
+
+| Case | Weights | Threads | By the weights | Every thread alike |
+|---|---|---|---|---|
+| `cgroup-fair/equal` | 100 : 100 | CPUs : 3 × CPUs | 50% : 50% | 25% : 75% |
+| `cgroup-fair/weighted` | 100 : 300 | CPUs : CPUs | 25% : 75% | 50% : 50% |
+
+A scheduler that does not schedule groups at all fails the first case. One
+that schedules groups and ignores their weights passes the first and fails
+the second. Every thread is busy all the time and each group has at least
+as many threads as there are CPUs, so each group could use the whole
+machine and the split is the scheduler's alone.
+
+What is measured is the CPU time each thread got during the window, read
+from the threads' own CPU clocks by the measuring thread at both ends of
+it, and summed per group.
+
+- `weight_accuracy_pct` is how close the ratio of the two groups' CPU time
+  is to the ratio of their weights, as a percentage of it. 100% is exact,
+  and being off by a factor of three is 33% whichever group got too much,
+  which is what both cases give under the wrong rule. It is scored, and
+  higher is better. It is a ratio and not a difference of shares so that a
+  relative change means something: an error of 0.1 against 0.3 percentage
+  points would be a threefold difference that nobody cares about.
+- `cpu_used_pct` is the CPU time of both groups as a share of what the
+  machine has. With more busy threads than CPUs anything short of all of it
+  is CPUs left idle. It is scored, and higher is better.
+- `share_a_pct` is the first group's share of the CPU time used. It is
+  informational and comes with `expected_share_a_pct`, the share by the
+  weights, and `flat_share_a_pct`, the share by the number of threads, so
+  that the report can say which rule the split followed.
+- `work_per_s` is the integer mixing done by all threads, informational.
+
+The workload needs cgroup v2 with the `cpu` controller available to the
+children of the root, and the right to create groups there, which `matrix`
+has as root. Where that is missing the run is invalid and says what was
+missing; nothing is measured without the groups.
+
+The threads of one process can only be in different groups in a threaded
+subtree. For the run the benchmark creates `helicoprion-<pid>` under the
+root of the hierarchy with two threaded children, gives them their weights,
+moves its own process into the new group and each thread into its child.
+Afterwards the process goes back to the group it came from and the three
+groups are removed, however the run ends. Moving the benchmark's own process
+changes where everything after it is measured, so none of this is taken on
+trust. A run is invalid, whatever it measured, when the move changes the
+CPUs the process may use, which happens when the group it came from has a
+cpuset that the new one has not, when the process cannot be moved back, when
+it is not in the group it started in afterwards, or when one of the groups
+cannot be removed. The threads run for half a second before the window
+starts, so that the scheduler has spread them and the split has settled.
+
+The number of CPUs the workload is sized for has to be the number the
+threads can run on, or there is nothing to split: four threads sized for two
+CPUs get a CPU each on sixteen, and a scheduler that follows the weights to
+the letter gives both groups half. That happens when the count was taken
+under a CPU quota, which the group the benchmark was started in can have and
+the new one under the root has not. A run whose CPU count differs from the
+number of CPUs in its affinity mask is refused before anything is moved, and
+one in which the threads used more than 105% of the CPU time that many CPUs
+have is invalid. Both reject some set-ups that could be measured with more
+work, which is better than reporting that a scheduler ignores weights it
+follows.
 
 ## Reading the results
 
