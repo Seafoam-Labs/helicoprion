@@ -10,7 +10,7 @@ pub use result::{
     Better, Design, MIN_READABLE_SCHEMA, Metric, ResultFile, RunResult, SCHEMA_VERSION, Window, WorkloadResult,
 };
 pub use sched::Scheduler;
-pub use system::SystemInfo;
+pub use system::{Freq, Probe, Reading, SystemInfo};
 
 use std::fs;
 use std::path::Path;

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use helicoprion_core::{MIN_READABLE_SCHEMA, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
+use helicoprion_core::{MIN_READABLE_SCHEMA, Probe, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
 use helicoprion_report::{Comparison, Options, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use helicoprion_workloads::{SUITES, SuiteOpts, suite};
@@ -276,9 +276,11 @@ fn run(a: RunArgs) -> Result<()> {
         );
     }
 
+    let probe = Probe::find();
     let cfg = RunConfig {
         expected: sched.clone(),
         detect: &Scheduler::detect,
+        probe: &|| Some(probe.read()),
         cancel: &|| false,
         runs,
         warmup,
@@ -500,7 +502,8 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
         started_at,
         session_id: matrix::new_session_id(),
     };
-    let out = run_matrix(&session, &ctl, &Scheduler::detect, &interrupted, prior, progress);
+    let probe = Probe::find();
+    let out = run_matrix(&session, &ctl, &Scheduler::detect, &|| Some(probe.read()), &interrupted, prior, progress);
 
     if out.interrupted {
         eprintln!("\ninterrupted after {} visits; results so far are in {}", out.visits, out_dir.display());

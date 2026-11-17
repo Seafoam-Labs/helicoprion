@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use helicoprion_core::{RunResult, Scheduler, WorkloadResult};
+use helicoprion_core::{Reading, RunResult, Scheduler, WorkloadResult};
 
 use crate::Workload;
 
@@ -16,6 +16,9 @@ pub struct RunConfig<'a> {
     pub expected: Scheduler,
     /// Reads the current scheduler (`Scheduler::detect` outside tests).
     pub detect: &'a dyn Fn() -> Scheduler,
+    /// Reads the machine's state (`Probe::read` outside tests), right
+    /// before and right after every run. `None` records nothing.
+    pub probe: &'a dyn Fn() -> Option<Reading>,
     /// Checked before every run; once true, no further runs start and the
     /// runs completed so far are returned.
     pub cancel: &'a dyn Fn() -> bool,
@@ -59,10 +62,15 @@ pub fn run_workload(w: &dyn Workload, cfg: &RunConfig<'_>, mut on: impl FnMut(Ev
         let idx = if warmup { i } else { i - cfg.warmup };
         on(Event::Start { workload: &name, run: idx, total: cfg.runs, warmup });
 
+        // The machine first and last, the scheduler innermost: nothing
+        // but the run itself lies between the two scheduler readings.
+        let state_before = (cfg.probe)();
         let before = (cfg.detect)();
         let mut r = w.run(cfg.duration);
         let after = (cfg.detect)();
         judge(&mut r, &cfg.expected, before, after);
+        r.before = state_before;
+        r.after = (cfg.probe)();
 
         let summary = match &r.invalid_reason {
             Some(why) => format!("INVALID: {why}"),
@@ -154,6 +162,7 @@ mod tests {
         let cfg = RunConfig {
             expected: eevdf(),
             detect: &eevdf,
+            probe: &|| None,
             cancel: &cancel,
             runs: 10,
             warmup: 0,
@@ -163,6 +172,39 @@ mod tests {
         let res = run_workload(&Instant1, &cfg, |_| {});
         assert_eq!(res.runs.len(), 3);
         assert!(res.runs.iter().all(|r| r.valid));
+    }
+
+    #[test]
+    fn every_run_is_bracketed_by_readings() {
+        // A clock that ticks once per reading: warm-ups read it too, and
+        // their readings are dropped with them.
+        let t = std::cell::Cell::new(0.0);
+        let probe = || {
+            t.set(t.get() + 1.0);
+            Some(Reading { at: t.get(), loadavg_1m: None, temp_c: Some(50.0 + t.get()), freq_mhz: None })
+        };
+        let cfg = RunConfig {
+            expected: eevdf(),
+            detect: &eevdf,
+            probe: &probe,
+            cancel: &|| false,
+            runs: 2,
+            warmup: 1,
+            duration: Duration::ZERO,
+            cooldown: Duration::ZERO,
+        };
+        let res = run_workload(&Instant1, &cfg, |_| {});
+        let at = |r: &Option<Reading>| r.as_ref().unwrap().at;
+        let times: Vec<(f64, f64)> = res.runs.iter().map(|r| (at(&r.before), at(&r.after))).collect();
+        assert_eq!(times, [(3.0, 4.0), (5.0, 6.0)]);
+        assert_eq!(res.runs[1].after.as_ref().unwrap().temp_c, Some(56.0));
+
+        // Without a probe nothing is recorded, and nothing written.
+        let cfg = RunConfig { probe: &|| None, ..cfg };
+        let res = run_workload(&Instant1, &cfg, |_| {});
+        assert!(res.runs.iter().all(|r| r.before.is_none() && r.after.is_none()));
+        let json = serde_json::to_string(&res.runs[0]).unwrap();
+        assert!(!json.contains("\"before\"") && !json.contains("\"after\""), "{json}");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::hist::Histogram;
-use crate::{Scheduler, SystemInfo};
+use crate::{Reading, Scheduler, SystemInfo};
 
 /// 2: per-run scheduler readings, latency histogram, diagnostic counters,
 ///    cpufreq summaries over all policies.
@@ -15,7 +15,8 @@ use crate::{Scheduler, SystemInfo};
 /// 4: `Better::Neither` (informational metrics), `Metric::extreme`,
 ///    `RunResult::visit`/`round`, `ResultFile::design`. Schema 3 files still read.
 ///    `Metric::share` was added later as an optional field; files without it
-///    are still schema 4.
+///    are still schema 4. So were `RunResult::before`/`after` and
+///    `SystemInfo::temp_sensor`.
 pub const SCHEMA_VERSION: u32 = 4;
 /// Oldest schema `compare` can read.
 pub const MIN_READABLE_SCHEMA: u32 = 3;
@@ -88,6 +89,13 @@ pub struct RunResult {
     /// round), for paired analysis; absent for plain `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
+    /// The clock, load, temperature and CPU frequency right before and
+    /// right after the run: when it ran, and whether the machine drifted.
+    /// Absent in files written before these were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Reading>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<Reading>,
     /// Length of the measurement window (excludes thread setup/teardown).
     pub duration_s: f64,
     /// Actual boundaries of each measurement window, in seconds relative

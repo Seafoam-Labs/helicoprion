@@ -33,7 +33,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use helicoprion_core::{Design, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo, WorkloadResult};
+use helicoprion_core::{Design, Reading, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo, WorkloadResult};
 use helicoprion_workloads::Workload;
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use serde_json::Value;
@@ -777,6 +777,7 @@ pub fn run_matrix(
     s: &Session<'_>,
     ctl: &dyn Control,
     detect: &dyn Fn() -> Scheduler,
+    probe: &dyn Fn() -> Option<Reading>,
     interrupted: &dyn Fn() -> bool,
     prior: Prior,
     mut progress: impl FnMut(Event<'_>),
@@ -799,6 +800,7 @@ pub fn run_matrix(
                 let cfg = RunConfig {
                     expected,
                     detect,
+                    probe,
                     cancel: interrupted,
                     runs: s.runs_per_visit,
                     warmup: s.warmup,
@@ -1059,7 +1061,7 @@ mod tests {
         let per_visit = s.runs_per_visit * s.workloads.len();
         let detect = || sim.detect();
         let interrupted = || stop_after_visits.is_some_and(|n| done.get() >= per_visit * n as usize);
-        run_matrix(s, sim, &detect, &interrupted, prior, |ev| {
+        run_matrix(s, sim, &detect, &|| None, &interrupted, prior, |ev| {
             if let Event::Done { warmup: false, .. } = ev {
                 done.set(done.get() + 1);
             }

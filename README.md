@@ -111,6 +111,13 @@ and the parameters and runs of each workload. Each run stores:
   These are what `compare` compares.
 - `visit` and `round`, the scheduler visit and the round the run belongs to
   in a `matrix` session.
+- `before` and `after`, the machine's state right before and right after
+  the run: the time, the 1-minute load average, the CPU temperature (from
+  the sensor named in `system.temp_sensor`) and the frequency the CPUs run
+  at (lowest and highest of the cpufreq policies, and the mean over their
+  CPUs). They say when
+  each run happened and let a result be checked for drift. Values the
+  machine does not offer are left out.
 - `counters`, diagnostics that are not compared.
 - `windows`, the real start and end of each measurement, relative to the
   common start.
