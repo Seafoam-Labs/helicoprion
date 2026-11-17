@@ -123,12 +123,16 @@ about it.
 ## What is measured
 
 The `quick` suite has two workloads, both with one thread pair for every two
-CPUs.
+CPUs. The `periodic` suite has the two timer-driven ones, and `all` runs all
+four. `quick` is the default and stays as it is, so that its results remain
+comparable with earlier ones.
 
 | Name | What it does | Metrics |
 |---|---|---|
 | `wake-pingpong` | Each pair passes a token back and forth through a private futex | p50, p99, p99.9 and max in µs for each population, round trips per second, and threads actually woken per second |
 | `wake-pingpong/loaded` | The same, while one CPU hog thread per CPU keeps every CPU busy | The same, plus hog work per second |
+| `periodic-wake` | A few threads wake on a timer every millisecond, work for 100 µs of CPU time and sleep again | p50, p99, p99.9 and max in µs of the wake-up latency and of the response time, and the share of periods that missed their deadline |
+| `periodic-wake/loaded` | The same, while one CPU hog thread per CPU keeps every CPU busy | The same, plus hog work per second |
 
 ### Blocked and fast round trips
 
@@ -172,6 +176,42 @@ are fixed for every pinger, and a run whose workers are not ready within
 deadline, and the real boundaries of each measurement are stored in
 `windows`. If any worker fails, every waiting thread is woken and the run
 ends as invalid.
+
+### Periodic wake-ups
+
+`wake-pingpong` runs as fast as the scheduler lets it, so the amount and the
+kind of work differ between schedulers. `periodic-wake` asks every scheduler
+for the same thing at the same moments. Each task has a release every
+period, at fixed instants that do not move when a period is late, and the
+tasks' phases are spread over the period. There are up to four tasks, one
+for every four CPUs.
+
+For each period that runs, `wake` is the time from the release to the task
+running again, and `response` the time from the release to the work being
+done. The work is a fixed amount of the thread's own CPU time, so a task
+preempted in the middle of it has a longer response, not more work. A
+period is on time when its work is done before the next release. When it is
+not, the releases that passed meanwhile are skipped, as a frame loop drops
+frames instead of queueing them.
+
+`deadline_miss_pct` is the share of all due periods that were late or
+skipped, and it is the scored metric: 1.0% against 0.1% is ten times fewer
+missed deadlines. `on_time_pct` is its complement and informational. As a
+change of the share on time, 99.0% against 99.9% is under one percent, and
+from 95.3% on not even a perfect 100% would reach a 5% threshold. A side
+that missed no deadline has 0%. When that side is the baseline, the change
+is undefined and the report says so instead of scoring it; such a
+difference shows in the tail of `response`. The counters `periods_due`,
+`periods_ran`, `periods_late` and `periods_skipped` give the numbers behind
+both.
+
+Each task sets its timer slack to 1 ns and reads it back. The default of
+50 µs lets the kernel fire a timer that much late on purpose, which would
+be measured as wake-up latency, and a run whose tasks did not get 1 ns is
+invalid. The tasks report ready before one start is fixed for all; a run
+whose tasks are not ready within 30 s, or in which a thread cannot be
+created or fails, ends as invalid after every thread that was started has
+been joined.
 
 ## Reading the results
 

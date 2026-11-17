@@ -3,6 +3,7 @@
 
 mod futex;
 pub mod hog;
+pub mod periodic;
 pub mod runner;
 pub mod samples;
 pub mod wake_pingpong;
@@ -44,13 +45,56 @@ impl Default for SuiteOpts {
 
 pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Workload>>> {
     let pairs = (cpus / 2).max(1);
+    let pingpong = |hogs: usize| -> Box<dyn Workload> {
+        Box::new(wake_pingpong::WakePingPong { pairs, hogs, cpu_diag: opts.cpu_diag })
+    };
+    // A few periodic tasks whatever the machine: the question is how late
+    // each wakes, not how many fit. 1 ms and 100 µs: a tenth of a CPU per
+    // task, and 20000 periods in a five-second run of four tasks, enough
+    // for a p99.9.
+    let periodic = |hogs: usize| -> Box<dyn Workload> {
+        Box::new(periodic::PeriodicWake {
+            tasks: (cpus / 4).clamp(1, 4),
+            period: std::time::Duration::from_millis(1),
+            work: std::time::Duration::from_micros(100),
+            hogs,
+        })
+    };
     match name {
-        "quick" => Some(vec![
-            Box::new(wake_pingpong::WakePingPong { pairs, hogs: 0, cpu_diag: opts.cpu_diag }),
-            Box::new(wake_pingpong::WakePingPong { pairs, hogs: cpus, cpu_diag: opts.cpu_diag }),
-        ]),
+        "quick" => Some(vec![pingpong(0), pingpong(cpus)]),
+        "periodic" => Some(vec![periodic(0), periodic(cpus)]),
+        "all" => Some(vec![pingpong(0), pingpong(cpus), periodic(0), periodic(cpus)]),
         _ => None,
     }
 }
 
-pub const SUITES: &[&str] = &["quick"];
+/// `quick` is what it has always been, so that results stay comparable
+/// with earlier ones; `periodic` is the timer-driven workload alone, and
+/// `all` runs both.
+pub const SUITES: &[&str] = &["quick", "periodic", "all"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suites_hold_what_they_say() {
+        let names = |suite: &str, cpus: usize| -> Vec<String> {
+            super::suite(suite, cpus, SuiteOpts::default()).unwrap().iter().map(|w| w.name()).collect()
+        };
+        // `quick` must not change: results are compared with older ones.
+        assert_eq!(names("quick", 16), ["wake-pingpong", "wake-pingpong/loaded"]);
+        assert_eq!(names("periodic", 16), ["periodic-wake", "periodic-wake/loaded"]);
+        assert_eq!(names("all", 16).len(), 4);
+        for name in SUITES {
+            assert!(super::suite(name, 2, SuiteOpts::default()).is_some(), "{name}");
+        }
+        assert!(super::suite("nope", 2, SuiteOpts::default()).is_none());
+        // The loaded variant keeps every CPU busy; the tasks stay few.
+        let w = super::suite("periodic", 16, SuiteOpts::default()).unwrap();
+        assert_eq!(w[1].params()["hogs"], 16);
+        assert_eq!((w[0].params()["tasks"].clone(), w[0].params()["hogs"].clone()), (4.into(), 0.into()));
+        let small = super::suite("periodic", 2, SuiteOpts::default()).unwrap();
+        assert_eq!(small[0].params()["tasks"], 1);
+    }
+}

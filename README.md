@@ -81,6 +81,11 @@ Both run five rounds by default, and `--recommended` cannot be combined with
 `--sched`. `--simple` adds a summary in plain words, and the HTML report in
 the output directory still has all the data and charts.
 
+`--suite` picks the workloads: `quick` (the default) hands a token between
+pairs of threads as fast as it goes, `periodic` wakes a few threads on a
+timer for a short piece of work, as a frame or an audio buffer would, and
+`all` runs both. Each comes idle and with every CPU kept busy.
+
 ### Compare existing result files
 
 `compare` reads the result files of earlier `run` or `matrix` sessions,
