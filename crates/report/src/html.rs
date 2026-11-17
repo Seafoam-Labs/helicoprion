@@ -188,7 +188,7 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
         h,
         "<h2>In short</h2><p class=sub>Compared with <strong>{}</strong>. {}</p><div class=briefs>",
         esc(&c.series[c.baseline].label),
-        esc(crate::simple::WHAT)
+        esc(&crate::simple::what(c))
     );
     // One card per scheduler, a part per workload.
     for (series, of) in crate::simple::by_scheduler(&briefs) {
@@ -564,7 +564,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
     if !tails.is_empty() {
         let _ = write!(
             h,
-            "<h2>Latency quantiles</h2><p class=cap>Latency at each percentile, one chart per population: a lower line is better.</p><details class=help><summary>How to read this</summary><p>One chart per population. For wake-pingpong, <code>rtt_blocked</code> are round trips in which the pinger really slept in FUTEX_WAIT (wakeup latency); <code>rtt_fast</code> are hand-offs that completed before it blocked, and are not wakeup latency. Each curve is the quantile function of the runs' log-linear histograms (bucket width ≤1.6% of value; min and max exact), median per quantile across valid runs, plotted only up to the quantile every run has enough samples for (≥10 beyond it). Series run with different workload parameters than the baseline are left out. A dashed curve is a minor population, holding under {ms}% of the run's round trips: its quantiles describe a handful of unusual events, not the run. Hover a point for its value.</p></details>",
+            "<h2>Latency quantiles</h2><p class=cap>Latency at each percentile, one chart per population: a lower line is better.</p><details class=help><summary>How to read this</summary><p>One chart per population. For wake-pingpong, <code>rtt_blocked</code> are round trips in which the pinger really slept in FUTEX_WAIT (wakeup latency); <code>rtt_fast</code> are hand-offs that completed before it blocked, and are not wakeup latency. For periodic-wake, <code>wake</code> is the time from a period's release to the task running again and <code>response</code> the time from the release to its work being done. Each curve is the quantile function of the runs' log-linear histograms (bucket width ≤1.6% of value; min and max exact), median per quantile across valid runs, plotted only up to the quantile every run has enough samples for (≥10 beyond it). Series run with different workload parameters than the baseline are left out. For wake-pingpong, whose populations are parts of the round trips, a dashed curve is a minor population, holding under {ms}% of the run's round trips: its quantiles describe a handful of unusual events, not the run. Hover a point for its value.</p></details>",
             ms = c.opts.min_share_pct
         );
         for svg in tails {
@@ -640,7 +640,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
     h.push_str("</table>");
 
     if !c.diagnostics.is_empty() {
-        h.push_str("<h2>Run diagnostics</h2><p class=cap>Counters summed over valid runs: what kind of round trips each scheduler produced.</p><details class=help><summary>How to read this</summary><p>For wake-pingpong: <code>roundtrips_blocked</code>/<code>roundtrips_fast</code> split round trips by whether the pinger slept; <code>roundtrips_ambiguous</code> had a wait interrupted by a signal (EINTR) without a completed sleep and are in neither histogram; <code>roundtrips_two_sided</code> are blocked round trips whose FUTEX_WAKE also woke a sleeping ponger; <code>*_waits_slept</code> are FUTEX_WAITs that really slept, <code>*_waits_eagain</code> returned at once because the token had already moved; <code>futex_woken</code> is the number of threads FUTEX_WAKE actually woke. Same-CPU means the CPU read by the ponger just before replying and the CPU read by the pinger just after receiving the reply are the same logical CPU; cross-CPU means they differ. These are two observations at two instants (either thread may move in between), useful to tell regimes apart, not proof of a local wakeup or an IPI. <code>ping_cpu_changes</code> counts observed CPU changes between round trips, not migrations. Blocked round trips are also split into <code>rtt_blocked_same_cpu</code> / <code>rtt_blocked_cross_cpu</code> metrics in the table above.</p></details>");
+        h.push_str("<h2>Run diagnostics</h2><p class=cap>Counters summed over valid runs: what each scheduler's runs consisted of.</p><details class=help><summary>How to read this</summary><p>For wake-pingpong: <code>roundtrips_blocked</code>/<code>roundtrips_fast</code> split round trips by whether the pinger slept; <code>roundtrips_ambiguous</code> had a wait interrupted by a signal (EINTR) without a completed sleep and are in neither histogram; <code>roundtrips_two_sided</code> are blocked round trips whose FUTEX_WAKE also woke a sleeping ponger; <code>*_waits_slept</code> are FUTEX_WAITs that really slept, <code>*_waits_eagain</code> returned at once because the token had already moved; <code>futex_woken</code> is the number of threads FUTEX_WAKE actually woke. Same-CPU means the CPU read by the ponger just before replying and the CPU read by the pinger just after receiving the reply are the same logical CPU; cross-CPU means they differ. These are two observations at two instants (either thread may move in between), useful to tell regimes apart, not proof of a local wakeup or an IPI. <code>ping_cpu_changes</code> counts observed CPU changes between round trips, not migrations. For periodic-wake: <code>periods_due</code> is fixed by the clock (tasks × run length ÷ period); <code>periods_ran</code> were started, <code>periods_late</code> of them finished their work after the next release, and <code>periods_skipped</code> were never started because an earlier period was still at work when they came due. For wake-pingpong, blocked round trips are also split into <code>rtt_blocked_same_cpu</code> / <code>rtt_blocked_cross_cpu</code> metrics in the table above.</p></details>");
         let mut workloads: Vec<&str> = Vec::new();
         for d in &c.diagnostics {
             if !workloads.contains(&d.workload.as_str()) {
@@ -669,6 +669,9 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
                 ("roundtrips_fast_same_cpu", "roundtrips_fast", "same-CPU share of fast round trips"),
                 ("ping_cpu_changes", "roundtrips", "pinger seen on a new CPU, per round trip"),
                 ("roundtrips_ambiguous", "roundtrips", "ambiguous share (EINTR, excluded)"),
+                ("periods_ran", "periods_due", "periods that ran, of those due"),
+                ("periods_late", "periods_ran", "late share of the periods that ran"),
+                ("periods_skipped", "periods_due", "skipped share of the periods due"),
             ] {
                 if !keys.iter().any(|k| *k == num) {
                     continue;

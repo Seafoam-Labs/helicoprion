@@ -31,6 +31,8 @@ fn title(workload: &str) -> String {
     match workload {
         "wake-pingpong" => "Idle system".into(),
         "wake-pingpong/loaded" => "Busy system (every CPU kept busy)".into(),
+        "periodic-wake" => "Tasks on a timer, idle system".into(),
+        "periodic-wake/loaded" => "Tasks on a timer, busy system (every CPU kept busy)".into(),
         other => other.to_string(),
     }
 }
@@ -173,8 +175,23 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     let row = c.rows.iter().find(|r| r.workload == workload && r.metric == metric)?;
     let d = row.improvement(c.baseline, i)?;
     let (b, v) = medians(row, c.baseline, i)?;
-    let values = format!("{} → {}{}", fmt_value(b), fmt_value(v), unit(&row.unit));
     let word = if d.median > 0.0 { words.0 } else { words.1 };
+    // A share in percent: "35% fewer" for 1.0% against 0.65% would be a
+    // percentage of a percentage, and read as points. The two shares say
+    // it, with the direction, and with the factor where it is a multiple.
+    if row.unit == "%" {
+        let values = format!("{}% → {}% of periods", fmt_value(b), fmt_value(v));
+        let factor = d.ratio.max(1.0 / d.ratio);
+        let size = if factor.is_finite() && factor >= 2.0 { format!("{}× ", times(factor)) } else { String::new() };
+        return Some(match c.unclear_reason(row, i, &d) {
+            None => format!("{label}: {size}{word} ({values})"),
+            Some(UnclearReason::Uneven(_)) => {
+                format!("{label}: {word}; the effect varied too much between rounds to score ({values})")
+            }
+            Some(reason) => format!("{label}: no reliable difference; {} ({values})", why(c, &d, reason)),
+        });
+    }
+    let values = format!("{} → {}{}", fmt_value(b), fmt_value(v), unit(&row.unit));
     Some(match (c.unclear_reason(row, i, &d), d.ci) {
         (None, _) => format!("{label}: {} {word}{} ({values})", amount(&d), at_least(&d).unwrap_or_default()),
         (Some(UnclearReason::Uneven(_)), Some((lo, hi))) => format!(
@@ -183,6 +200,50 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
         ),
         (Some(reason), _) => format!("{label}: no reliable difference; {} ({values})", why(c, &d, reason)),
     })
+}
+
+/// How often periodic-wake's tasks missed their deadline. Zero is common
+/// here, and a baseline of zero leaves no change to take, so the line is
+/// worded for those cases instead of being left out.
+///
+/// What is compared are medians over the runs. A median of zero is not
+/// "no deadline missed": three clean runs and two with misses have a
+/// median of zero, and a benchmark for rare lateness must not call that
+/// none. "None" is said only when every run of a side has none; otherwise
+/// the line says "median" and how much single runs missed.
+fn deadlines(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == "deadline_miss_pct")?;
+    let (b, v) = medians(row, c.baseline, i)?;
+    let base = &c.series[c.baseline].label;
+    // The most any single run of a side missed.
+    let worst = |k: usize| {
+        row.cells.get(k).and_then(Option::as_ref).map_or(0.0, |cell| cell.values.iter().copied().fold(0.0, f64::max))
+    };
+    let (worst_b, worst_v) = (worst(c.baseline), worst(i));
+    let runs = |worst: f64| {
+        if worst == 0.0 {
+            "no run missed any".to_string()
+        } else {
+            format!("single runs missed up to {}%", fmt_value(worst))
+        }
+    };
+    match (b == 0.0, v == 0.0) {
+        (true, true) if worst_b == 0.0 && worst_v == 0.0 => {
+            Some("Deadlines missed: none in any run under either".into())
+        }
+        (true, true) => Some(format!(
+            "Deadlines missed: a median of 0% of periods under both ({base}: {}; here: {})",
+            runs(worst_b),
+            runs(worst_v)
+        )),
+        (true, false) => Some(format!(
+            "Deadlines missed: a median of {}% of periods, and a median of 0% under {base} ({}); a change from zero \
+             is not scored",
+            fmt_value(v),
+            runs(worst_b)
+        )),
+        _ => point(c, workload, i, "deadline_miss_pct", "Deadlines missed", ("fewer", "more")),
+    }
 }
 
 /// Why a change is not scored, for a reader who sees "1434 → 42.2 µs" next
@@ -232,14 +293,30 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
         .into_iter()
         .map(|s| {
             let (w, i) = (s.workload.as_str(), s.series);
-            let slowest = point(c, w, i, "rtt_blocked_p99.9", "Slowest wake-ups (1 in 1000)", ("shorter", "longer"))
-                .or_else(|| point(c, w, i, "rtt_blocked_p99", "Slow wake-ups (1 in 100)", ("shorter", "longer")));
+            // The same two lines for either workload's wake-ups: the tail
+            // at 1 in 1000 where the runs have the samples for it.
+            let delays = ("shorter", "longer");
+            let slowest = |population: &str, what: &str, more: &str| {
+                point(c, w, i, &format!("{population}_p99.9"), &format!("Slowest {what} (1 in 1000){more}"), delays)
+                    .or_else(|| {
+                        point(c, w, i, &format!("{population}_p99"), &format!("Slow {what} (1 in 100){more}"), delays)
+                    })
+            };
             let mut points: Vec<String> = [
                 // Round trips, not wake-ups: one round trip can take one wake-up
                 // or two, or none, and `woken_per_s` counts those.
                 point(c, w, i, "roundtrips_per_s", "Round trips completed", ("more", "fewer")),
-                point(c, w, i, "rtt_blocked_p50", "Typical wake-up delay", ("shorter", "longer")),
-                slowest,
+                point(c, w, i, "rtt_blocked_p50", "Typical wake-up delay", delays),
+                slowest("rtt_blocked", "wake-ups", ""),
+                // periodic-wake: the same amount of work for every
+                // scheduler, so only how late it ran.
+                point(c, w, i, "wake_p50", "Typical wake-up delay", delays),
+                slowest("wake", "wake-ups", ""),
+                // Two schedulers can wake a task equally fast and differ
+                // in how often they take the CPU away during its work:
+                // only the response shows that.
+                slowest("response", "responses", ", work included"),
+                deadlines(c, w, i),
                 background(c, w, i),
             ]
             .into_iter()
@@ -387,6 +464,23 @@ pub fn nothing_to_compare(c: &Comparison) -> String {
 pub const WHAT: &str = "The test makes pairs of tasks wake each other up in turn, as fast as they can: \
 what a snappy desktop, a game or a busy server depends on.";
 
+/// The same for periodic-wake.
+pub const WHAT_PERIODIC: &str = "The test wakes a few tasks on a timer for a short piece of work, as a frame \
+or an audio buffer would, and measures how late they run.";
+
+/// What the workloads of this comparison do, in a sentence each.
+pub fn what(c: &Comparison) -> String {
+    let has = |prefix: &str| c.rows.iter().any(|r| r.workload.starts_with(prefix));
+    let parts: Vec<&str> = [("wake-pingpong", WHAT), ("periodic-wake", WHAT_PERIODIC)]
+        .into_iter()
+        .filter(|(prefix, _)| has(prefix))
+        .map(|(_, words)| words)
+        .collect();
+    // Results this module has no words for: the old sentence would be
+    // wrong, and none is better than that.
+    parts.join(" ").replacen("The test wakes", "It also wakes", usize::from(parts.len() > 1))
+}
+
 /// What "at least" stands for, where a line says it: the cautious end of
 /// an estimated interval reads like a promise otherwise.
 pub const AT_LEAST: &str = "\"At least\" is the cautious end of the 95% interval around the estimate: how small \
@@ -435,7 +529,10 @@ pub fn text(c: &Comparison) -> String {
     if let Some(note) = at_least_note(&briefs) {
         let _ = writeln!(out, "\n{note}");
     }
-    let _ = writeln!(out, "\n{WHAT}");
+    let what = what(c);
+    if !what.is_empty() {
+        let _ = writeln!(out, "\n{what}");
+    }
     out
 }
 

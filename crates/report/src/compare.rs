@@ -2190,6 +2190,134 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert_eq!(c.summary()[0].verdict(), Verdict::Worse);
     }
 
+    /// periodic-wake has its own words in the plain view: how late the
+    /// tasks ran and how often their work was done in time, and what the
+    /// test does. The token-passing sentence is not said of it.
+    #[test]
+    fn periodic_wake_is_described_in_plain_words() {
+        let session = |workload: &str| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = workload.into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    // The drift of the round, without the candidate's 10%.
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    r.metrics.clear();
+                    let wake = if is_cand { 18.0 } else { 20.0 };
+                    r.metrics.insert("wake_p50".into(), Metric::lower(wake * wobble, "us"));
+                    r.metrics.insert("wake_p99".into(), Metric::lower(40.0 * wake * wobble, "us"));
+                    r.metrics.insert("response_p50".into(), Metric::lower((100.0 + wake) * wobble, "us"));
+                    r.metrics.insert("response_p99".into(), Metric::lower(60.0 * wake * wobble, "us"));
+                    let missed = if is_cand { 1.0 } else { 10.0 };
+                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(missed * wobble, "%"));
+                    r.metrics.insert("on_time_pct".into(), Metric::info(100.0 - missed * wobble, "%"));
+                    r.metrics.insert("hog_work_per_s".into(), Metric::info(1e6 * wobble, "units/s"));
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let c = session("periodic-wake/loaded");
+        let text = crate::simple::text(&c);
+        assert!(text.contains("  Tasks on a timer, busy system (every CPU kept busy): BETTER\n"), "{text}");
+        assert!(text.contains("• Typical wake-up delay: 10% shorter (23.0 → 20.7 µs)"), "{text}");
+        // Too few samples for 1 in 1000: the p99 stands in.
+        assert!(text.contains("• Slow wake-ups (1 in 100): 10% shorter ("), "{text}");
+        // The response has a line of its own: it can differ where the
+        // wake-up does not.
+        assert!(text.contains("• Slow responses (1 in 100), work included: 10% shorter ("), "{text}");
+        // Two shares and a factor, not a percentage of a percentage.
+        assert!(text.contains("• Deadlines missed: 10× fewer (11.5% → 1.15% of periods)"), "{text}");
+        assert!(!text.contains("on time"), "informational, and the same fact: {text}");
+        assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
+        // The typical response moves by under 2%: below the threshold.
+        assert!(text.contains("• Of 5 measurements, 4 clearly better and 0 clearly worse"), "{text}");
+
+        // Deadlines missed by neither, and by the candidate only: zero is
+        // a value, and a change from zero is not made up.
+        let zeros = |base: f64, cand: f64| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "periodic-wake".into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    r.metrics.clear();
+                    r.metrics.insert("wake_p50".into(), Metric::lower(20.0, "us"));
+                    let missed = if is_cand { cand } else { base };
+                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(missed, "%"));
+                }
+            }
+            crate::simple::text(&Comparison::build(files, 0))
+        };
+        assert!(zeros(0.0, 0.0).contains("• Deadlines missed: none in any run under either\n"), "{}", zeros(0.0, 0.0));
+        let from_zero = zeros(0.0, 2.5);
+        assert!(
+            from_zero.contains(
+                "• Deadlines missed: a median of 2.50% of periods, and a median of 0% under base (no run missed any); a \
+                 change from zero is not scored"
+            ),
+            "{from_zero}"
+        );
+
+        // A median of zero is not "none". Five runs a side: three clean,
+        // two with misses. Both medians are 0%, and both sides did miss
+        // deadlines; the line must say median, and what single runs did.
+        let rare = |base: [f64; 5], cand: [f64; 5]| {
+            let mk = |label: &str, missed: [f64; 5]| {
+                let mut f = file(label, &[1.0; 5], 1);
+                f.workloads[0].name = "periodic-wake".into();
+                for (r, m) in f.workloads[0].runs.iter_mut().zip(missed) {
+                    r.metrics.clear();
+                    r.metrics.insert("wake_p50".into(), Metric::lower(20.0, "us"));
+                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(m, "%"));
+                }
+                f
+            };
+            crate::simple::text(&Comparison::build(vec![mk("base", base), mk("cand", cand)], 0))
+        };
+        let said = rare([0.0, 0.0, 0.0, 0.02, 0.05], [0.0, 0.0, 0.0, 0.04, 0.08]);
+        assert!(
+            said.contains(
+                "• Deadlines missed: a median of 0% of periods under both (base: single runs missed up to 0.05%; here: \
+                 single runs missed up to 0.08%)"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("none") && !said.contains("no run missed"), "{said}");
+        // A baseline with a median of zero that did miss some.
+        let said = rare([0.0, 0.0, 0.0, 0.02, 0.05], [2.0, 2.5, 3.0, 2.5, 2.5]);
+        assert!(
+            said.contains(
+                "• Deadlines missed: a median of 2.50% of periods, and a median of 0% under base (single runs missed \
+                 up to 0.05%); a change from zero is not scored"
+            ),
+            "{said}"
+        );
+        // One side clean throughout, the other with rare misses.
+        let said = rare([0.0; 5], [0.0, 0.0, 0.0, 0.04, 0.08]);
+        assert!(said.contains("under both (base: no run missed any; here: single runs missed up to 0.08%)"), "{said}");
+        // To zero: fewer, without a factor that would be infinite.
+        let to_zero = zeros(2.5, 0.0);
+        assert!(to_zero.contains("• Deadlines missed: fewer (2.50% → 0.00% of periods)"), "{to_zero}");
+        assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_PERIODIC)), "{text}");
+        assert!(!text.contains("pairs of tasks"), "{text}");
+        assert!(crate::simple::text(&session("periodic-wake")).contains("  Tasks on a timer, idle system: BETTER"));
+        let html = crate::html::report(&c);
+        assert!(html.contains(&crate::esc(crate::simple::WHAT_PERIODIC)) && !html.contains("pairs of tasks wake"));
+
+        // Both workloads in one report: both sentences, joined.
+        let mut files = drifting_session();
+        for f in &mut files {
+            let mut second = f.workloads[0].clone();
+            f.workloads[0].name = "wake-pingpong".into();
+            second.name = "periodic-wake".into();
+            f.workloads.push(second);
+        }
+        let what = crate::simple::what(&Comparison::build(files, 0));
+        assert!(what.starts_with("The test makes pairs of tasks wake each other up"), "{what}");
+        assert!(what.contains(" It also wakes a few tasks on a timer"), "{what}");
+        // A workload without words gets no sentence about another one.
+        assert_eq!(crate::simple::what(&Comparison::build(drifting_session(), 0)), "");
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]
