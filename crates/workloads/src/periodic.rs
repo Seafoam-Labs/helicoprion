@@ -58,8 +58,6 @@
 //! (`CLOCK_THREAD_CPUTIME_ID`), read between short bursts of integer
 //! mixing.
 
-use std::collections::BTreeMap;
-use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -69,8 +67,9 @@ use helicoprion_core::{Metric, RunResult, Window};
 use serde_json::json;
 
 use crate::Workload;
+use crate::clock::{Alive, TIMER_SLACK_NS, burn, now_ns, ns, set_timer_slack, sleep_until};
 use crate::hog::Hogs;
-use crate::samples::{min_samples_for, quantile_grid};
+use crate::samples::population;
 
 pub const POP_WAKE: &str = "wake";
 pub const POP_RESPONSE: &str = "response";
@@ -98,22 +97,6 @@ struct Hooks {
     ready_timeout: Option<Duration>,
     /// Tasks running: up on entry, down on exit, however they exit.
     alive: Arc<AtomicUsize>,
-}
-
-/// Counts a task as alive until dropped, also when it panics.
-struct Alive(Arc<AtomicUsize>);
-
-impl Alive {
-    fn new(count: &Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Alive(Arc::clone(count))
-    }
-}
-
-impl Drop for Alive {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 pub struct PeriodicWake {
@@ -268,78 +251,6 @@ impl PeriodicWake {
     }
 }
 
-fn ns(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn clock_ns(clock: libc::clockid_t) -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid timespec to write to; both clocks used here
-    // exist on every Linux this builds for.
-    unsafe {
-        libc::clock_gettime(clock, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-fn now_ns() -> u64 {
-    clock_ns(libc::CLOCK_MONOTONIC)
-}
-
-/// Sleep until the monotonic clock reads `at`; returns at once if it
-/// already does.
-fn sleep_until(at: u64) {
-    let ts =
-        libc::timespec { tv_sec: (at / 1_000_000_000) as libc::time_t, tv_nsec: (at % 1_000_000_000) as libc::c_long };
-    loop {
-        // SAFETY: `ts` is a valid timespec; with TIMER_ABSTIME the
-        // remaining-time pointer is unused and may be null.
-        let r = unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
-        // Interrupted by a signal: the deadline is absolute, so go again.
-        if r != libc::EINTR {
-            return;
-        }
-    }
-}
-
-/// The timer slack every task runs with, in nanoseconds, as recorded in
-/// the workload's parameters.
-const TIMER_SLACK_NS: u64 = 1;
-
-/// Ask for timers that fire on time, and check that this thread got
-/// them: the default slack of 50 µs would be measured as wake-up latency,
-/// and the parameters of the run promise `TIMER_SLACK_NS`.
-fn set_timer_slack() -> Result<(), String> {
-    // SAFETY: PR_SET_TIMERSLACK takes one integer argument and affects
-    // only the calling thread.
-    let set = unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, TIMER_SLACK_NS as libc::c_ulong) };
-    if set != 0 {
-        return Err(format!("setting the timer slack failed: {}", std::io::Error::last_os_error()));
-    }
-    // SAFETY: PR_GET_TIMERSLACK takes no further argument and returns
-    // the calling thread's slack.
-    let got = unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) };
-    if i64::from(got) != TIMER_SLACK_NS as i64 {
-        return Err(format!("the timer slack is {got} ns after asking for {TIMER_SLACK_NS} ns"));
-    }
-    Ok(())
-}
-
-/// Use `work` nanoseconds of this thread's CPU time.
-fn burn(work: u64) {
-    let from = clock_ns(libc::CLOCK_THREAD_CPUTIME_ID);
-    let mut x = from | 1;
-    while clock_ns(libc::CLOCK_THREAD_CPUTIME_ID) - from < work {
-        // Well under a microsecond of integer mixing between two readings.
-        for _ in 0..256 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-        }
-        black_box(x);
-    }
-}
-
 #[derive(Default)]
 struct TaskOut {
     wake: Recorder,
@@ -386,22 +297,6 @@ fn task(first: u64, end: u64, period: u64, work: u64) -> TaskOut {
         }
         k = next;
     }
-}
-
-/// p50/p99/p99.9/max of one population, each only with enough samples,
-/// and its quantile curve likewise truncated.
-fn population(m: &mut BTreeMap<String, Metric>, name: &str, rec: &Recorder) -> Vec<(f64, f64)> {
-    let n = rec.count();
-    let us = |q: f64| rec.quantile(q).unwrap_or(0.0) / 1000.0;
-    for (q, suffix) in [(0.5, "p50"), (0.99, "p99"), (0.999, "p99.9")] {
-        if n >= min_samples_for(q) {
-            m.insert(format!("{name}_{suffix}"), Metric::lower(us(q), "us"));
-        }
-    }
-    if let Some(max) = rec.max() {
-        m.insert(format!("{name}_max"), Metric::lower(max as f64 / 1000.0, "us").extreme());
-    }
-    quantile_grid().into_iter().filter(|q| n >= min_samples_for(*q)).map(|q| (q, us(q))).collect()
 }
 
 fn summarize(outs: &[TaskOut], duration: Duration, began: Instant, hog: Option<(u64, Instant, Instant)>) -> RunResult {
@@ -590,17 +485,6 @@ mod tests {
         let r = w.run_with(Duration::from_millis(50), &hooks);
         assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
         assert_eq!(alive.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn timer_slack_is_set_and_checked() {
-        std::thread::spawn(|| {
-            assert_eq!(set_timer_slack(), Ok(()));
-            // SAFETY: as in `set_timer_slack`.
-            assert_eq!(unsafe { libc::prctl(libc::PR_GET_TIMERSLACK) }, 1);
-        })
-        .join()
-        .unwrap();
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Workloads are written in-tree: no external benchmark programs, no
 //! downloaded assets. Each one stresses a specific scheduler behaviour.
 
+mod clock;
 mod futex;
 pub mod hog;
 pub mod periodic;
