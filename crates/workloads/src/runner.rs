@@ -4,7 +4,15 @@
 //! it equals `RunConfig::expected` (the scheduler recorded in the result
 //! file). That catches a crash/restart during a run (ops or `enable_seq`
 //! change) as well as a scheduler swapped in between runs.
+//!
+//! A run is also invalid when the benchmark is no longer in the control
+//! groups it started in. A workload may move the process for its own
+//! run and has to put it back; if that fails, or something else moves
+//! the process, every run from then on is measured under other limits
+//! and weights than the ones before, and must not pass for the same
+//! session.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use helicoprion_core::{Reading, RunResult, Scheduler, WorkloadResult};
@@ -19,6 +27,12 @@ pub struct RunConfig<'a> {
     /// Reads the machine's state (`Probe::read` outside tests), right
     /// before and right after every run. `None` records nothing.
     pub probe: &'a dyn Fn() -> Option<Reading>,
+    /// The control groups the session began in (`home_groups` outside
+    /// tests). `None` checks nothing.
+    pub home: Option<&'a str>,
+    /// Reads the control groups of this process (`own_groups` outside
+    /// tests), after every run.
+    pub groups: &'a dyn Fn() -> Option<String>,
     /// Checked before every run; once true, no further runs start and the
     /// runs completed so far are returned.
     pub cancel: &'a dyn Fn() -> bool,
@@ -32,6 +46,28 @@ pub struct RunConfig<'a> {
 pub enum Event<'a> {
     Start { workload: &'a str, run: usize, total: usize, warmup: bool },
     Done { workload: &'a str, run: usize, warmup: bool, valid: bool, summary: String },
+}
+
+/// The control groups of this process, one line per hierarchy.
+pub fn own_groups() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup").ok()
+}
+
+/// The control groups the process was in when this was first asked:
+/// before the first run of a session.
+pub fn home_groups() -> Option<&'static str> {
+    static HOME: OnceLock<Option<String>> = OnceLock::new();
+    HOME.get_or_init(own_groups).as_deref()
+}
+
+/// Why a run does not count if the process is in `now` and began in
+/// `home`. Where either cannot be read there is nothing to compare.
+pub fn moved(home: Option<&str>, now: Option<&str>) -> Option<String> {
+    let (home, now) = (home?, now?);
+    let line = |groups: &str| groups.trim().replace('\n', ", ");
+    (home != now).then(|| {
+        format!("the benchmark is in other control groups ({}) than it started in ({})", line(now), line(home))
+    })
 }
 
 /// Mark `r` valid or invalid against the expected scheduler.
@@ -68,6 +104,11 @@ pub fn run_workload(w: &dyn Workload, cfg: &RunConfig<'_>, mut on: impl FnMut(Ev
         let before = (cfg.detect)();
         let mut r = w.run(cfg.duration);
         let after = (cfg.detect)();
+        // After the run: where it left the process, and where the next
+        // one would start. The workload's own reason comes first.
+        if r.invalid_reason.is_none() {
+            r.invalid_reason = moved(cfg.home, (cfg.groups)().as_deref());
+        }
         judge(&mut r, &cfg.expected, before, after);
         r.before = state_before;
         r.after = (cfg.probe)();
@@ -163,6 +204,8 @@ mod tests {
             expected: eevdf(),
             detect: &eevdf,
             probe: &|| None,
+            home: None,
+            groups: &|| None,
             cancel: &cancel,
             runs: 10,
             warmup: 0,
@@ -187,6 +230,8 @@ mod tests {
             expected: eevdf(),
             detect: &eevdf,
             probe: &probe,
+            home: None,
+            groups: &|| None,
             cancel: &|| false,
             runs: 2,
             warmup: 1,
@@ -205,6 +250,47 @@ mod tests {
         assert!(res.runs.iter().all(|r| r.before.is_none() && r.after.is_none()));
         let json = serde_json::to_string(&res.runs[0]).unwrap();
         assert!(!json.contains("\"before\"") && !json.contains("\"after\""), "{json}");
+    }
+
+    #[test]
+    fn a_process_in_other_control_groups_is_invalid() {
+        let home = "1:cpu:/\n0::/user.slice/session-2.scope\n";
+        assert_eq!(moved(Some(home), Some(home)), None);
+        let why = moved(Some(home), Some("1:cpu:/\n0::/helicoprion-4242\n")).unwrap();
+        assert_eq!(
+            why,
+            "the benchmark is in other control groups (1:cpu:/, 0::/helicoprion-4242) than it started in (1:cpu:/, \
+             0::/user.slice/session-2.scope)"
+        );
+        // Nothing to compare: no verdict.
+        assert_eq!(moved(None, Some(home)), None);
+        assert_eq!(moved(Some(home), None), None);
+
+        // In a session: the second run leaves the process elsewhere. That
+        // run and every later one are invalid, the first is not.
+        let calls = std::cell::Cell::new(0);
+        let groups = || {
+            calls.set(calls.get() + 1);
+            Some(if calls.get() >= 2 { "0::/helicoprion-4242\n".to_string() } else { home.to_string() })
+        };
+        let cfg = RunConfig {
+            expected: eevdf(),
+            detect: &eevdf,
+            probe: &|| None,
+            home: Some(home),
+            groups: &groups,
+            cancel: &|| false,
+            runs: 3,
+            warmup: 0,
+            duration: Duration::ZERO,
+            cooldown: Duration::ZERO,
+        };
+        let res = run_workload(&Instant1, &cfg, |_| {});
+        assert_eq!(res.runs.iter().map(|r| r.valid).collect::<Vec<_>>(), [true, false, false]);
+        assert!(res.runs[2].invalid_reason.as_deref().unwrap().contains("0::/helicoprion-4242"));
+        // Without a home nothing is checked.
+        let res = run_workload(&Instant1, &RunConfig { home: None, ..cfg }, |_| {});
+        assert!(res.runs.iter().all(|r| r.valid));
     }
 
     #[test]

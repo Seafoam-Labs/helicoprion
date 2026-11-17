@@ -337,6 +337,8 @@ fn run(a: RunArgs) -> Result<()> {
         expected: sched.clone(),
         detect: &Scheduler::detect,
         probe: &|| Some(probe.read()),
+        home: helicoprion_workloads::runner::home_groups(),
+        groups: &helicoprion_workloads::runner::own_groups,
         cancel: &|| false,
         runs,
         warmup,

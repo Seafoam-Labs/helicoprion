@@ -894,6 +894,8 @@ pub fn run_matrix(
                     expected,
                     detect,
                     probe,
+                    home: helicoprion_workloads::runner::home_groups(),
+                    groups: &helicoprion_workloads::runner::own_groups,
                     cancel: interrupted,
                     runs: s.runs_per_visit,
                     warmup: s.warmup,

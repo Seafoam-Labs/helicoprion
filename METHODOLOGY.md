@@ -120,6 +120,11 @@ crash or restart during a run and a manual switch. Kernels without
 then records `restart_detectable: false`, and both `run` and `compare` warn
 about it.
 
+The same holds for where the benchmark itself runs. The control groups of
+the process are read when the session starts and after every run, and a run
+after which they differ is invalid, as is every later one: its limits and
+weights are no longer those of the runs before.
+
 ## What is measured
 
 The `quick` suite has two workloads, both with one thread pair for every two
