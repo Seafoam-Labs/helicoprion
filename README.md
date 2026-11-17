@@ -103,7 +103,11 @@ The schema number goes up with every incompatible change.
 A file records the tool version, the label, the system, the expected
 scheduler, whether a scheduler restart can be detected
 (`restart_detectable`), the design of the `matrix` session if there is one,
-and the parameters and runs of each workload. Each run stores:
+and the parameters and runs of each workload. `protocol` holds how the runs
+were taken (suite, measured and warm-up runs, run length, pause), and the
+design of a `matrix` session its settle time, the order of visits and the
+options the scheduler ran with: what another session has to repeat to be a
+repetition of this one. Each run stores:
 
 - `sched_before` and `sched_after`, the scheduler readings used to check that
   the run is valid.

@@ -15,8 +15,9 @@ use crate::{Reading, Scheduler, SystemInfo};
 /// 4: `Better::Neither` (informational metrics), `Metric::extreme`,
 ///    `RunResult::visit`/`round`, `ResultFile::design`. Schema 3 files still read.
 ///    `Metric::share` was added later as an optional field; files without it
-///    are still schema 4. So were `RunResult::before`/`after` and
-///    `SystemInfo::temp_sensor`.
+///    are still schema 4. So were `RunResult::before`/`after`,
+///    `SystemInfo::temp_sensor`, `ResultFile::protocol` and the settle
+///    time, visit order and scheduler options of `Design`.
 pub const SCHEMA_VERSION: u32 = 4;
 /// Oldest schema `compare` can read.
 pub const MIN_READABLE_SCHEMA: u32 = 3;
@@ -130,7 +131,7 @@ pub struct Window {
 
 /// An interleaved session: schedulers were switched between visits so that
 /// slow drift (thermal, background state) affects every scheduler alike.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Design {
     /// e.g. `interleaved`
     pub kind: String,
@@ -144,6 +145,37 @@ pub struct Design {
     /// existed) are identified by start time and scheduler list instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// How long a scheduler had to hold after a switch before its runs
+    /// started, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_s: Option<f64>,
+    /// The order of visits within a round. `alternating`: the order of
+    /// `schedulers` in even rounds (counting from 0), reversed in odd ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
+    /// The options this file's scheduler ran with, as the scheduler
+    /// service reported them after every switch (the same each time, or
+    /// the session stops). `None` for the kernel's scheduler, and where the
+    /// service did not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+}
+
+/// How the runs of a file were taken: what a second session must repeat
+/// to be a repetition of this one. Workload parameters are with each
+/// workload; a `matrix` session adds its `Design`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Protocol {
+    /// The workload suite, e.g. `quick`.
+    pub suite: String,
+    /// Measured runs of each workload: in total for `run`, per scheduler
+    /// visit for `matrix`.
+    pub runs: u32,
+    /// Unrecorded runs before them (again per visit for `matrix`).
+    pub warmup: u32,
+    /// Requested length of a run and the pause after it, in seconds.
+    pub duration_s: f64,
+    pub cooldown_s: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,5 +203,9 @@ pub struct ResultFile {
     /// How the session was run; absent means a plain `run`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<Design>,
+    /// How the runs were taken. Absent in files written before it was
+    /// recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Protocol>,
     pub workloads: Vec<WorkloadResult>,
 }

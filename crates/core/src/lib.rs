@@ -7,7 +7,8 @@ pub mod sched;
 pub mod system;
 
 pub use result::{
-    Better, Design, MIN_READABLE_SCHEMA, Metric, ResultFile, RunResult, SCHEMA_VERSION, Window, WorkloadResult,
+    Better, Design, MIN_READABLE_SCHEMA, Metric, Protocol, ResultFile, RunResult, SCHEMA_VERSION, Window,
+    WorkloadResult,
 };
 pub use sched::Scheduler;
 pub use system::{Freq, Probe, Reading, SystemInfo};

@@ -33,7 +33,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use helicoprion_core::{Design, Reading, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo, WorkloadResult};
+use helicoprion_core::{Design, Protocol, Reading, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo, WorkloadResult};
 use helicoprion_workloads::Workload;
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use serde_json::Value;
@@ -585,15 +585,31 @@ fn mismatch(t: &Target, state: &Value, k: &Scheduler, allow_ops_mismatch: bool) 
     }
 }
 
+/// What a switch ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    /// The scheduler the runs must stay on.
+    pub scheduler: Scheduler,
+    /// The options scxcli reports the scheduler running with. `None` for
+    /// the kernel's scheduler and where scxcli does not say.
+    pub options: Option<Vec<String>>,
+}
+
+/// The options of the running scheduler in `scxcli get`, if it gives any.
+fn running_options(state: &Value) -> Option<Vec<String>> {
+    let args = state.pointer("/running/args")?;
+    args.is_array().then(|| str_list(Some(args)))
+}
+
 /// Switch to `t` and wait until scxcli and the kernel both show it and it
-/// holds for `settle`. Returns the scheduler the runs must stay on.
+/// holds for `settle`.
 pub fn switch_and_settle(
     ctl: &dyn Control,
     detect: &dyn Fn() -> Scheduler,
     interrupted: &dyn Fn() -> bool,
     t: &Target,
     cfg: &SwitchCfg,
-) -> Result<Scheduler> {
+) -> Result<Settled> {
     let deadline = Instant::now() + cfg.timeout;
     let left = || deadline.saturating_duration_since(Instant::now()).min(cfg.cmd_timeout);
     ctl.scxcli(&t.spec.scxcli_args(), left())?;
@@ -635,7 +651,7 @@ pub fn switch_and_settle(
         match (&stable_since, &why) {
             (Some((since, s)), None) if *s == k => {
                 if now.duration_since(*since) >= cfg.settle {
-                    return Ok(k);
+                    return Ok(Settled { scheduler: k, options: running_options(&state) });
                 }
             }
             (_, None) => stable_since = Some((now, k)),
@@ -707,6 +723,8 @@ pub fn new_session_id() -> String {
 
 pub struct Session<'a> {
     pub targets: Vec<Target>,
+    /// Name of the workload suite, for the record.
+    pub suite: String,
     pub rounds: u32,
     pub runs_per_visit: usize,
     pub warmup: usize,
@@ -725,6 +743,8 @@ pub struct Session<'a> {
 struct Accum {
     /// First scheduler reading of each visit.
     schedulers: Vec<Scheduler>,
+    /// The options the scheduler ran with in its first visit.
+    options: Option<Vec<String>>,
     workloads: BTreeMap<usize, WorkloadResult>,
 }
 
@@ -757,6 +777,16 @@ impl Session<'_> {
                 schedulers: labels,
                 spec: self.targets[i].label.clone(),
                 session_id: Some(self.session_id.clone()),
+                settle_s: Some(self.switch.settle.as_secs_f64()),
+                order: Some("alternating".into()),
+                options: acc.options.clone(),
+            }),
+            protocol: Some(Protocol {
+                suite: self.suite.clone(),
+                runs: self.runs_per_visit as u32,
+                warmup: self.warmup as u32,
+                duration_s: self.duration.as_secs_f64(),
+                cooldown_s: self.cooldown.as_secs_f64(),
             }),
             workloads: acc.workloads.values().cloned().collect(),
         })
@@ -794,8 +824,20 @@ pub fn run_matrix(
                 }
                 let t = &s.targets[ti];
                 eprintln!("\nround {}/{} · {}", round + 1, s.rounds, t.label);
-                let expected = switch_and_settle(ctl, detect, interrupted, t, &s.switch)?;
+                let Settled { scheduler: expected, options } =
+                    switch_and_settle(ctl, detect, interrupted, t, &s.switch)?;
                 eprintln!("  scheduler: {expected}");
+                // One file is one configuration: a scheduler that comes
+                // back with other options is not the one measured before.
+                if !acc[ti].schedulers.is_empty() && acc[ti].options != options {
+                    bail!(
+                        "{} runs with options {:?} now and ran with {:?} earlier in this session",
+                        t.label,
+                        options.as_deref().unwrap_or_default(),
+                        acc[ti].options.as_deref().unwrap_or_default()
+                    );
+                }
+                acc[ti].options = options;
                 acc[ti].schedulers.push(expected.clone());
                 let cfg = RunConfig {
                     expected,
@@ -900,6 +942,8 @@ mod tests {
         broken: Vec<String>,
         /// Process name -> kernel ops name, when they differ.
         odd_ops: Vec<(String, String)>,
+        /// Schedulers the service starts with other options every time.
+        shifting: Vec<String>,
     }
 
     impl Sim {
@@ -917,6 +961,7 @@ mod tests {
                 log: RefCell::default(),
                 broken: vec![],
                 odd_ops: vec![],
+                shifting: vec![],
             }
         }
 
@@ -990,6 +1035,10 @@ mod tests {
                     *u = Unit { active: false, enabled: false, next: None, failure: None, ..u.clone() };
                 }
                 ["start", "latency"] => self.launch("scx_eevdf", vec!["--slice-us".into(), "1600".into()]),
+                ["start", id] if self.shifting.iter().any(|s| s == id) => {
+                    let seq = self.unit.borrow().enable_seq;
+                    self.launch(id, vec!["--slice-us".into(), (1000 * seq).to_string()]);
+                }
                 ["start", id] => self.launch(id, vec![]),
                 ["run", sched, rest @ ..] => self.launch(sched, rest.iter().map(|s| s.to_string()).collect()),
                 ["stop"] => self.unit.borrow_mut().active = false,
@@ -1032,6 +1081,7 @@ mod tests {
         let labels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
         Session {
             targets: resolve(&labels, sim, Duration::from_secs(1)).unwrap(),
+            suite: "test".into(),
             rounds,
             runs_per_visit: 2,
             warmup: 0,
@@ -1197,6 +1247,55 @@ mod tests {
         assert_eq!(out.files.len(), 1);
         // The unit was disabled before: restore had to disable it again.
         assert_eq!(sim.log().last().unwrap(), "systemctl disable");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_protocol_and_the_options_are_on_record() {
+        let sim = Sim::new(false, false, None);
+        let w: Vec<Box<dyn Workload>> = vec![Box::new(Quick)];
+        let dir = tmp_dir("protocol");
+        let s = session(&sim, &["default", "scx_lavd", "latency", "scx_bpfland -s 5000"], 2, &w, &dir);
+        let out = go(&sim, &s, None);
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let options: Vec<Option<Vec<String>>> =
+            out.files.iter().map(|f| f.design.as_ref().unwrap().options.clone()).collect();
+        let list = |a: &[&str]| Some(a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // The kernel's scheduler has none; a scheduler started by name runs
+        // with what the service gave it (here nothing); a profile and a
+        // spec with options run with theirs.
+        assert_eq!(options, [None, list(&[]), list(&["--slice-us", "1600"]), list(&["-s", "5000"])]);
+        for f in &out.files {
+            let d = f.design.as_ref().unwrap();
+            assert_eq!((d.settle_s, d.order.as_deref()), (Some(0.005), Some("alternating")));
+            let p = f.protocol.as_ref().unwrap();
+            assert_eq!((p.suite.as_str(), p.runs, p.warmup), ("test", 2, 0));
+            assert_eq!((p.duration_s, p.cooldown_s), (0.0, 0.0));
+            // What is in memory is what is on disk.
+            let saved: ResultFile =
+                serde_json::from_str(&fs::read_to_string(dir.join(file_name(0, "default"))).unwrap()).unwrap();
+            assert_eq!(saved.protocol, out.files[0].protocol);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scheduler_that_returns_with_other_options_stops_the_session() {
+        let mut sim = Sim::new(false, false, None);
+        sim.shifting = vec!["scx_lavd".into()];
+        let before = prior_of(&sim);
+        let w: Vec<Box<dyn Workload>> = vec![Box::new(Quick)];
+        let dir = tmp_dir("shifting");
+        let s = session(&sim, &["default", "scx_lavd"], 3, &w, &dir);
+        let out = go(&sim, &s, None);
+        let e = format!("{:#}", out.error.unwrap());
+        assert!(e.contains("scx_lavd runs with options") && e.contains("earlier in this session"), "{e}");
+        // The first round is kept, with the options it was measured with.
+        assert_eq!(out.visits, 2);
+        let lavd = out.files.iter().find(|f| f.label == "scx_lavd").unwrap();
+        assert_eq!(lavd.workloads[0].runs.len(), 2);
+        assert_eq!(lavd.design.as_ref().unwrap().options.as_ref().unwrap()[0], "--slice-us");
+        assert!(out.restore_error.is_none() && prior_of(&sim).same_as(&before));
         let _ = fs::remove_dir_all(&dir);
     }
 

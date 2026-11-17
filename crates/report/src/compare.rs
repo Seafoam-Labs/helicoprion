@@ -1169,6 +1169,7 @@ mod tests {
             scheduler: Scheduler::Fair { class: "EEVDF".into(), scx_capable: false, bore: None },
             restart_detectable: true,
             design: None,
+            protocol: None,
             workloads: vec![WorkloadResult {
                 name: "w".into(),
                 description: String::new(),
@@ -2235,6 +2236,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                 schedulers: vec!["base".into(), "cand".into()],
                 spec: label.into(),
                 session_id: Some("0123456789abcdef".into()),
+                ..Default::default()
             });
             for (round, d) in drift.iter().enumerate() {
                 for jitter in [0.99, 1.01] {

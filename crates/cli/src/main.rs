@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use helicoprion_core::{MIN_READABLE_SCHEMA, Probe, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
+use helicoprion_core::{MIN_READABLE_SCHEMA, Probe, Protocol, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
 use helicoprion_report::{Comparison, Options, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use helicoprion_workloads::{SUITES, SuiteOpts, suite};
@@ -301,6 +301,13 @@ fn run(a: RunArgs) -> Result<()> {
         system: sys,
         restart_detectable: sched.restart_detectable(),
         design: None,
+        protocol: Some(Protocol {
+            suite: suite_name.into(),
+            runs: runs as u32,
+            warmup: warmup as u32,
+            duration_s: duration,
+            cooldown_s: cooldown,
+        }),
         scheduler: sched,
         workloads: results,
     };
@@ -484,6 +491,7 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
 
     let session = Session {
         targets,
+        suite: a.suite.clone(),
         rounds: a.rounds,
         runs_per_visit: a.runs_per_visit,
         warmup: a.warmup,

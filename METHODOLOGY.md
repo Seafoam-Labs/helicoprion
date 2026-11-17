@@ -56,6 +56,11 @@ The session ends when a switch fails or does not settle within
 takes longer than `--command-timeout` seconds (20 by default) is killed, so
 a hung scxcli cannot stall the session.
 
+The options scxcli reports for the running scheduler are recorded with its
+results. The session also ends when a scheduler comes back from a later
+switch with other options than in its first visit: one result file stands
+for one configuration.
+
 ### Restoring the previous state
 
 At the end, after an error, or after a first Ctrl-C, which stops before the
