@@ -33,6 +33,7 @@ td .m, .m { color: var(--ink-muted); }
 .warn { border-left: 3px solid var(--bad); padding: 6px 12px; background: var(--surface); margin: 6px 0; }
 details { margin-top: 8px; } summary { cursor: pointer; color: var(--ink-2); }
 .cap { color: var(--ink-2); margin: 0 0 6px; }
+table + .cap { margin-top: 14px; }
 details.help { margin: 0 0 16px; font-size: 13px; }
 .briefs { display: grid; gap: 12px; margin: -8px 0 20px; }
 .brief { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 16px; }
@@ -222,6 +223,189 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
 
 /// The report; with `simple`, everything but the plain-words section is
 /// folded into one collapsed block, for readers who only want the outcome.
+/// The rest of what the files say about machine, session and scheduler
+/// options, folded: a property per row, a file per column, only the
+/// properties some file has.
+fn system_details(h: &mut String, c: &Comparison) {
+    type Get = fn(&helicoprion_core::ResultFile) -> Option<String>;
+    let rows: [(&str, Get); 13] = [
+        ("Kernel build", |f| f.system.kernel_build.clone()),
+        ("Preemption", |f| f.system.preempt.clone()),
+        ("Kernel parameters", |f| (!f.system.cmdline.is_empty()).then(|| f.system.cmdline.join(" "))),
+        ("Topology", |f| {
+            let t = f.system.topology.as_ref()?;
+            let more = |n: Option<u32>, what: &str| n.map(|n| format!(", {n} {what}")).unwrap_or_default();
+            Some(format!(
+                "{} package(s), {} cores{}{}",
+                t.packages,
+                t.cores,
+                more(t.l3_domains, "L3 domain(s)"),
+                more(t.numa_nodes, "NUMA node(s)")
+            ))
+        }),
+        ("CPUs the benchmark may use", |f| f.system.allowed_cpus.clone()),
+        ("Isolated CPUs", |f| f.system.isolated_cpus.clone()),
+        ("Cpufreq driver", |f| f.system.cpufreq_driver.clone()),
+        ("Highest frequency (kHz)", |f| f.system.max_freq_khz.clone()),
+        ("Boost", |f| f.system.boost.map(|b| if b { "on" } else { "off" }.to_string())),
+        ("Power", |f| f.system.on_ac.map(|ac| if ac { "mains" } else { "battery" }.to_string())),
+        ("Temperature from", |f| f.system.temp_sensor.clone()),
+        ("Scheduler options", |f| {
+            let o = f.design.as_ref()?.options.as_ref()?;
+            Some(if o.is_empty() { "none".to_string() } else { o.join(" ") })
+        }),
+        ("Runs", |f| {
+            let p = f.protocol.as_ref()?;
+            let d = f.design.as_ref();
+            let per = if d.is_some() { " per visit" } else { "" };
+            let mut text =
+                format!("{} × {} s{per}, {} warm-up, {} s pause", p.runs, p.duration_s, p.warmup, p.cooldown_s);
+            if let Some(settle) = d.and_then(|d| d.settle_s) {
+                let _ = write!(text, ", {settle} s settle");
+            }
+            if let Some(order) = d.and_then(|d| d.order.as_ref()) {
+                let _ = write!(text, ", {order} order");
+            }
+            Some(text)
+        }),
+    ];
+    let shown: Vec<(&str, Vec<Option<String>>)> = rows
+        .iter()
+        .map(|(name, get)| (*name, c.series.iter().map(|s| get(&s.file)).collect::<Vec<_>>()))
+        .filter(|(_, values)| values.iter().any(Option::is_some))
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    h.push_str("<details><summary>More about the systems and how the runs were taken</summary><table><tr><th></th>");
+    for s in &c.series {
+        let _ = write!(h, "<th class=l>{}</th>", esc(&s.label));
+    }
+    h.push_str("</tr>");
+    for (name, values) in shown {
+        let _ = write!(h, "<tr><td>{name}</td>");
+        // One cell across when every file says the same.
+        if values.len() > 1 && values.iter().all(|v| v == &values[0]) {
+            let _ = write!(h, "<td class=l colspan={}>{}</td>", values.len(), esc(values[0].as_deref().unwrap_or("")));
+        } else {
+            for v in values {
+                match v {
+                    Some(v) => {
+                        let _ = write!(h, "<td class=l>{}</td>", esc(&v));
+                    }
+                    None => h.push_str("<td class=\"l m\">—</td>"),
+                }
+            }
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</table></details>");
+}
+
+/// When each scheduler was measured and what the machine was doing then,
+/// session by session: a table of rounds for every `matrix` session, and
+/// one table with a row per file for files taken with `run`.
+fn conditions_section(h: &mut String, c: &Comparison) {
+    use crate::conditions::{Session, Visit, clock, conditions, utc};
+    let sessions = conditions(&c.series);
+    if sessions.is_empty() {
+        return;
+    }
+    let range = |r: (f64, f64), digits: usize| {
+        if format!("{:.digits$}", r.0) == format!("{:.digits$}", r.1) {
+            format!("{:.digits$}", r.0)
+        } else {
+            format!("{:.digits$}–{:.digits$}", r.0, r.1)
+        }
+    };
+    let overall = |s: &Session| {
+        let mut parts = vec![format!("{} from the first run to the last", clock(s.span_s))];
+        if let Some(t) = s.temp_after_c {
+            parts.push(format!("{} °C after a visit's hottest run", range(t, 0)));
+        }
+        if let Some(f) = s.freq_ghz {
+            parts.push(format!("{} GHz right after the runs", range(f, 2)));
+        }
+        if let Some(l) = s.load_max {
+            parts.push(format!("load average at most {l:.2}"));
+        }
+        parts.join(", ")
+    };
+    let state = |v: &Visit| {
+        let mut parts = Vec::new();
+        if let Some((lo, hi)) = v.temp_c {
+            parts.push(format!("{lo:.0}→{hi:.0} °C"));
+        }
+        if let Some(f) = v.freq_ghz {
+            parts.push(format!("{f:.2} GHz"));
+        }
+        if let Some(l) = v.load {
+            parts.push(format!("load {l:.2}"));
+        }
+        parts
+    };
+    let apart = if sessions.len() > 1 {
+        format!(
+            " The files come from {} sessions; each is shown on its own, with its own clock, since a round of one has nothing to do with the same round of another.",
+            sessions.len()
+        )
+    } else {
+        String::new()
+    };
+    let _ = write!(
+        h,
+        "<h2>Conditions</h2><p class=cap>When each scheduler was measured, and the state of the machine then.{apart}</p><details class=help><summary>How to read this</summary><p>Read right before and right after every run, outside the measurement. For a <code>matrix</code> session a cell is one scheduler's visit in a round: the time its first run started, counted from the session's first run; the CPU temperature from the coolest reading before a run to the hottest after one; the mean frequency of the CPUs right after the runs (before a run they idle, which says little); and the highest 1-minute load average, which includes the benchmark's own threads. Visits of one round that differ much were not measured under the same conditions; a round that differs from the others is where drift between rounds shows. Files taken with <code>run</code> are sessions of their own and get a row each, with the time they started. Nothing here is scored: the tables are for judging whether the machine was the same machine throughout.</p></details>"
+    );
+    for s in sessions.iter().filter(|s| s.interleaved) {
+        let _ = write!(
+            h,
+            "<p class=cap><strong>Session started {}</strong>: {}.</p><table><tr><th></th>",
+            utc(s.started_at),
+            overall(s)
+        );
+        for i in &s.series {
+            let _ = write!(h, "<th>{}</th>", esc(&c.series[*i].label));
+        }
+        h.push_str("</tr>");
+        for row in &s.rows {
+            let name = row.round.map_or_else(|| "all runs".to_string(), |r| format!("round {}", r + 1));
+            let _ = write!(h, "<tr><td>{name}</td>");
+            for v in &row.visits {
+                match v {
+                    Some(v) => {
+                        let _ = write!(
+                            h,
+                            "<td><span class=m>+{}</span><br>{}</td>",
+                            clock(v.start_s),
+                            state(v).join("<br>")
+                        );
+                    }
+                    None => h.push_str("<td class=m>—</td>"),
+                }
+            }
+            h.push_str("</tr>");
+        }
+        h.push_str("</table>");
+    }
+    let separate: Vec<&Session> = sessions.iter().filter(|s| !s.interleaved).collect();
+    if !separate.is_empty() {
+        h.push_str("<p class=cap><strong>Runs taken separately</strong>: every file is a session of its own.</p><table><tr><th>File</th><th>Started</th><th>Took</th><th>Machine</th></tr>");
+        for s in separate {
+            // One file, all its runs: a single visit.
+            let v = s.rows.iter().flat_map(|r| r.visits.iter().flatten()).next();
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&c.series[s.series[0]].label),
+                utc(s.started_at),
+                clock(s.span_s),
+                v.map(|v| state(v).join(" · ")).unwrap_or_default()
+            );
+        }
+        h.push_str("</table>");
+    }
+}
+
 pub fn report_with(c: &Comparison, simple: bool) -> String {
     let mut h = String::new();
     let base = &c.series[c.baseline];
@@ -273,6 +457,8 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
         );
     }
     h.push_str("</table>");
+    system_details(&mut h, c);
+    conditions_section(&mut h, c);
 
     if let Some(svg) = delta_chart(c) {
         let paired_note = if c.any_paired() {

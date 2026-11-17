@@ -2,6 +2,7 @@
 //! baseline, and self-contained SVG/HTML output (no JS, no external assets).
 
 pub mod compare;
+pub mod conditions;
 pub mod html;
 pub mod simple;
 pub mod stats;

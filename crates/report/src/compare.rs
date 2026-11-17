@@ -1026,6 +1026,44 @@ pub fn env_diff(base: &ResultFile, other: &ResultFile) -> Vec<String> {
     cmp("platform profile", opt(&a.platform_profile), opt(&b.platform_profile));
     cmp("kernel", a.kernel.clone(), b.kernel.clone());
     cmp("tool version", base.tool_version.clone(), other.tool_version.clone());
+    // What newer files also record. A file without a field (written
+    // before it existed, or by a user who may not read it) says nothing,
+    // and nothing is not a difference.
+    let mut known = |what: &str, x: Option<String>, y: Option<String>| {
+        if let (Some(x), Some(y)) = (x, y) {
+            cmp(what, x, y);
+        }
+    };
+    let words = |v: &[String]| if v.is_empty() { "none".to_string() } else { v.join(" ") };
+    let power = |ac: bool| if ac { "mains" } else { "battery" }.to_string();
+    let switch = |on: bool| if on { "on" } else { "off" }.to_string();
+    known("kernel build", a.kernel_build.clone(), b.kernel_build.clone());
+    known("preemption model", a.preempt.clone(), b.preempt.clone());
+    // The parameters are read wherever the build is.
+    known(
+        "kernel parameters",
+        a.kernel_build.as_ref().map(|_| words(&a.cmdline)),
+        b.kernel_build.as_ref().map(|_| words(&b.cmdline)),
+    );
+    known("CPUs the benchmark may use", a.allowed_cpus.clone(), b.allowed_cpus.clone());
+    known("CPU topology", a.topology.as_ref().map(|t| format!("{t:?}")), b.topology.as_ref().map(|t| format!("{t:?}")));
+    known(
+        "isolated CPUs",
+        a.topology.as_ref().map(|_| opt(&a.isolated_cpus)),
+        b.topology.as_ref().map(|_| opt(&b.isolated_cpus)),
+    );
+    known("cpufreq driver", a.cpufreq_driver.clone(), b.cpufreq_driver.clone());
+    known("frequency boost", a.boost.map(switch), b.boost.map(switch));
+    known("power source", a.on_ac.map(power), b.on_ac.map(power));
+    let taken = |f: &ResultFile| {
+        f.protocol.as_ref().map(|p| {
+            format!(
+                "{} runs of {} s, {} warm-up, {} s pause, suite {}",
+                p.runs, p.duration_s, p.warmup, p.cooldown_s, p.suite
+            )
+        })
+    };
+    known("how the runs were taken", taken(base), taken(other));
     out
 }
 
@@ -2714,6 +2752,149 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(c.env_notes.iter().any(|n| n.contains("kernel")));
         // Environment differences do not block the comparison.
         assert!(c.rows[0].improvement(0, 1).is_some());
+    }
+
+    /// The report shows when each scheduler was measured and the state of
+    /// the machine then, and the rest of what the files record, without
+    /// inventing either for files that have neither.
+    #[test]
+    fn conditions_and_details_are_shown_when_recorded() {
+        use helicoprion_core::{Freq, Reading};
+        let old = Comparison::build(drifting_session(), 0);
+        let html = crate::html::report(&old);
+        assert!(!html.contains("<h2>Conditions</h2>") && !html.contains("More about the systems"), "old files");
+
+        let mut files = drifting_session();
+        for (i, f) in files.iter_mut().enumerate() {
+            f.system.preempt = Some("full".into());
+            f.system.temp_sensor = Some("k10temp/Tctl".into());
+            f.design.as_mut().unwrap().options = (i == 1).then(|| vec!["--slice-us".into(), "5000".into()]);
+            for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                // Rounds a minute apart, the candidate 20 s after the baseline.
+                let at = 1.8e9 + 60.0 * (k / 2) as f64 + 20.0 * i as f64 + 6.0 * (k % 2) as f64;
+                let reading = |at: f64, temp: f64, mhz: f64| Reading {
+                    at,
+                    loadavg_1m: Some(0.25),
+                    temp_c: Some(temp),
+                    freq_mhz: Some(Freq { min: mhz, mean: mhz, max: mhz }),
+                };
+                r.before = Some(reading(at, 55.0 + k as f64, 2000.0));
+                r.after = Some(reading(at + 5.0, 70.0 + k as f64, 4250.0));
+            }
+        }
+        let html = crate::html::report(&Comparison::build(files, 0));
+        assert!(html.contains("<h2>Conditions</h2>"));
+        assert!(html.contains(
+            "<strong>Session started 2027-01-15 08:00 UTC</strong>: 5:31 from the first run to the last, 71–81 °C \
+after a visit's hottest run, 4.25 GHz right after the runs, load average at most 0.25."
+        ));
+        assert!(!html.contains("Runs taken separately") && !html.contains("sessions; each is shown"));
+        // Round 2 of the candidate: started 1:20 in, 57 °C before its
+        // first run, 73 °C after its second.
+        assert!(html.contains("<td>round 2</td>"));
+        assert!(html.contains("<td><span class=m>+1:20</span><br>57→73 °C<br>4.25 GHz<br>load 0.25</td>"));
+        // Shared by both files: one cell; per file where they differ.
+        assert!(html.contains("<tr><td>Preemption</td><td class=l colspan=2>full</td></tr>"));
+        assert!(
+            html.contains(
+                "<tr><td>Scheduler options</td><td class=\"l m\">—</td><td class=l>--slice-us 5000</td></tr>"
+            )
+        );
+        // Nothing recorded, no row.
+        assert!(!html.contains("Kernel build") && !html.contains("<td>Power</td>"));
+
+        // The same two schedulers measured again a day later, compared
+        // with the first session: two sessions, two tables, two clocks.
+        // Round 2 of one is not laid next to round 2 of the other.
+        let with_readings = |id: &str, shift: f64| {
+            let mut files = drifting_session();
+            for (i, f) in files.iter_mut().enumerate() {
+                f.design.as_mut().unwrap().session_id = Some(id.into());
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    let at = 1.8e9 + shift + 60.0 * (k / 2) as f64 + 20.0 * i as f64 + 6.0 * (k % 2) as f64;
+                    let reading =
+                        |at: f64, temp: f64| Reading { at, loadavg_1m: None, temp_c: Some(temp), freq_mhz: None };
+                    r.before = Some(reading(at, 50.0));
+                    r.after = Some(reading(at + 5.0, 60.0 + shift / 86_400.0 * 20.0));
+                }
+            }
+            files
+        };
+        let mut files = with_readings("monday", 0.0);
+        files.extend(with_readings("tuesday", 86_400.0));
+        // And a plain run from yet another day.
+        let mut plain = file("by hand", &[100.0], 1);
+        let at = 1.8e9 + 3.0 * 86_400.0;
+        plain.workloads[0].runs[0].before = Some(Reading { at, loadavg_1m: Some(0.5), temp_c: None, freq_mhz: None });
+        plain.workloads[0].runs[0].after =
+            Some(Reading { at: at + 5.0, loadavg_1m: Some(0.75), temp_c: None, freq_mhz: None });
+        files.push(plain);
+        let html = crate::html::report(&Comparison::build(files, 0));
+        let section = &html[html.find("<h2>Conditions</h2>").unwrap()..html.find("<h2>Change vs baseline").unwrap()];
+        assert!(section.contains("The files come from 3 sessions; each is shown on its own"), "{section}");
+        assert!(section.contains("<strong>Session started 2027-01-15 08:00 UTC</strong>: 5:31 from the first run"));
+        assert!(section.contains("<strong>Session started 2027-01-16 08:00 UTC</strong>: 5:31 from the first run"));
+        assert_eq!(section.matches("<td>round 2</td>").count(), 2, "one per session");
+        // Each table has its own two schedulers, and its own temperatures.
+        assert_eq!(section.matches("<th>base</th><th>cand</th>").count(), 1);
+        assert_eq!(section.matches("<th>base #2</th><th>cand #2</th>").count(), 1);
+        assert!(section.contains("50→60 °C") && section.contains("50→80 °C"));
+        // Nothing counts from the other session's start: no "+24:01:20".
+        assert!(!section.contains("+24:"), "{section}");
+        assert!(
+            section.contains("<tr><td>by hand</td><td>2027-01-18 08:00 UTC</td><td>0:05</td><td>load 0.75</td></tr>")
+        );
+    }
+
+    /// What newer files record about the machine and the protocol is
+    /// compared too, where both files have it; a file without a field is
+    /// not "different".
+    #[test]
+    fn recorded_protocol_and_machine_differences_are_noted() {
+        use helicoprion_core::{Protocol, Topology};
+        let described = |label: &str| {
+            let mut f = file(label, &[1.0], 1);
+            f.system.kernel_build = Some("#1 SMP PREEMPT_DYNAMIC Mon, 16 Nov 2026".into());
+            f.system.preempt = Some("full".into());
+            f.system.cmdline = vec!["mitigations=auto".into()];
+            f.system.topology = Some(Topology { packages: 1, cores: 8, l3_domains: Some(1), numa_nodes: Some(1) });
+            f.system.cpufreq_driver = Some("amd-pstate-epp".into());
+            f.system.allowed_cpus = Some("0-7".into());
+            f.system.boost = Some(true);
+            f.system.on_ac = Some(true);
+            f.protocol = Some(Protocol { suite: "quick".into(), runs: 5, warmup: 1, duration_s: 5.0, cooldown_s: 1.0 });
+            f
+        };
+        let notes = |base: ResultFile, other: ResultFile| Comparison::build(vec![base, other], 0).env_notes;
+        assert_eq!(notes(described("a"), described("b")), Vec::<String>::new());
+        // An older file next to a newer one: nothing to compare, no note.
+        assert_eq!(notes(file("old", &[1.0], 1), described("new")), Vec::<String>::new());
+        assert_eq!(notes(described("new"), file("old", &[1.0], 1)), Vec::<String>::new());
+
+        let mut other = described("b");
+        other.system.kernel_build = Some("#2 SMP PREEMPT_DYNAMIC Tue, 17 Nov 2026".into());
+        other.system.preempt = Some("lazy".into());
+        other.system.cmdline = vec![];
+        other.system.isolated_cpus = Some("2-3".into());
+        // Eight CPUs as well, but other ones.
+        other.system.allowed_cpus = Some("8-15".into());
+        other.system.boost = Some(false);
+        other.system.on_ac = Some(false);
+        other.protocol.as_mut().unwrap().cooldown_s = 0.0;
+        let n = notes(described("a"), other).join("\n");
+        for expected in [
+            "kernel build differs",
+            "preemption model differs (lazy vs baseline full)",
+            "kernel parameters differs (none vs baseline mitigations=auto)",
+            "isolated CPUs differs (2-3 vs baseline ?)",
+            "CPUs the benchmark may use differs (8-15 vs baseline 0-7)",
+            "frequency boost differs (off vs baseline on)",
+            "power source differs (battery vs baseline mains)",
+            "how the runs were taken differs (5 runs of 5 s, 1 warm-up, 0 s pause, suite quick vs baseline",
+        ] {
+            assert!(n.contains(expected), "{expected}\n{n}");
+        }
+        assert!(!n.contains("topology") && !n.contains("cpufreq driver"), "{n}");
     }
 
     #[test]
