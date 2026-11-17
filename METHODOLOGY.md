@@ -17,6 +17,9 @@ sudo helicoprion matrix --sched default --sched scx_lavd --sched scx_cosmos \
     --sched "scx_bpfland -s 5000" --rounds 5 -o lavd-vs-cosmos/
 ```
 
+Run `matrix` as root, otherwise scxcli asks polkit for authorization at
+every switch.
+
 ### Choosing the schedulers
 
 `--sched` takes what scxcli takes: `default` for the kernel's own scheduler,
@@ -55,23 +58,19 @@ a hung scxcli cannot stall the session.
 
 ### Restoring the previous state
 
-At the end, and also after an error or Ctrl-C, helicoprion restores the
-scheduler and options that were selected before, and whether `scx.service`
-was active and enabled. It then checks both the configuration scxcli reports
-and the scheduler the kernel has attached. A failed restore is reported
-before any other error, and the commands that restore everything by hand are
-printed when the session starts.
+At the end, after an error, or after a first Ctrl-C, which stops before the
+next run or switch, helicoprion restores the scheduler and options that were
+selected before, and whether `scx.service` was active and enabled. It then
+checks both the configuration scxcli reports and the scheduler the kernel
+has attached. A failed restore is reported before any other error, the
+commands that restore everything by hand are printed when the session
+starts, and a second Ctrl-C exits at once without restoring.
 
 `matrix` refuses to start in a state it could not restore exactly: when
 `SCX_SCHEDULER_OVERRIDE` or `SCX_FLAGS_OVERRIDE` is set, when the unit was
 enabled with `systemctl enable --runtime` or is active without a configured
 scheduler, when scxcli could not fully resolve its configuration, or when
 the unit and the kernel disagree about the scheduler.
-
-Pressing Ctrl-C once stops before the next run or switch and restores the
-previous state. Pressing it again exits at once without restoring. Run
-`matrix` as root, otherwise scxcli asks polkit for authorization at every
-switch.
 
 ### Output
 
@@ -159,32 +158,29 @@ ends as invalid.
 ### Change against the baseline
 
 Each workload has `--runs` measured runs (5 by default) after `--warmup`
-runs that are thrown away (1 by default). In a `matrix` session that is
-`--runs-per-visit` runs per visit (1 by default). Reports use the median of
-the valid runs and the interquartile range, and every change is signed so
-that positive means better.
+runs that are thrown away (1 by default), or `--runs-per-visit` runs per
+visit (1 by default) in a `matrix` session. Reports use the median of the
+valid runs and the interquartile range, and every change is signed so that
+positive means better.
 
 The interval of a change is a 95% percentile bootstrap over the runs of both
 sides. Files from one `matrix` session, recognised by their
 `design.session_id`, are compared round by round instead: the change is
 computed within each round, where both schedulers ran under the same
 conditions, the estimate is the median of those changes, and the bootstrap
-resamples whole rounds. Drift between rounds then cancels out instead of
+resamples whole rounds, so drift between rounds cancels out instead of
 widening the interval. Runs of one session are never treated as independent
-samples, so `--rounds 2 --runs-per-visit 5` still has only two rounds.
-
-With a handful of runs this is a rough guide, not a significance test, and
-there is no correction for comparing many metrics at once. The bootstrap
-also cannot see drift between sessions. In an A/A test, with EEVDF twice on
-the same machine, whole sessions shifted by about 3%, which is why
-`--min-effect` exists. Calibrate it with an A/A test on your own hardware,
-or use `matrix`.
+samples, so `--rounds 2 --runs-per-visit 5` still has only two rounds. With
+a handful of runs or rounds this is a rough guide, not a significance test,
+and there is no correction for comparing many metrics at once.
 
 ### When a change is clear
 
 A change is clear, coloured in the HTML report and starred (`*`) in the
 terminal table, only when none of these rules holds it back. They are
-checked in this order:
+checked in this order. A change that is held back is still listed, and
+extremes, minor populations, uneven and unstable changes are also kept off
+the change chart.
 
 | Held back when | Option | Mark |
 |---|---|---|
@@ -197,37 +193,29 @@ checked in this order:
 | In `matrix`, the change varies too much between rounds | `--unstable-spread` (10%) | `≠` |
 | Outside `matrix`, the runs of either side spread too much | `--unstable-spread` (10%) | `~` |
 
-A change that is held back is still listed. Extremes, minor populations,
-uneven and unstable changes are also kept off the change chart.
-
-A minor population describes a handful of unusual events, so even a large
-change there says that the populations differ, not that the same events got
-slower or faster. Its curve is dashed on the quantile charts, and
-`--min-share 0` turns the rule off.
-
-In a `matrix` session the spread between runs is mostly drift, so stability
-is judged by how much the changes of the single rounds disagree. That
-variation, half the interquartile range of the per-round ratios, only holds
-a change back when it is also larger than the distance between no change and
-the cautious end of the interval. A change of 2.2 times worse with an
-interval of 1.9 to 2.5 times is scored even with rounds 14% apart, since 1.9
-times is 90% away from no change. A round without a usable ratio, typically
-because the candidate measured zero, is compared in percentage points
-instead. Outside `matrix`, the spread is half the relative interquartile
-range of the runs, as when p99.9 under load sits at the edge of a rare
-plateau around 1.6 ms and flips between 40 µs and 1.4 ms from run to run.
-
-`hog_work_per_s` and `woken_per_s` are informational and never scored. The
-first only shows how CPU time was split between the hogs and the ping-pong
-threads. The second follows the mix of round trips, so a scheduler whose
-replies mostly arrive before the pinger sleeps wakes fewer threads without
-being worse.
-
-When a population's share of the round trips differs by a factor of 2 or
-more between the two sides, for example 99.9% blocked round trips against
-40%, the report warns at the top. Its latencies are still scored, but they
-describe different parts of the two runs, so read them together with
-`roundtrips_per_s`, which covers all round trips.
+- A minor population describes a handful of unusual events, so even a large
+  change there only says that the populations differ, not that the same
+  events got slower or faster. Its curve is dashed on the quantile charts,
+  and `--min-share 0` turns the rule off.
+- The threshold covers what the bootstrap cannot see, the drift between
+  sessions. In an A/A test with EEVDF twice on the same machine, whole
+  sessions shifted by about 3%, so calibrate `--min-effect` with an A/A test
+  on your own hardware, or use `matrix`.
+- In `matrix`, the spread between runs is mostly drift, so the rule looks at
+  how much the per-round ratios disagree, measured as half their
+  interquartile range. That only holds a change back when it is also larger
+  than the distance between no change and the cautious end of the interval.
+  A change of 2.2 times worse with an interval of 1.9 to 2.5 times is
+  therefore scored even with rounds 14% apart, because 1.9 times is 90% away
+  from no change. A round without a usable ratio, typically because the
+  candidate measured zero, is compared in percentage points instead.
+- Outside `matrix`, the spread is half the relative interquartile range of
+  the runs. A typical case is p99.9 under load at the edge of a rare plateau
+  around 1.6 ms, flipping between 40 µs and 1.4 ms from run to run.
+- `hog_work_per_s` and `woken_per_s` are informational and never scored. The
+  first only shows how CPU time was split between the hogs and the ping-pong
+  threads, and the second drops when more replies arrive before the pinger
+  sleeps, which is not worse.
 
 ### Summary and wording
 
@@ -243,26 +231,29 @@ as `−2819.1%` hides it. The end of an interval nearer to no change is cut
 off rather than rounded, so 4.87 times reads `4.8×`. The change axis of the
 charts is capped at 100% in either direction.
 
-### What `compare` checks
+### Checks and warnings
 
 `compare` refuses to compute a change, and leaves the series out of the
 latency charts, when the workload parameters such as `pairs` or `hogs`
 differ from the baseline's, or when the unit or direction of a metric does.
 Differences in CPU, CPU count, SMT, governor, EPP, platform profile, kernel
 and tool version are listed as notes, and a different kernel never blocks a
-comparison. Governor and EPP are read from every cpufreq policy, and a run
-warns when the 1-minute load average is above 25% of the CPU count.
+comparison. A run warns when the 1-minute load average is above 25% of the
+CPU count. For stable numbers, fix the governor and EPP, stop background
+jobs, keep the same kernel build and do several runs per scheduler.
 
-For stable numbers, fix the governor and EPP, stop background jobs, keep the
-same kernel build and do several runs per scheduler.
+When a population's share of the round trips differs by a factor of 2 or
+more between the two sides, for example 99.9% blocked round trips against
+40%, the report warns at the top. Its latencies are still scored, but they
+describe different parts of the two runs, so read them together with
+`roundtrips_per_s`, which covers all round trips.
 
 ## Plain-language results (`--simple`)
 
-Add `--simple` to `matrix` or `compare` to get the result in plain words:
-
-```sh
-sudo helicoprion matrix --recommended --simple
-```
+Add `--simple` to `matrix` or `compare` to get the result in plain words.
+The HTML report always opens with an "In short" section like the one below,
+one card per scheduler, and `--simple` folds the charts, tables and reading
+notes under "Full report". In the terminal it looks like this:
 
 ```
 In short, compared with scx_pandemonium:
@@ -281,26 +272,21 @@ scx_cake
     • Of 12 measurements, 11 clearly better and 0 clearly worse
 ```
 
-The HTML report always opens with this "In short" section, one card per
-scheduler. With `--simple`, the charts, tables and reading notes are folded
-under "Full report".
-
 The scoring is the same as in the full report. A line only says "more" or
 "longer" where the table colours the change. Otherwise it says "no reliable
 difference", however far apart the two numbers look, and names the first
 rule from the table above that held the change back. "No clear difference"
 means that the run could not tell the two apart, not that they are equal.
 
-When a scored estimate is far above the cautious end of its interval, the
-line also gives that end, as in `54× shorter, at least 1.49×`. This is one
-end of an estimated 95% interval, not a guaranteed minimum. A change held
-back only because its rounds were uneven still shows the direction its
-interval supports, but neither the verdict nor the count includes it.
-
-When the schedulers produce different mixes of round trips, the affected
-part gets a note below its metrics, such as "Note: Only 11% of round trips
-needed a wake-up, versus 99% for default. The wake-up delays here do not
-describe the same mix of round trips." It describes a difference in
-behaviour, not a proven cause of a delay. Warnings of the full report and
-results from different setups are also mentioned above the folded section
-and in the terminal.
+- When a scored estimate is far above the cautious end of its interval, the
+  line also gives that end, as in `54× shorter, at least 1.49×`. This is one
+  end of an estimated 95% interval, not a guaranteed minimum.
+- A change held back only because its rounds were uneven still shows the
+  direction its interval supports, but neither the verdict nor the count
+  includes it.
+- When the schedulers produce different mixes of round trips, the affected
+  part gets a note below its metrics, such as "Note: Only 11% of round trips
+  needed a wake-up, versus 99% for default." It describes a difference in
+  behaviour, not a proven cause of a delay.
+- Warnings of the full report, and results from different setups, are also
+  mentioned above the folded section and in the terminal.
