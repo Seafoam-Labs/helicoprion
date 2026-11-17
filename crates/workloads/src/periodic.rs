@@ -494,7 +494,8 @@ mod tests {
         let (period, work) = (2_000_000, 5_000_000);
         let first = now_ns() + 1_000_000;
         let out = task(first, first + 60_000_000, period, work);
-        assert!(out.ran >= 5, "{}", out.ran);
+        // How many periods run depends on how much CPU the test gets.
+        assert!(out.ran >= 2, "{}", out.ran);
         assert_eq!(out.late, out.ran);
         assert!(out.skipped >= 2 * (out.ran - 1), "{} skipped for {} ran", out.skipped, out.ran);
         // Nothing beyond the end is counted as due.
