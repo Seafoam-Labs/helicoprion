@@ -33,6 +33,9 @@ fn title(workload: &str) -> String {
         "wake-pingpong/loaded" => "Busy system (every CPU kept busy)".into(),
         "periodic-wake" => "Tasks on a timer, idle system".into(),
         "periodic-wake/loaded" => "Tasks on a timer, busy system (every CPU kept busy)".into(),
+        "wake-burst/half" => "A group of tasks woken at once, half as many as CPUs".into(),
+        "wake-burst/full" => "A group of tasks woken at once, as many as CPUs".into(),
+        "wake-burst/double" => "A group of tasks woken at once, twice as many as CPUs".into(),
         other => other.to_string(),
     }
 }
@@ -180,7 +183,7 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     // percentage of a percentage, and read as points. The two shares say
     // it, with the direction, and with the factor where it is a multiple.
     if row.unit == "%" {
-        let values = format!("{}% → {}% of periods", fmt_value(b), fmt_value(v));
+        let values = format!("{}% → {}% {}", fmt_value(b), fmt_value(v), share_of(metric));
         let factor = d.ratio.max(1.0 / d.ratio);
         let size = if factor.is_finite() && factor >= 2.0 { format!("{}× ", times(factor)) } else { String::new() };
         return Some(match c.unclear_reason(row, i, &d) {
@@ -202,19 +205,41 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     })
 }
 
-/// How often periodic-wake's tasks missed their deadline. Zero is common
-/// here, and a baseline of zero leaves no change to take, so the line is
-/// worded for those cases instead of being left out.
+/// What a share in percent is a share of.
+fn share_of(metric: &str) -> &'static str {
+    match metric {
+        "overrun_pct" => "of wake-ups",
+        _ => "of periods",
+    }
+}
+
+/// A share of failures that is scored: periodic-wake's missed deadlines,
+/// wake-burst's wake-ups lost to overrun.
+struct Failures {
+    metric: &'static str,
+    label: &'static str,
+    /// "missed" in "no run missed any" and "single runs missed up to".
+    verb: &'static str,
+}
+
+const DEADLINES: Failures = Failures { metric: "deadline_miss_pct", label: "Deadlines missed", verb: "missed" };
+const OVERRUNS: Failures =
+    Failures { metric: "overrun_pct", label: "Wake-ups lost because the task was still busy", verb: "lost" };
+
+/// How often a workload's tasks failed in the way `f` names. Zero is
+/// common here, and a baseline of zero leaves no change to take, so the
+/// line is worded for those cases instead of being left out.
 ///
 /// What is compared are medians over the runs. A median of zero is not
 /// "no deadline missed": three clean runs and two with misses have a
 /// median of zero, and a benchmark for rare lateness must not call that
 /// none. "None" is said only when every run of a side has none; otherwise
 /// the line says "median" and how much single runs missed.
-fn deadlines(c: &Comparison, workload: &str, i: usize) -> Option<String> {
-    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == "deadline_miss_pct")?;
+fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<String> {
+    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == f.metric)?;
     let (b, v) = medians(row, c.baseline, i)?;
     let base = &c.series[c.baseline].label;
+    let (label, verb, of) = (f.label, f.verb, share_of(f.metric));
     // The most any single run of a side missed.
     let worst = |k: usize| {
         row.cells.get(k).and_then(Option::as_ref).map_or(0.0, |cell| cell.values.iter().copied().fold(0.0, f64::max))
@@ -222,27 +247,24 @@ fn deadlines(c: &Comparison, workload: &str, i: usize) -> Option<String> {
     let (worst_b, worst_v) = (worst(c.baseline), worst(i));
     let runs = |worst: f64| {
         if worst == 0.0 {
-            "no run missed any".to_string()
+            format!("no run {verb} any")
         } else {
-            format!("single runs missed up to {}%", fmt_value(worst))
+            format!("single runs {verb} up to {}%", fmt_value(worst))
         }
     };
     match (b == 0.0, v == 0.0) {
-        (true, true) if worst_b == 0.0 && worst_v == 0.0 => {
-            Some("Deadlines missed: none in any run under either".into())
-        }
+        (true, true) if worst_b == 0.0 && worst_v == 0.0 => Some(format!("{label}: none in any run under either")),
         (true, true) => Some(format!(
-            "Deadlines missed: a median of 0% of periods under both ({base}: {}; here: {})",
+            "{label}: a median of 0% {of} under both ({base}: {}; here: {})",
             runs(worst_b),
             runs(worst_v)
         )),
         (true, false) => Some(format!(
-            "Deadlines missed: a median of {}% of periods, and a median of 0% under {base} ({}); a change from zero \
-             is not scored",
+            "{label}: a median of {}% {of}, and a median of 0% under {base} ({}); a change from zero is not scored",
             fmt_value(v),
             runs(worst_b)
         )),
-        _ => point(c, workload, i, "deadline_miss_pct", "Deadlines missed", ("fewer", "more")),
+        _ => point(c, workload, i, f.metric, label, ("fewer", "more")),
     }
 }
 
@@ -316,7 +338,17 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 // in how often they take the CPU away during its work:
                 // only the response shows that.
                 slowest("response", "responses", ", work included"),
-                deadlines(c, w, i),
+                failures(c, w, i, &DEADLINES),
+                // wake-burst: a whole group woken at once. How soon one
+                // of them runs, how soon all of them do, and how soon
+                // their work is done; the last is what whoever handed
+                // out the batch waits for.
+                point(c, w, i, "start_p50", "Typical wake-up delay", delays),
+                slowest("start", "wake-ups", ""),
+                point(c, w, i, "all_running_p50", "Until the whole group runs, typically", delays),
+                point(c, w, i, "all_done_p50", "Until the whole group is done, typically", delays),
+                slowest("all_done", "bursts", ", until the whole group is done"),
+                failures(c, w, i, &OVERRUNS),
                 background(c, w, i),
             ]
             .into_iter()
@@ -468,17 +500,24 @@ what a snappy desktop, a game or a busy server depends on.";
 pub const WHAT_PERIODIC: &str = "The test wakes a few tasks on a timer for a short piece of work, as a frame \
 or an audio buffer would, and measures how late they run.";
 
+/// The same for wake-burst.
+pub const WHAT_BURST: &str = "The test wakes a whole group of tasks at once for a short piece of work, as a \
+thread pool given a batch would, and measures how soon they run and how soon all of them are done.";
+
 /// What the workloads of this comparison do, in a sentence each.
 pub fn what(c: &Comparison) -> String {
     let has = |prefix: &str| c.rows.iter().any(|r| r.workload.starts_with(prefix));
-    let parts: Vec<&str> = [("wake-pingpong", WHAT), ("periodic-wake", WHAT_PERIODIC)]
+    let parts: Vec<String> = [("wake-pingpong", WHAT), ("periodic-wake", WHAT_PERIODIC), ("wake-burst", WHAT_BURST)]
         .into_iter()
         .filter(|(prefix, _)| has(prefix))
-        .map(|(_, words)| words)
+        .enumerate()
+        // One test with several parts: the first sentence introduces
+        // it, the others add to it.
+        .map(|(k, (_, words))| if k == 0 { words.to_string() } else { words.replacen("The test ", "It also ", 1) })
         .collect();
-    // Results this module has no words for: the old sentence would be
-    // wrong, and none is better than that.
-    parts.join(" ").replacen("The test wakes", "It also wakes", usize::from(parts.len() > 1))
+    // Results this module has no words for: a sentence about another
+    // workload would be wrong, and none is better than that.
+    parts.join(" ")
 }
 
 /// What "at least" stands for, where a line says it: the cautious end of

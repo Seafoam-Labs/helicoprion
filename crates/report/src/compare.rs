@@ -2318,6 +2318,112 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert_eq!(crate::simple::what(&Comparison::build(drifting_session(), 0)), "");
     }
 
+    /// wake-burst in the plain view: one task, the whole group, the work
+    /// done, and the wake-ups a task sat out because it was still busy.
+    #[test]
+    fn wake_burst_is_described_in_plain_words() {
+        let session = |workload: &str, overrun: (f64, f64)| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = workload.into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    // The drift of the round, without the candidate's 10%.
+                    let wobble = r.metrics["p99"].value / if is_cand { 90.0 } else { 100.0 };
+                    r.metrics.clear();
+                    let k = if is_cand { 0.5 } else { 1.0 } * wobble;
+                    r.metrics.insert("start_p50".into(), Metric::lower(40.0 * k, "us"));
+                    r.metrics.insert("start_p99.9".into(), Metric::lower(900.0 * k, "us"));
+                    r.metrics.insert("all_running_p50".into(), Metric::lower(120.0 * k, "us"));
+                    r.metrics.insert("all_done_p50".into(), Metric::lower(200.0 + 120.0 * k, "us"));
+                    r.metrics.insert("all_done_p99".into(), Metric::lower(200.0 + 800.0 * k, "us"));
+                    let lost = if is_cand { overrun.1 } else { overrun.0 };
+                    r.metrics.insert("overrun_pct".into(), Metric::lower(lost * wobble, "%"));
+                    let overrun = (lost * 10.0) as u64;
+                    for (name, n) in [
+                        ("bursts_planned", 252),
+                        ("bursts", 250),
+                        ("bursts_skipped", 2),
+                        ("bursts_complete", 250 - overrun),
+                        ("wakeups_due", 1000),
+                        ("wakeups_ran", 999 - overrun),
+                        ("wakeups_not_asleep", 1),
+                        ("wakeups_overrun", overrun),
+                    ] {
+                        r.counters.insert(name.into(), n);
+                    }
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let c = session("wake-burst/double", (4.0, 1.0));
+        let text = crate::simple::text(&c);
+        assert!(text.contains("  A group of tasks woken at once, twice as many as CPUs: BETTER\n"), "{text}");
+        assert!(text.contains("• Typical wake-up delay: 2.0× shorter (45.9 → 23.0 µs)"), "{text}");
+        assert!(text.contains("• Slowest wake-ups (1 in 1000): 2.0× shorter ("), "{text}");
+        assert!(text.contains("• Until the whole group runs, typically: 2.0× shorter ("), "{text}");
+        // The work is in it, so it shrinks by less than the wait does.
+        assert!(text.contains("• Until the whole group is done, typically: 20% shorter (338 → 269 µs)"), "{text}");
+        assert!(text.contains("• Slow bursts (1 in 100), until the whole group is done: 41% shorter ("), "{text}");
+        // A share of the wake-ups, not of periods, and no percentage of a
+        // percentage.
+        assert!(
+            text.contains("• Wake-ups lost because the task was still busy: 4.0× fewer (4.59% → 1.15% of wake-ups)"),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_BURST)), "{text}");
+        for (name, title) in [("wake-burst/half", "half as many as CPUs"), ("wake-burst/full", "as many as CPUs")] {
+            let text = crate::simple::text(&session(name, (0.0, 0.0)));
+            assert!(text.contains(&format!("  A group of tasks woken at once, {title}: BETTER\n")), "{text}");
+            // Zero is the usual case, and is said, not left out.
+            assert!(
+                text.contains("• Wake-ups lost because the task was still busy: none in any run under either\n"),
+                "{text}"
+            );
+        }
+        let from_zero = crate::simple::text(&session("wake-burst/full", (0.0, 2.0)));
+        assert!(
+            from_zero.contains(
+                "• Wake-ups lost because the task was still busy: a median of 2.30% of wake-ups, and a median of \
+                 0% under base (no run lost any); a change from zero is not scored"
+            ),
+            "{from_zero}"
+        );
+        // The report explains the populations and counters it shows.
+        let html = crate::html::report(&c);
+        assert!(html.contains(&crate::esc(crate::simple::WHAT_BURST)), "{html}");
+        assert!(html.contains("<code>wakeups_overrun</code>") && html.contains("<code>wake_call</code>"));
+        let share = |label: &str, base: &str, cand: &str| {
+            format!("<td><strong>{label}</strong></td><td><strong>{base}</strong></td><td><strong>{cand}</strong></td>")
+        };
+        assert!(html.contains(&share("wake-ups lost because the task was still busy", "4.0%", "1.0%")), "{html}");
+        assert!(html.contains(&share("wake-ups measured, of those due", "95.9%", "98.9%")), "{html}");
+        // Not asleep yet is its own row, not part of the overruns.
+        assert!(
+            html.contains(&share("wake-ups that found the task done but not asleep yet", "0.1%", "0.1%")),
+            "{html}"
+        );
+        assert!(html.contains(&share("bursts the waker left out, of those planned", "0.8%", "0.8%")), "{html}");
+        assert!(html.contains(&share("bursts in which every task took part", "84.0%", "96.0%")), "{html}");
+
+        // All three workloads in one report: one test with three parts.
+        let mut files = drifting_session();
+        for f in &mut files {
+            let (mut second, mut third) = (f.workloads[0].clone(), f.workloads[0].clone());
+            f.workloads[0].name = "wake-pingpong".into();
+            second.name = "periodic-wake".into();
+            third.name = "wake-burst/full".into();
+            f.workloads.extend([second, third]);
+        }
+        let all = Comparison::build(files, 0);
+        let what = crate::simple::what(&all);
+        assert!(what.starts_with("The test makes pairs of tasks wake each other up"), "{what}");
+        assert!(what.contains(" It also wakes a few tasks on a timer"), "{what}");
+        assert!(what.contains(" It also wakes a whole group of tasks at once"), "{what}");
+        assert_eq!(what.matches("The test ").count(), 1, "{what}");
+        // Alone, it is introduced as the test.
+        assert!(crate::simple::what(&c).starts_with("The test wakes a whole group"));
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]
