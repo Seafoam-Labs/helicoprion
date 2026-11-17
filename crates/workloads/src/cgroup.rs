@@ -203,6 +203,25 @@ fn allowed_cpus() -> Result<Vec<usize>, String> {
     Ok((0..libc::CPU_SETSIZE as usize).filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) }).collect())
 }
 
+/// How long a group may stay busy after its last thread was joined.
+const GROUP_BUSY: Duration = Duration::from_secs(2);
+
+/// Remove a group that no longer has members. A thread that was joined
+/// has finished, but the kernel takes it out of its group a moment
+/// later, when the task is released, and until then removing the group
+/// fails as busy. Try again for a while before taking that for final.
+fn remove_group(dir: &Path) -> std::io::Result<()> {
+    let give_up = Instant::now() + GROUP_BUSY;
+    loop {
+        match fs::remove_dir(dir) {
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            done => return done,
+        }
+    }
+}
+
 /// The groups of one run. `restore` puts the process back where it was
 /// and removes them, and says so if it could not; dropping without it
 /// tries the same and can tell nobody.
@@ -321,7 +340,7 @@ impl Groups {
         // The children before the parent; a group that is not there was
         // never created.
         for dir in [self.parent.join("a"), self.parent.join("b"), self.parent.clone()] {
-            match fs::remove_dir(&dir) {
+            match remove_group(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => failed.push(format!("removing the control group {}: {e}", dir.display())),
