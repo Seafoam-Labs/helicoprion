@@ -13,9 +13,9 @@
 //! protocol. A difference stops the analysis. What a file does not record
 //! is neither equal nor different, and is reported as unverified.
 
-use helicoprion_core::{ResultFile, Scheduler, SystemInfo};
+use helicoprion_core::{Better, ResultFile, Scheduler, SystemInfo};
 
-use crate::compare::{SessionKey, session_key};
+use crate::compare::{Comparison, Delta, Options, SessionKey, UnclearReason, Verdict, session_key};
 use crate::conditions::utc;
 
 /// The files of one `matrix` session, in the order of its scheduler list.
@@ -271,6 +271,288 @@ pub fn check(reference: &Session, other: &Session) -> Check {
         }
     }
     c
+}
+
+/// With fewer sessions than this, the report says that they are too few
+/// for even a first idea of how often a result would repeat.
+///
+/// A practical floor, not a statistical one: reaching it guarantees
+/// nothing. One could reckon that a change scored the same way in five
+/// of five sessions would do so by chance once in sixteen times if its
+/// direction were a coin toss, but that holds for one metric chosen
+/// beforehand and independent sessions. A report lists dozens of
+/// metrics that move together, and nobody picks one in advance.
+pub const SESSIONS_TO_GENERALISE: usize = 5;
+
+/// One session's own estimate of a change, with its own scoring.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outcome {
+    pub delta: Delta,
+    /// Why this session does not score the change; `None` when it does.
+    pub unclear: Option<UnclearReason>,
+}
+
+impl Outcome {
+    /// Scored, and better than the baseline (`Some(true)`) or worse.
+    pub fn clear(&self) -> Option<bool> {
+        self.unclear.is_none().then_some(self.delta.median > 0.0)
+    }
+}
+
+/// How the sessions' scorings of one change agree. A count of sessions,
+/// not a test: it says what happened in these sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agreement {
+    /// Scored in every session that measured it, always in this direction
+    /// (`true`: better than the baseline).
+    Every { better: bool },
+    /// Scored in `clear` sessions, always in this direction; not scored
+    /// in the others.
+    Some { better: bool, clear: usize },
+    /// Scored as better in some sessions and as worse in others.
+    Opposite { better: usize, worse: usize },
+    /// Scored in no session.
+    Never,
+}
+
+/// A scored metric of one scheduler against the baseline, session by
+/// session.
+#[derive(Debug, Clone)]
+pub struct Effect {
+    /// Index into the scheduler list; never 0, the baseline.
+    pub scheduler: usize,
+    pub workload: String,
+    pub metric: String,
+    /// One per session; `None` where the session has no estimate (a side
+    /// lacks the metric there).
+    pub sessions: Vec<Option<Outcome>>,
+}
+
+impl Effect {
+    /// Sessions with an estimate.
+    pub fn measured(&self) -> usize {
+        self.sessions.iter().flatten().count()
+    }
+
+    pub fn agreement(&self) -> Agreement {
+        let clear: Vec<bool> = self.sessions.iter().flatten().filter_map(Outcome::clear).collect();
+        let better = clear.iter().filter(|b| **b).count();
+        let worse = clear.len() - better;
+        match (better, worse) {
+            (0, 0) => Agreement::Never,
+            (b, w) if b > 0 && w > 0 => Agreement::Opposite { better: b, worse: w },
+            (b, _) if clear.len() == self.measured() => Agreement::Every { better: b > 0 },
+            (b, _) => Agreement::Some { better: b > 0, clear: clear.len() },
+        }
+    }
+
+    /// The smallest and the largest of the sessions' estimates, as
+    /// changes in percent (positive is better). `None` with fewer than two.
+    pub fn range(&self) -> Option<(f64, f64)> {
+        let mut changes = self.sessions.iter().flatten().map(|o| o.delta.median);
+        let first = changes.next()?;
+        let (lo, hi, n) = changes.fold((first, first, 1), |(lo, hi, n), c| (lo.min(c), hi.max(c), n + 1));
+        (n >= 2).then_some((lo, hi))
+    }
+}
+
+/// The measured value of one metric under one scheduler, session by
+/// session: the stability of the result itself, apart from any
+/// comparison. Every metric has one, the baseline's and unscored ones too.
+#[derive(Debug, Clone)]
+pub struct Level {
+    /// Index into the scheduler list; 0 is the baseline.
+    pub scheduler: usize,
+    pub workload: String,
+    pub metric: String,
+    pub unit: String,
+    /// The session's median over its valid runs.
+    pub sessions: Vec<Option<f64>>,
+}
+
+impl Level {
+    /// The largest session median over the smallest: 1.0 when all agree.
+    /// `None` with fewer than two values, or when one is not positive.
+    pub fn factor(&self) -> Option<f64> {
+        let v: Vec<f64> = self.sessions.iter().flatten().copied().collect();
+        let (lo, hi) = (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(0.0, f64::max));
+        (v.len() >= 2 && lo > 0.0).then(|| hi / lo)
+    }
+}
+
+/// One scheduler on one workload: the verdict each session gave it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verdicts {
+    pub scheduler: usize,
+    pub workload: String,
+    pub sessions: Vec<Option<Verdict>>,
+}
+
+/// What the sessions' verdicts on one scheduler and workload add up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consensus {
+    /// Every session has a verdict, and it is the same one.
+    Same(Verdict),
+    /// Sessions with a verdict disagree.
+    Differs,
+    /// Some session has no verdict (no comparable measurement there).
+    /// Whatever the others say, it does not hold for every session;
+    /// `agreed` is their common verdict, if they have one.
+    Incomplete { agreed: Option<Verdict>, measured: usize },
+}
+
+impl Verdicts {
+    /// Sessions with a verdict.
+    pub fn measured(&self) -> usize {
+        self.sessions.iter().flatten().count()
+    }
+
+    pub fn consensus(&self) -> Consensus {
+        let mut given = self.sessions.iter().flatten();
+        let agreed = given.next().copied().filter(|first| given.all(|x| x == first));
+        match (self.measured() == self.sessions.len(), agreed) {
+            (true, Some(v)) => Consensus::Same(v),
+            (true, None) => Consensus::Differs,
+            (false, agreed) => Consensus::Incomplete { agreed, measured: self.measured() },
+        }
+    }
+
+    /// Every session has a verdict and all are the same. A session
+    /// without one is not a session that agrees.
+    pub fn same(&self) -> bool {
+        matches!(self.consensus(), Consensus::Same(_))
+    }
+}
+
+/// Sessions of one experiment, each analysed on its own and laid side by
+/// side.
+#[derive(Debug, Clone)]
+pub struct Analysis {
+    /// Scheduler specs, baseline first.
+    pub schedulers: Vec<String>,
+    /// Oldest first; the first is the reference of the check.
+    pub sessions: Vec<Session>,
+    /// Each session's own comparison, series in scheduler order.
+    pub comparisons: Vec<Comparison>,
+    /// What could not be compared with the reference, per session (empty
+    /// for the reference itself).
+    pub unverified: Vec<Vec<String>>,
+    pub verdicts: Vec<Verdicts>,
+    pub effects: Vec<Effect>,
+    pub levels: Vec<Level>,
+}
+
+impl Analysis {
+    /// Too few sessions for even a first idea of how often a result would
+    /// repeat (`SESSIONS_TO_GENERALISE`).
+    pub fn few(&self) -> bool {
+        self.sessions.len() < SESSIONS_TO_GENERALISE
+    }
+}
+
+/// Analyse `files` as sessions of one experiment. `Err` lists why they
+/// are not: fewer than two sessions, or what differs from the oldest
+/// session, session by session. Nothing is computed then.
+pub fn analyse(files: Vec<(String, ResultFile)>, opts: Options) -> Result<Analysis, Vec<String>> {
+    let sessions = group(files).map_err(|e| vec![e])?;
+    if sessions.len() < 2 {
+        return Err(vec![format!(
+            "{} matrix session given; comparing sessions takes at least two (`compare` reports a single one)",
+            sessions.len()
+        )]);
+    }
+    let checks: Vec<Check> = sessions.iter().map(|s| check(&sessions[0], s)).collect();
+    let differs: Vec<String> = sessions
+        .iter()
+        .zip(&checks)
+        .flat_map(|(s, c)| c.differs.iter().map(move |d| format!("{}: {d}", s.name())))
+        .collect();
+    if !differs.is_empty() {
+        let mut why = vec![format!(
+            "these sessions do not repeat one experiment; compared with the oldest, {}:",
+            sessions[0].name()
+        )];
+        why.extend(differs);
+        return Err(why);
+    }
+
+    let schedulers: Vec<String> = sessions[0].schedulers().to_vec();
+    let comparisons: Vec<Comparison> =
+        sessions.iter().map(|s| Comparison::build_with(s.files.clone(), 0, opts)).collect();
+
+    // Rows in the order they first appear, session by session.
+    let mut keys: Vec<(String, String)> = Vec::new();
+    for c in &comparisons {
+        for r in &c.rows {
+            let key = (r.workload.clone(), r.metric.clone());
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    let row = |c: &'_ Comparison, key: &(String, String)| -> Option<usize> {
+        c.rows.iter().position(|r| r.workload == key.0 && r.metric == key.1)
+    };
+
+    let mut effects = Vec::new();
+    let mut levels = Vec::new();
+    for key in &keys {
+        for scheduler in 0..schedulers.len() {
+            let first = comparisons.iter().find_map(|c| row(c, key).map(|i| &c.rows[i]));
+            let Some(first) = first else { continue };
+            levels.push(Level {
+                scheduler,
+                workload: key.0.clone(),
+                metric: key.1.clone(),
+                unit: first.unit.clone(),
+                sessions: comparisons
+                    .iter()
+                    .map(|c| {
+                        let cell = c.rows[row(c, key)?].cells.get(scheduler)?.as_ref()?;
+                        (!cell.values.is_empty()).then_some(cell.spread.median)
+                    })
+                    .collect(),
+            });
+            // Scored metrics only: an extreme or an informational metric
+            // has no outcome to agree on.
+            if scheduler == 0 || first.extreme || first.better == Better::Neither {
+                continue;
+            }
+            let outcomes: Vec<Option<Outcome>> = comparisons
+                .iter()
+                .map(|c| {
+                    let r = &c.rows[row(c, key)?];
+                    let delta = r.improvement(0, scheduler)?;
+                    Some(Outcome { delta, unclear: c.unclear_reason(r, scheduler, &delta) })
+                })
+                .collect();
+            if outcomes.iter().any(Option::is_some) {
+                effects.push(Effect { scheduler, workload: key.0.clone(), metric: key.1.clone(), sessions: outcomes });
+            }
+        }
+    }
+
+    let mut verdicts: Vec<Verdicts> = Vec::new();
+    for (si, c) in comparisons.iter().enumerate() {
+        for s in c.summary() {
+            let at = match verdicts.iter().position(|v| v.scheduler == s.series && v.workload == s.workload) {
+                Some(at) => at,
+                None => {
+                    verdicts.push(Verdicts {
+                        scheduler: s.series,
+                        workload: s.workload.clone(),
+                        sessions: vec![None; comparisons.len()],
+                    });
+                    verdicts.len() - 1
+                }
+            };
+            verdicts[at].sessions[si] = Some(s.verdict());
+        }
+    }
+    verdicts.sort_by_key(|v| v.scheduler);
+
+    let unverified = checks.into_iter().map(|c| c.unverified).collect();
+    Ok(Analysis { schedulers, sessions, comparisons, unverified, verdicts, effects, levels })
 }
 
 #[cfg(test)]
@@ -653,5 +935,219 @@ pub(crate) mod tests {
         assert_eq!(check(&s[0], &s[1]), Check::default());
         // But against a machine that does say: a difference.
         assert!(two(bare).differs.iter().any(|d| d.contains("power source: none here, mains in")));
+    }
+
+    /// Three sessions of default, scx_lavd and scx_cosmos on one workload.
+    /// lavd is 1.5× slower every time. cosmos is 20% slower than a
+    /// baseline of 100 µs; the baseline is 100, 100 and 150 µs, so in the
+    /// third session cosmos (120 µs) comes out ahead.
+    fn drifting_baseline() -> Vec<(String, ResultFile)> {
+        let mut files = Vec::new();
+        for (k, base) in [100.0, 100.0, 150.0].into_iter().enumerate() {
+            let value = move |spec: &str, round: u32| {
+                // Rounds drift together; the effect within a round does not.
+                let drift = 1.0 + 0.02 * f64::from(round);
+                drift
+                    * match spec {
+                        "default" => base,
+                        "scx_lavd" => base * 1.5,
+                        _ => 120.0,
+                    }
+            };
+            files.extend(session(&format!("s{k}"), 1000 * (k as u64 + 1), &SCHEDS, 4, value));
+        }
+        files
+    }
+
+    #[test]
+    fn sessions_are_analysed_on_their_own_and_laid_side_by_side() {
+        let a = analyse(drifting_baseline(), Options::default()).unwrap();
+        assert_eq!(a.schedulers, SCHEDS);
+        assert_eq!((a.sessions.len(), a.comparisons.len()), (3, 3));
+        assert!(a.few() && a.unverified.iter().all(Vec::is_empty));
+        let effect =
+            |sched: usize, metric: &str| a.effects.iter().find(|e| e.scheduler == sched && e.metric == metric).unwrap();
+
+        // lavd: scored as worse in every session, by the same factor.
+        let lavd = effect(1, "p99");
+        assert_eq!((lavd.measured(), lavd.agreement()), (3, Agreement::Every { better: false }));
+        let (lo, hi) = lavd.range().unwrap();
+        assert!((lo + 50.0).abs() < 1.0 && (hi + 50.0).abs() < 1.0, "{lo} {hi}");
+        // Each session's estimate is its own paired one.
+        assert!(lavd.sessions.iter().flatten().all(|o| o.delta.paired_rounds == Some(4) && o.unclear.is_none()));
+
+        // cosmos: worse twice, better once. Every session is sure of
+        // itself; together they contradict each other.
+        let cosmos = effect(2, "p99");
+        assert_eq!(cosmos.agreement(), Agreement::Opposite { better: 1, worse: 2 });
+        let (lo, hi) = cosmos.range().unwrap();
+        assert!((lo + 20.0).abs() < 1.0 && (hi - 20.0).abs() < 1.0, "{lo} {hi}");
+        assert_eq!(
+            cosmos.sessions.iter().flatten().map(|o| o.clear()).collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(true)]
+        );
+        // The rate moves with the latency: the same picture.
+        assert_eq!(effect(2, "ops").agreement(), Agreement::Opposite { better: 1, worse: 2 });
+
+        // The verdicts, session by session.
+        let verdict = |sched: usize| a.verdicts.iter().find(|v| v.scheduler == sched).unwrap();
+        assert_eq!(verdict(1).sessions, [Some(Verdict::Worse); 3]);
+        assert!(verdict(1).same());
+        assert_eq!(verdict(2).sessions, [Some(Verdict::Worse), Some(Verdict::Worse), Some(Verdict::Better)]);
+        assert!(!verdict(2).same());
+
+        assert_eq!(verdict(1).consensus(), Consensus::Same(Verdict::Worse));
+        assert_eq!(verdict(2).consensus(), Consensus::Differs);
+
+        // The levels show where the contradiction comes from: cosmos
+        // measured the same every time, the baseline did not.
+        let level = |sched: usize| a.levels.iter().find(|l| l.scheduler == sched && l.metric == "p99").unwrap();
+        assert!((level(2).factor().unwrap() - 1.0).abs() < 0.01, "{:?}", level(2));
+        assert!((level(0).factor().unwrap() - 1.5).abs() < 0.01, "{:?}", level(0));
+        assert_eq!(level(0).unit, "us");
+        assert_eq!(a.levels.len(), 6, "every scheduler, both metrics");
+        assert_eq!(a.effects.len(), 4, "the two candidates, both metrics");
+    }
+
+    /// A session without a verdict is not a session that agrees: "better,
+    /// better, nothing measured" is not "better in every session".
+    #[test]
+    fn a_missing_verdict_is_not_agreement() {
+        let verdicts = |sessions: Vec<Option<Verdict>>| Verdicts { scheduler: 1, workload: "w".into(), sessions };
+        let (b, w) = (Some(Verdict::Better), Some(Verdict::Worse));
+        let v = verdicts(vec![b, b, None]);
+        assert!(!v.same());
+        assert_eq!(v.consensus(), Consensus::Incomplete { agreed: Some(Verdict::Better), measured: 2 });
+        assert_eq!(verdicts(vec![b, None, w]).consensus(), Consensus::Incomplete { agreed: None, measured: 2 });
+        assert_eq!(verdicts(vec![None, None]).consensus(), Consensus::Incomplete { agreed: None, measured: 0 });
+        assert!(verdicts(vec![b, b, b]).same());
+        assert!(!verdicts(vec![b, w, b]).same());
+
+        // Through the analysis: in the third session every run of lavd is
+        // invalid, so that session has nothing to say about it.
+        let mut files = Vec::new();
+        for k in 0..3u64 {
+            let mut s =
+                session(
+                    &format!("s{k}"),
+                    1000 * (k + 1),
+                    &SCHEDS,
+                    4,
+                    |spec, _| {
+                        if spec == "scx_lavd" { 50.0 } else { 100.0 }
+                    },
+                );
+            if k == 2 {
+                s[1].1.workloads[0].runs.iter_mut().for_each(|r| r.valid = false);
+            }
+            files.extend(s);
+        }
+        let a = analyse(files, Options::default()).unwrap();
+        let lavd = a.verdicts.iter().find(|v| v.scheduler == 1).unwrap();
+        assert_eq!(lavd.sessions, [Some(Verdict::Better), Some(Verdict::Better), None]);
+        assert_eq!(lavd.consensus(), Consensus::Incomplete { agreed: Some(Verdict::Better), measured: 2 });
+        // Its effects were measured in two sessions of three.
+        let e = a.effects.iter().find(|e| e.scheduler == 1 && e.metric == "p99").unwrap();
+        assert_eq!((e.measured(), e.agreement()), (2, Agreement::Every { better: true }));
+        // The scheduler that was measured throughout is unaffected.
+        let cosmos = a.verdicts.iter().find(|v| v.scheduler == 2).unwrap();
+        assert_eq!(cosmos.consensus(), Consensus::Same(Verdict::NoClearDifference));
+    }
+
+    #[test]
+    fn agreement_counts_sessions() {
+        let outcome = |change: f64, unclear: Option<UnclearReason>| {
+            Some(Outcome {
+                delta: Delta {
+                    median: change,
+                    ci: Some((change - 1.0, change + 1.0)),
+                    ratio: 1.0 + change / 100.0,
+                    paired_rounds: Some(5),
+                    unmatched_rounds: false,
+                    paired_spread: None,
+                    undefined_rounds: 0,
+                    better: Better::Higher,
+                },
+                unclear,
+            })
+        };
+        let of = |sessions: Vec<Option<Outcome>>| {
+            let e = Effect { scheduler: 1, workload: "w".into(), metric: "m".into(), sessions };
+            (e.measured(), e.agreement())
+        };
+        let (better, worse) = (outcome(20.0, None), outcome(-20.0, None));
+        let noise = outcome(1.0, Some(UnclearReason::BelowThreshold));
+        // A change that is not scored has a sign too, and does not count.
+        let hint = outcome(-30.0, Some(UnclearReason::IntervalIncludesNoChange));
+        assert_eq!(of(vec![better, better, better]), (3, Agreement::Every { better: true }));
+        assert_eq!(of(vec![worse, worse]), (2, Agreement::Every { better: false }));
+        assert_eq!(of(vec![worse, noise, worse]), (3, Agreement::Some { better: false, clear: 2 }));
+        assert_eq!(of(vec![better, hint, hint]), (3, Agreement::Some { better: true, clear: 1 }));
+        assert_eq!(of(vec![better, worse, noise]), (3, Agreement::Opposite { better: 1, worse: 1 }));
+        assert_eq!(of(vec![noise, hint]), (2, Agreement::Never));
+        // A session without the metric is not a session that disagrees.
+        assert_eq!(of(vec![worse, None, worse]), (2, Agreement::Every { better: false }));
+        assert_eq!(of(vec![None, None]), (0, Agreement::Never));
+
+        let e = Effect { scheduler: 1, workload: "w".into(), metric: "m".into(), sessions: vec![better, None, worse] };
+        assert_eq!(e.range(), Some((-20.0, 20.0)));
+        let e = Effect { sessions: vec![better, None], ..e };
+        assert_eq!(e.range(), None, "one estimate has no range");
+
+        let level = |sessions: Vec<Option<f64>>| {
+            Level { scheduler: 0, workload: "w".into(), metric: "m".into(), unit: "us".into(), sessions }.factor()
+        };
+        assert_eq!(level(vec![Some(33.5), Some(124.0), Some(553.0)]).map(|f| (f * 10.0).round()), Some(165.0));
+        assert_eq!(level(vec![Some(5.0), None, Some(5.0)]), Some(1.0));
+        assert_eq!(level(vec![Some(5.0), None]), None);
+        assert_eq!(level(vec![Some(0.0), Some(5.0)]), None, "no factor from zero");
+    }
+
+    #[test]
+    fn nothing_is_computed_for_sessions_that_do_not_match() {
+        // One session is not a comparison of sessions.
+        let e = analyse(session("mon", 1000, &SCHEDS, 3, flat), Options::default()).unwrap_err();
+        assert!(e[0].starts_with("1 matrix session given"), "{e:?}");
+
+        // A third session on another kernel, with one scheduler updated:
+        // every difference is listed, under the session it belongs to.
+        let mut files = session("mon", 1000, &SCHEDS, 3, flat);
+        files.extend(session("tue", 2000, &SCHEDS, 3, flat));
+        let mut wed = session("wed", 3000, &SCHEDS, 3, flat);
+        for (_, f) in wed.iter_mut() {
+            f.system.kernel = "7.3.5-1".into();
+        }
+        if let Scheduler::Ext { ops, .. } = &mut wed[1].1.scheduler {
+            *ops = "lavd_1.1.5_x86_64".into();
+        }
+        files.extend(wed);
+        let e = analyse(files, Options::default()).unwrap_err();
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(e[0].starts_with(
+            "these sessions do not repeat one experiment; compared with the oldest, 1970-01-01 00:16 UTC"
+        ));
+        assert!(
+            e[1].starts_with("1970-01-01 00:50 UTC (wed/00-default.json): kernel: 7.3.5-1 here, 7.3.4-1 in"),
+            "{e:?}"
+        );
+        assert!(e[2].contains("scx_lavd: scheduler: lavd_1.1.5_x86_64 here"), "{e:?}");
+
+        // An incomplete session, even when every session lacks the same
+        // file: nothing is computed, rather than a scheduler renamed.
+        let mut files = session("mon", 1000, &SCHEDS, 3, flat);
+        files.remove(0);
+        let mut tue = session("tue", 2000, &SCHEDS, 3, flat);
+        tue.remove(0);
+        files.extend(tue);
+        let e = analyse(files, Options::default()).unwrap_err();
+        assert!(e.len() == 1 && e[0].contains("incomplete, without results for default"), "{e:?}");
+
+        // What is unverified does not stop the analysis, and is kept.
+        let mut files = session("mon", 1000, &SCHEDS, 3, flat);
+        let mut tue = session("tue", 2000, &SCHEDS, 3, flat);
+        tue[1].1.design.as_mut().unwrap().options = None;
+        files.extend(tue);
+        let a = analyse(files, Options::default()).unwrap();
+        assert_eq!(a.unverified, [vec![], vec!["scx_lavd: scheduler options".to_string()]]);
     }
 }
