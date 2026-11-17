@@ -83,8 +83,11 @@ the output directory still has all the data and charts.
 
 `--suite` picks the workloads: `quick` (the default) hands a token between
 pairs of threads as fast as it goes, `periodic` wakes a few threads on a
-timer for a short piece of work, as a frame or an audio buffer would, and
-`all` runs both. Each comes idle and with every CPU kept busy.
+timer for a short piece of work, as a frame or an audio buffer would,
+`bursts` wakes a whole group of threads at once, as a thread pool given a
+batch would, and `all` runs all three. The first two come idle and with
+every CPU kept busy, the bursts with half as many threads as CPUs, as many
+and twice as many.
 
 ### Compare existing result files
 

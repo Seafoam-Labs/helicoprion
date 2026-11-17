@@ -1,6 +1,7 @@
 //! Workloads are written in-tree: no external benchmark programs, no
 //! downloaded assets. Each one stresses a specific scheduler behaviour.
 
+pub mod burst;
 mod clock;
 mod futex;
 pub mod hog;
@@ -61,18 +62,36 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
             hogs,
         })
     };
+    // A group woken at once, in three sizes relative to the machine: it
+    // fits with room to spare, it fits exactly, it does not fit. 2 ms and
+    // 200 µs: a tenth of a CPU per task, and 2500 bursts in a five-second
+    // run, enough for a p99 of the per-burst times.
+    let burst = |size: &'static str, tasks: usize| -> Box<dyn Workload> {
+        Box::new(burst::WakeBurst {
+            size,
+            tasks: tasks.max(1),
+            period: std::time::Duration::from_millis(2),
+            work: std::time::Duration::from_micros(200),
+        })
+    };
+    let bursts = || vec![burst("half", cpus / 2), burst("full", cpus), burst("double", cpus * 2)];
     match name {
         "quick" => Some(vec![pingpong(0), pingpong(cpus)]),
         "periodic" => Some(vec![periodic(0), periodic(cpus)]),
-        "all" => Some(vec![pingpong(0), pingpong(cpus), periodic(0), periodic(cpus)]),
+        "bursts" => Some(bursts()),
+        "all" => {
+            let mut all = vec![pingpong(0), pingpong(cpus), periodic(0), periodic(cpus)];
+            all.extend(bursts());
+            Some(all)
+        }
         _ => None,
     }
 }
 
 /// `quick` is what it has always been, so that results stay comparable
-/// with earlier ones; `periodic` is the timer-driven workload alone, and
-/// `all` runs both.
-pub const SUITES: &[&str] = &["quick", "periodic", "all"];
+/// with earlier ones; `periodic` is the timer-driven workload alone,
+/// `bursts` the group wake-ups alone, and `all` runs everything.
+pub const SUITES: &[&str] = &["quick", "periodic", "bursts", "all"];
 
 #[cfg(test)]
 mod tests {
@@ -86,7 +105,16 @@ mod tests {
         // `quick` must not change: results are compared with older ones.
         assert_eq!(names("quick", 16), ["wake-pingpong", "wake-pingpong/loaded"]);
         assert_eq!(names("periodic", 16), ["periodic-wake", "periodic-wake/loaded"]);
-        assert_eq!(names("all", 16).len(), 4);
+        assert_eq!(names("bursts", 16), ["wake-burst/half", "wake-burst/full", "wake-burst/double"]);
+        assert_eq!(names("all", 16).len(), 7);
+        assert_eq!(names("all", 16)[..4], [names("quick", 16), names("periodic", 16)].concat());
+        // Sizes follow the machine, and a single CPU still has a task.
+        let tasks = |cpus: usize| -> Vec<u64> {
+            let suite = super::suite("bursts", cpus, SuiteOpts::default()).unwrap();
+            suite.iter().map(|w| w.params()["tasks"].as_u64().unwrap()).collect()
+        };
+        assert_eq!(tasks(16), [8, 16, 32]);
+        assert_eq!(tasks(1), [1, 1, 2]);
         for name in SUITES {
             assert!(super::suite(name, 2, SuiteOpts::default()).is_some(), "{name}");
         }

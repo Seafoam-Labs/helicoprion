@@ -100,6 +100,31 @@ pub(crate) fn set_timer_slack() -> Result<(), String> {
     Ok(())
 }
 
+/// `set_timer_slack` for a thread that goes on to do other things: the
+/// slack it had comes back when this is dropped.
+pub(crate) struct PreciseTimers {
+    before: libc::c_int,
+}
+
+impl PreciseTimers {
+    pub(crate) fn new() -> Result<Self, String> {
+        let before = timer_slack();
+        set_timer_slack()?;
+        Ok(PreciseTimers { before })
+    }
+}
+
+impl Drop for PreciseTimers {
+    fn drop(&mut self) {
+        if self.before > 0 {
+            // SAFETY: as in `set_timer_slack`.
+            unsafe {
+                libc::prctl(libc::PR_SET_TIMERSLACK, self.before as libc::c_ulong);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +134,21 @@ mod tests {
         std::thread::spawn(|| {
             assert_eq!(set_timer_slack(), Ok(()));
             assert_eq!(timer_slack(), 1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_thread_gets_its_timer_slack_back() {
+        std::thread::spawn(|| {
+            let before = timer_slack();
+            assert!(before > 1, "the default is 50 µs: {before}");
+            {
+                let _precise = PreciseTimers::new().unwrap();
+                assert_eq!(timer_slack(), 1);
+            }
+            assert_eq!(timer_slack(), before);
         })
         .join()
         .unwrap();

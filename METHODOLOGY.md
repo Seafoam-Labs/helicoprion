@@ -123,9 +123,10 @@ about it.
 ## What is measured
 
 The `quick` suite has two workloads, both with one thread pair for every two
-CPUs. The `periodic` suite has the two timer-driven ones, and `all` runs all
-four. `quick` is the default and stays as it is, so that its results remain
-comparable with earlier ones.
+CPUs. The `periodic` suite has the two timer-driven ones, `bursts` the three
+sizes of a group woken at once, and `all` runs all seven. `quick` is the
+default and stays as it is, so that its results remain comparable with
+earlier ones.
 
 | Name | What it does | Metrics |
 |---|---|---|
@@ -133,6 +134,9 @@ comparable with earlier ones.
 | `wake-pingpong/loaded` | The same, while one CPU hog thread per CPU keeps every CPU busy | The same, plus hog work per second |
 | `periodic-wake` | A few threads wake on a timer every millisecond, work for 100 µs of CPU time and sleep again | p50, p99, p99.9 and max in µs of the wake-up latency and of the response time, and the share of periods that missed their deadline |
 | `periodic-wake/loaded` | The same, while one CPU hog thread per CPU keeps every CPU busy | The same, plus hog work per second |
+| `wake-burst/half` | One thread wakes a group of sleeping threads with one call every 2 ms, half as many as there are CPUs; each works for 200 µs of CPU time and sleeps again | p50, p99, p99.9 and max in µs of the time until a task runs, until the whole group runs and until the whole group is done, and the share of wake-ups that found the task still at work |
+| `wake-burst/full` | The same with as many tasks as CPUs | The same |
+| `wake-burst/double` | The same with twice as many tasks as CPUs | The same |
 
 ### Blocked and fast round trips
 
@@ -212,6 +216,79 @@ invalid. The tasks report ready before one start is fixed for all; a run
 whose tasks are not ready within 30 s, or in which a thread cannot be
 created or fails, ends as invalid after every thread that was started has
 been joined.
+
+### Wake-up bursts
+
+The two workloads above wake one task at a time. `wake-burst` hands the
+scheduler a whole group in the same instant, as a thread pool given a batch
+or a build step fanned out to workers does: one thread calls `FUTEX_WAKE`
+for every waiter of one futex, each woken task works for a fixed amount of
+its own CPU time and sleeps on the futex again. Bursts are released by the
+clock, 2 ms apart, so every scheduler is asked for the same work at the same
+moments. The three sizes follow the machine: half as many tasks as CPUs,
+where the group fits with room to spare, as many, where it fits only if the
+scheduler uses every CPU, and twice as many, where half of the group has to
+wait.
+
+The waker notes the time right before its call. From that instant, `start`
+is the time to a woken task running, with one sample per task and burst,
+`all_running` the time to the last task of the group running and `all_done`
+the time to the last one having done its work, both with one sample per
+burst. The kernel wakes the group one task after another inside the waker's
+call, so `start` includes the time the waker needs to get to a task. With
+twice as many tasks as CPUs, how long the second half waits is the
+scheduler's choice between letting the first ones finish and slicing, and
+`all_running` and `all_done` show the two sides of it.
+
+A wake-up is only measured for a task that slept in `FUTEX_WAIT` when its
+burst was released, and every such wake-up is measured. A task woken by the
+last burst that gets a CPU only after the run is over still takes its time
+and does its work, because leaving it out would drop exactly the slowest
+wake-ups. For every burst released, each task counts which of three things
+happened:
+
+| Counter | What happened |
+|---|---|
+| `wakeups_ran` | The task was asleep and the burst woke it: one sample |
+| `wakeups_overrun` | The task was still busy with an earlier burst, woken by it and waiting for a CPU or at its work. It is not woken again, finds the burst gone when it is done and waits for the next |
+| `wakeups_not_asleep` | The task was done with its work but not asleep yet: the few instructions between the two, or the first burst coming before the task got to sleep |
+
+What tells the second kind from the third is the time. A burst released
+before the task finished its work found it busy, and one released after
+found it done, whenever the task gets to look. A task that loses its CPU
+right after its work is therefore not taken for one that was still working.
+
+The three add up to `wakeups_due`, bursts times tasks, for every task, and a
+run in which they do not is invalid. `overrun_pct` is the share of the
+second kind. It is scored like `deadline_miss_pct`, with the same handling
+of zero, so that a scheduler which lets tasks overrun is not judged only on
+the bursts that went well. The third kind is counted and shown but not
+scored, since it is not a way of being late. `all_running` and `all_done`
+exist only for bursts in which every task took part (`bursts_complete`).
+`tasks_found_asleep` is what the wake calls returned, and equals
+`wakeups_ran`.
+
+The waker runs with a timer slack of 1 ns, set and read back as in
+`periodic-wake`, and gets the slack it had back afterwards. One reading of
+the clock decides whether a release is still due, is the time the tasks
+measure from, and gives how late the release was, recorded as
+`release_late_p50`, `release_late_p99` and `release_late_max`. From that
+reading to the return of the wake call is `wake_call_p50`, `wake_call_p99`
+and `wake_call_max`. The waker can lose its CPU in between, and that time is
+in every `start` of the burst without being the tasks' wake-up, so a
+`wake_call_max` far above its median says that some of the slowest starts
+are the waker's. Both describe the load and are informational. A release
+that is already a whole period past when the waker gets to it is left out
+instead of following the next one at once, and counted in `bursts_skipped`
+out of `bursts_planned`. A release that comes late is closer to the next
+one, so a late waker can make tasks overrun by itself, and `release_late` is
+where to look when `overrun_pct` is not zero. Every scheduler is meant to
+get the same bursts, so a run in which more than 1% of them were left out is
+invalid: a scheduler must not look better for having been handed less work.
+
+The start and the handling of failures are those of `periodic-wake`: all
+tasks report ready before the first burst, and a run that cannot start or
+in which a thread fails ends as invalid after every thread has been joined.
 
 ## Reading the results
 
