@@ -253,7 +253,19 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 "Of {} measurements, {} clearly better and {} clearly worse",
                 s.compared, s.better, s.worse
             ));
-            let note = mix_note(c, w, i);
+            // A repeated arm of the baseline: whatever the verdict says,
+            // it is not about the scheduler.
+            let again = crate::calibration::pairs(c).iter().any(|p| p.first == c.baseline && p.twin == i).then(|| {
+                format!(
+                    "This is {} again, measured as a separate arm: a difference here is not the scheduler, it is \
+                         what the measurement finds between two runs of the same thing.",
+                    c.series[c.baseline].label
+                )
+            });
+            let note = match (again, mix_note(c, w, i)) {
+                (Some(a), Some(m)) => Some(format!("{a} {m}")),
+                (a, m) => a.or(m),
+            };
             Brief { series: i, workload: s.workload.clone(), title: title(w), verdict: s.verdict(), points, note }
         })
         .collect()

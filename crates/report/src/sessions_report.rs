@@ -117,7 +117,7 @@ fn agreement_words(e: &Effect, total: usize) -> String {
 }
 
 /// A few words for why a session does not score a change.
-fn unclear_words(reason: UnclearReason) -> &'static str {
+pub(crate) fn unclear_words(reason: UnclearReason) -> &'static str {
     match reason {
         UnclearReason::SingleSample => "single sample",
         UnclearReason::MinorPopulation => "minor",

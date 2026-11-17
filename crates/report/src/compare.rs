@@ -693,7 +693,21 @@ impl Comparison {
         Self::build_with(files, baseline, Options::default())
     }
 
-    pub fn build_with(mut files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
+    pub fn build_with(files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
+        let mut c = Self::build_core(files, baseline, opts);
+        // Two arms of one scheduler that differ clearly: said with the
+        // other warnings, so that every output carries it.
+        let alarms: Vec<String> = crate::calibration::calibrate(&c)
+            .iter()
+            .flat_map(|cal| cal.balance_warning().into_iter().chain(cal.warning()))
+            .collect();
+        c.warnings.extend(alarms);
+        c
+    }
+
+    /// The comparison without the A/A check, which itself compares pairs
+    /// of files with this.
+    pub(crate) fn build_core(mut files: Vec<ResultFile>, baseline: usize, opts: Options) -> Self {
         for f in &mut files {
             informational_in_older_files(f);
         }

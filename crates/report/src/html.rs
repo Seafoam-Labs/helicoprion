@@ -408,6 +408,88 @@ fn conditions_section(h: &mut String, c: &Comparison) {
     }
 }
 
+/// What the A/A pairs of the session show: two arms of one scheduler,
+/// where every clear change is a false alarm.
+fn aa_section(h: &mut String, c: &Comparison) {
+    let calibrations = crate::calibration::calibrate(c);
+    if calibrations.is_empty() {
+        return;
+    }
+    let _ = write!(
+        h,
+        "<h2>A/A check</h2><p class=cap>The same scheduler measured as two arms: what the method finds where there is nothing to find.</p><details class=help><summary>How to read this</summary><p>An arm that repeats another is the same scheduler with the same options, visited separately in every round. Nothing differs between the two but when each ran, so their difference is the noise of the measurement on this machine, metric by metric. <em>Change</em> is the repeated arm against the first, estimated and scored like any candidate against a baseline, with the thresholds of this report (±{me}% and the others). A change scored as clear is a false alarm: the method can produce a change of that size without any difference between schedulers, so read such changes between other schedulers of this session with caution and repeat them in another session. <em>Later against earlier</em> is the effect of position: within each round, the arm visited second against the arm visited first, median over the rounds. The arms swap places every round, so over an even number of rounds an effect of position cancels in <em>Change</em> and shows here, for example a machine that is warmer for whichever arm comes second. One session is one observation: several A/A sessions, laid side by side with <code>sessions</code>, show how large these numbers get.</p></details>",
+        me = c.opts.min_effect_pct
+    );
+    for cal in &calibrations {
+        let alarms = cal.false_alarms().count();
+        let mut line = format!(
+            "<strong>{} is {} again</strong>: {} of {} scored metrics differ clearly between the two",
+            esc(&cal.twin),
+            esc(&cal.first),
+            alarms,
+            cal.metrics.len()
+        );
+        if let Some(silencing) = cal.silencing_min_effect() {
+            let _ = write!(
+                line,
+                ", which is not the scheduler; a --min-effect above {}% would have scored none",
+                crate::calibration::above(silencing)
+            );
+        }
+        if let Some(largest) = cal.largest() {
+            let _ = write!(
+                line,
+                ". Largest change: {} · {} {}",
+                esc(&largest.workload),
+                esc(&largest.metric),
+                fmt_delta(&largest.delta)
+            );
+        }
+        if let Some((before, after)) = cal.unbalanced() {
+            let _ = write!(
+                line,
+                ". <strong>Not balanced</strong>: {} was visited before {} in {before} rounds and after it in {after}, so an effect of position is part of the change",
+                esc(&cal.first),
+                esc(&cal.twin)
+            );
+        }
+        let _ = write!(
+            h,
+            "<p class=cap>{line}.</p><div class=wide><table><tr><th class=l>Workload · metric</th><th>Change</th><th class=l>Scored</th><th>Later against earlier</th></tr>"
+        );
+        for m in &cal.metrics {
+            let interval = m
+                .delta
+                .ci
+                .map(|(lo, hi)| format!(" <span class=m>[{}]</span>", fmt_interval(&m.delta, lo, hi)))
+                .unwrap_or_default();
+            let scored = match m.unclear {
+                None => "<span class=bad>clear: a false alarm</span>".to_string(),
+                Some(reason) => format!("<span class=m>{}</span>", crate::sessions_report::unclear_words(reason)),
+            };
+            let order = m.order.map_or_else(
+                || "<span class=m>—</span>".to_string(),
+                |o| {
+                    format!(
+                        "{} <span class=m>(better in {} of {} rounds)</span>",
+                        crate::svg::pct(o.median),
+                        o.later_better,
+                        o.rounds
+                    )
+                },
+            );
+            let _ = write!(
+                h,
+                "<tr><td>{} · <code>{}</code></td><td>{}{interval}</td><td class=l>{scored}</td><td>{order}</td></tr>",
+                esc(&m.workload),
+                esc(&m.metric),
+                fmt_delta(&m.delta)
+            );
+        }
+        h.push_str("</table></div>");
+    }
+}
+
 pub fn report_with(c: &Comparison, simple: bool) -> String {
     let mut h = String::new();
     let base = &c.series[c.baseline];
@@ -461,6 +543,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
     h.push_str("</table>");
     system_details(&mut h, c);
     conditions_section(&mut h, c);
+    aa_section(&mut h, c);
 
     if let Some(svg) = delta_chart(c) {
         let paired_note = if c.any_paired() {

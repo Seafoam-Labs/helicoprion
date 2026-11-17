@@ -1,6 +1,7 @@
 //! Compare result files: per-metric medians and spread, change relative to a
 //! baseline, and self-contained SVG/HTML output (no JS, no external assets).
 
+pub mod calibration;
 pub mod compare;
 pub mod conditions;
 pub mod html;

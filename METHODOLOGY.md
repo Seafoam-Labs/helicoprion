@@ -281,6 +281,38 @@ more between the two sides, for example 99.9% blocked round trips against
 describe different parts of the two runs, so read them together with
 `roundtrips_per_s`, which covers all round trips.
 
+## A/A: comparing a scheduler with itself
+
+```sh
+sudo helicoprion matrix --sched default --sched default -o aa/
+```
+
+Between two arms of the same scheduler nothing differs but when each ran.
+What the report finds there is the noise of the method on this machine,
+which is what `--min-effect` and the other thresholds have to be judged
+against. An A/A pair can also stand next to other schedulers in one
+session.
+
+The report's A/A check lists every scored metric of the pair:
+
+- **Change**: the repeated arm against the first, estimated and scored like
+  any candidate against a baseline. A change scored as clear is a false
+  alarm, and it is also raised as a warning: the method can produce a change
+  of that size without any difference between schedulers, so changes of
+  that size between other schedulers of the session should be read with
+  caution and repeated in another session. The report names the
+  `--min-effect` above which none of them would have been scored.
+- **Later against earlier**: within each round, the arm visited second
+  against the arm visited first, as the median over the rounds. The arms
+  swap places every round, so over an even number of rounds an effect of
+  position, such as a machine that
+  is warmer for whichever arm comes second, cancels in the change and shows
+  here.
+
+One A/A session is one observation of the noise. Lay several side by side
+with `sessions` before settling on a threshold. Nothing here changes a
+threshold by itself.
+
 ## Comparing sessions
 
 ```sh
