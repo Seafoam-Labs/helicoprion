@@ -2424,6 +2424,92 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(crate::simple::what(&c).starts_with("The test wakes a whole group"));
     }
 
+    /// cgroup-fair in the plain view: the split, what the weights ask
+    /// for, and whether the split is the one a scheduler without groups
+    /// or without weights gives.
+    #[test]
+    fn cgroup_fair_is_described_in_plain_words() {
+        // Shares of the first group: (baseline, candidate).
+        let session = |workload: &str, share: (f64, f64), expected: f64, flat: f64| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = workload.into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    r.metrics.clear();
+                    let a = if is_cand { share.1 } else { share.0 };
+                    let off = (a / (100.0 - a)) / (expected / (100.0 - expected));
+                    r.metrics.insert("weight_accuracy_pct".into(), Metric::higher(off.min(1.0 / off) * 100.0, "%"));
+                    r.metrics.insert("cpu_used_pct".into(), Metric::higher(99.0, "%"));
+                    r.metrics.insert("share_a_pct".into(), Metric::info(a, "%"));
+                    r.metrics.insert("expected_share_a_pct".into(), Metric::info(expected, "%"));
+                    r.metrics.insert("flat_share_a_pct".into(), Metric::info(flat, "%"));
+                    r.counters.insert("cpu_ms_a".into(), (a * 100.0) as u64);
+                    r.counters.insert("cpu_ms_b".into(), ((100.0 - a) * 100.0) as u64);
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        // The baseline follows the weights; the candidate ignores them.
+        let c = session("cgroup-fair/weighted", (25.5, 49.5), 25.0, 50.0);
+        let text = crate::simple::text(&c);
+        assert!(text.contains("  Two control groups, same tasks, one with three times the weight: WORSE\n"), "{text}");
+        assert!(
+            text.contains(
+                "• CPU time of the two groups: 49.5% : 50.5% (the weights ask for 25.0% : 75.0%), which is the split \
+                 by number of tasks, as if the weights were not there; under base: 25.5% : 74.5%"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "• How closely the split follows the weights: 2.9× further (97.4% → 34.0% of the intended ratio)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("• CPU time used: no reliable difference; the interval includes no change (99.0% → 99.0% of the machine's CPU time)"),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_CGROUP)), "{text}");
+
+        // No group scheduling at all: the case with unequal thread counts.
+        let text = crate::simple::text(&session("cgroup-fair/equal", (50.0, 25.5), 50.0, 25.0));
+        assert!(text.contains("  Two control groups, same weight, one with three times the tasks: WORSE\n"), "{text}");
+        assert!(
+            text.contains("which is the split by number of tasks, as if the groups were not there; under base"),
+            "{text}"
+        );
+
+        // Off, but not by the rule of threads: no such remark. The
+        // scheduler knows the weights and misses them.
+        let text = crate::simple::text(&session("cgroup-fair/weighted", (25.0, 35.0), 25.0, 50.0));
+        assert!(
+            text.contains(
+                "• CPU time of the two groups: 35.0% : 65.0% (the weights ask for 25.0% : 75.0%); under base"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("as if"), "{text}");
+        // And one that follows them gets none either.
+        let text = crate::simple::text(&session("cgroup-fair/weighted", (49.5, 25.2), 25.0, 50.0));
+        assert!(text.contains("BETTER") && !text.contains("as if"), "{text}");
+        assert!(text.contains("• How closely the split follows the weights: 2.9× closer ("), "{text}");
+
+        let html = crate::html::report(&c);
+        assert!(html.contains(&crate::esc(crate::simple::WHAT_CGROUP)), "{html}");
+        assert!(html.contains("<code>cpu_ms_a</code>"));
+        // With another workload it is one more part of the test.
+        let mut files = drifting_session();
+        for f in &mut files {
+            let mut second = f.workloads[0].clone();
+            f.workloads[0].name = "wake-pingpong".into();
+            second.name = "cgroup-fair/equal".into();
+            f.workloads.push(second);
+        }
+        let what = crate::simple::what(&Comparison::build(files, 0));
+        assert!(what.contains(" It also runs two control groups of busy tasks"), "{what}");
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]

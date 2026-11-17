@@ -36,6 +36,8 @@ fn title(workload: &str) -> String {
         "wake-burst/half" => "A group of tasks woken at once, half as many as CPUs".into(),
         "wake-burst/full" => "A group of tasks woken at once, as many as CPUs".into(),
         "wake-burst/double" => "A group of tasks woken at once, twice as many as CPUs".into(),
+        "cgroup-fair/equal" => "Two control groups, same weight, one with three times the tasks".into(),
+        "cgroup-fair/weighted" => "Two control groups, same tasks, one with three times the weight".into(),
         other => other.to_string(),
     }
 }
@@ -209,6 +211,8 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
 fn share_of(metric: &str) -> &'static str {
     match metric {
         "overrun_pct" => "of wake-ups",
+        "weight_accuracy_pct" => "of the intended ratio",
+        "cpu_used_pct" => "of the machine's CPU time",
         _ => "of periods",
     }
 }
@@ -266,6 +270,38 @@ fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<St
         )),
         _ => point(c, workload, i, f.metric, label, ("fewer", "more")),
     }
+}
+
+/// How cgroup-fair's two groups shared the CPU time, next to what their
+/// weights ask for, and under the baseline. Observed, not scored: the
+/// score is in how closely the split follows the weights. Where the
+/// split is the one the number of threads gives, the line says so: that
+/// is a scheduler that does not know the groups, or their weights, and
+/// not one that knows them badly.
+fn split(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let median = |metric: &str, k: usize| {
+        let row = c.rows.iter().find(|r| r.workload == workload && r.metric == metric)?;
+        row.cells.get(k).and_then(Option::as_ref).map(|c| c.spread.median)
+    };
+    let pair = |a: f64| format!("{a:.1}% : {:.1}%", 100.0 - a);
+    let share = median("share_a_pct", i)?;
+    let mut line = format!("CPU time of the two groups: {}", pair(share));
+    if let Some(expected) = median("expected_share_a_pct", i) {
+        let _ = write!(line, " (the weights ask for {})", pair(expected));
+        // Nearer to the split by threads than to the one by weights, and
+        // within five points of it.
+        if let Some(flat) = median("flat_share_a_pct", i)
+            && (share - flat).abs() < (share - expected).abs()
+            && (share - flat).abs() <= 5.0
+        {
+            let ignored = if workload.ends_with("/equal") { "the groups were" } else { "the weights were" };
+            let _ = write!(line, ", which is the split by number of tasks, as if {ignored} not there");
+        }
+    }
+    if let Some(base) = median("share_a_pct", c.baseline) {
+        let _ = write!(line, "; under {}: {}", c.series[c.baseline].label, pair(base));
+    }
+    Some(line)
 }
 
 /// Why a change is not scored, for a reader who sees "1434 → 42.2 µs" next
@@ -349,6 +385,18 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 point(c, w, i, "all_done_p50", "Until the whole group is done, typically", delays),
                 slowest("all_done", "bursts", ", until the whole group is done"),
                 failures(c, w, i, &OVERRUNS),
+                // cgroup-fair: who got the CPUs, whether that is what
+                // the weights ask for, and whether any were left idle.
+                split(c, w, i),
+                point(
+                    c,
+                    w,
+                    i,
+                    "weight_accuracy_pct",
+                    "How closely the split follows the weights",
+                    ("closer", "further"),
+                ),
+                point(c, w, i, "cpu_used_pct", "CPU time used", ("more", "less")),
                 background(c, w, i),
             ]
             .into_iter()
@@ -504,17 +552,26 @@ or an audio buffer would, and measures how late they run.";
 pub const WHAT_BURST: &str = "The test wakes a whole group of tasks at once for a short piece of work, as a \
 thread pool given a batch would, and measures how soon they run and how soon all of them are done.";
 
+/// The same for cgroup-fair.
+pub const WHAT_CGROUP: &str = "The test runs two control groups of busy tasks that compete for every CPU, and \
+measures whether the CPU time is split between them the way their weights say.";
+
 /// What the workloads of this comparison do, in a sentence each.
 pub fn what(c: &Comparison) -> String {
     let has = |prefix: &str| c.rows.iter().any(|r| r.workload.starts_with(prefix));
-    let parts: Vec<String> = [("wake-pingpong", WHAT), ("periodic-wake", WHAT_PERIODIC), ("wake-burst", WHAT_BURST)]
-        .into_iter()
-        .filter(|(prefix, _)| has(prefix))
-        .enumerate()
-        // One test with several parts: the first sentence introduces
-        // it, the others add to it.
-        .map(|(k, (_, words))| if k == 0 { words.to_string() } else { words.replacen("The test ", "It also ", 1) })
-        .collect();
+    let parts: Vec<String> = [
+        ("wake-pingpong", WHAT),
+        ("periodic-wake", WHAT_PERIODIC),
+        ("wake-burst", WHAT_BURST),
+        ("cgroup-fair", WHAT_CGROUP),
+    ]
+    .into_iter()
+    .filter(|(prefix, _)| has(prefix))
+    .enumerate()
+    // One test with several parts: the first sentence introduces
+    // it, the others add to it.
+    .map(|(k, (_, words))| if k == 0 { words.to_string() } else { words.replacen("The test ", "It also ", 1) })
+    .collect();
     // Results this module has no words for: a sentence about another
     // workload would be wrong, and none is better than that.
     parts.join(" ")
