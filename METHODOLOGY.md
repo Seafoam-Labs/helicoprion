@@ -266,6 +266,68 @@ more between the two sides, for example 99.9% blocked round trips against
 describe different parts of the two runs, so read them together with
 `roundtrips_per_s`, which covers all round trips.
 
+## Comparing sessions
+
+```sh
+helicoprion sessions monday/ tuesday/ friday/ -o sessions.html
+```
+
+The intervals of a `matrix` session come from resampling its own rounds.
+They cannot see what changes between sessions: the state the machine booted
+into, or what else ran that evening. `sessions` takes the directories or
+result files of two or more `matrix` sessions and treats each session as
+one observation.
+
+### The sessions must repeat one experiment
+
+Before anything is computed, every session is checked against the oldest
+one. A difference stops the analysis and is named: the schedulers and their
+order, a scheduler without results, each scheduler's build (the kernel's ops
+string) and options, the workloads and their parameters, the protocol
+(suite, runs per visit, warm-up, run length, pause, settle time, order of
+visits), the tool version, and the machine (kernel release and build,
+preemption model, kernel parameters, CPU model, topology, usable and allowed
+CPUs, SMT, governor, EPP, cpufreq driver, boost, power source, platform
+profile, THP). There is no option to override this.
+
+What a file does not record cannot be compared. It counts as neither equal
+nor different and is listed as not compared, so scheduler options that were
+not recorded are never taken for "no options". Sessions written before the
+protocol and the fuller description of the machine were recorded can still
+be laid side by side, with those fields listed.
+
+### What is shown
+
+Every session is analysed on its own, exactly as `compare` would, and the
+answers are laid side by side. Nothing is pooled or averaged, and there is
+no interval across sessions and no reproducibility score: the rounds of a
+session are not independent samples of how sessions differ.
+
+- **Verdicts**: what each session concluded about each scheduler on each
+  workload.
+- **Effects**: each scored metric against the baseline, session by session,
+  with that session's own estimate and scoring. Across sessions it is then
+  scored the same way in all of them, in some only, as better in some and as
+  worse in others, or in none, with the smallest and largest estimate. A
+  change that a session does not score does not count, whatever its sign.
+- **Levels**: the measured values themselves, session by session, with the
+  largest session median over the smallest. This is the stability of the
+  result apart from any comparison. When a scheduler's own values hardly
+  move and the baseline's do, a disagreement between sessions is the
+  baseline's.
+
+Agreement is counted over the sessions that measured a metric, and the
+report says when those are not all of them ("better in both measured
+sessions (2 of 5)"). Such a metric is not counted among those scored the
+same way in every session, and a scheduler without a verdict in some
+session is never reported as having the same verdict in every session.
+
+Fewer than five sessions are flagged: they show what differed between them
+and are too few for even a first idea of how often a result would repeat.
+Five is a practical floor for that, not a statistical guarantee: a report
+lists dozens of metrics that move together, and agreement across a handful
+of sessions on one of them proves little by itself.
+
 ## Plain-language results (`--simple`)
 
 Add `--simple` to `matrix` or `compare` to get the result in plain words.

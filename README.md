@@ -94,6 +94,21 @@ helicoprion compare default.json lavd.json -o report.html --svg-dir charts/
 Separate `run` sessions can drift apart, for example as the machine warms up,
 so prefer `matrix` when the comparison has to be fair.
 
+### Check whether a result repeats
+
+One `matrix` session says how the schedulers differed that time. Run the
+same `matrix` command again, on another day or after a reboot, and
+`sessions` lays the sessions side by side: what each concluded, which
+changes were scored the same way every time, and how much the measured
+values themselves moved.
+
+```sh
+helicoprion sessions monday/ tuesday/ friday/ -o sessions.html
+```
+
+It refuses sessions that do not repeat one experiment, and says what
+differs. See [METHODOLOGY.md](METHODOLOGY.md#comparing-sessions).
+
 ## Result format
 
 Each `run` writes one JSON result file, and `matrix` writes one per

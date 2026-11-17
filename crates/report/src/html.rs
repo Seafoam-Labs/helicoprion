@@ -10,7 +10,7 @@ use crate::stats::MIN_RUNS_FOR_CI;
 use crate::svg::{delta_chart, fmt_delta, fmt_interval, fmt_share, fmt_value, tail_chart};
 use crate::theme::{STYLE, series_var};
 
-const PAGE_CSS: &str = r#"
+pub(crate) const PAGE_CSS: &str = r#"
 body.ck { margin: 0; background: var(--page); color: var(--ink-1);
   font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; }
 main { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
@@ -34,6 +34,8 @@ td .m, .m { color: var(--ink-muted); }
 details { margin-top: 8px; } summary { cursor: pointer; color: var(--ink-2); }
 .cap { color: var(--ink-2); margin: 0 0 6px; }
 table + .cap { margin-top: 14px; }
+.wide { overflow-x: auto; } .wide td, .wide th { white-space: nowrap; }
+.wide td:first-child { white-space: normal; min-width: 180px; }
 details.help { margin: 0 0 16px; font-size: 13px; }
 .briefs { display: grid; gap: 12px; margin: -8px 0 20px; }
 .brief { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 16px; }

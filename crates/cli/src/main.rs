@@ -140,6 +140,19 @@ enum Cmd {
         #[command(flatten)]
         thresholds: Thresholds,
     },
+    /// Lay several matrix sessions of the same experiment side by side:
+    /// which results repeat from session to session and which do not.
+    Sessions {
+        /// Session directories written by `matrix`, or their result
+        /// files. At least two sessions.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// HTML report path.
+        #[arg(short, long, default_value = "helicoprion-sessions.html")]
+        output: PathBuf,
+        #[command(flatten)]
+        scoring: Scoring,
+    },
 }
 
 fn main() -> Result<()> {
@@ -196,6 +209,7 @@ fn main() -> Result<()> {
         Cmd::Compare { files, baseline, output, svg_dir, thresholds } => {
             compare(&files, baseline, &output, svg_dir, thresholds.options()?, thresholds.simple)
         }
+        Cmd::Sessions { paths, output, scoring } => sessions(&paths, &output, scoring.options()?),
     }
 }
 
@@ -354,6 +368,66 @@ fn run(a: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Read one result file.
+fn load(p: &Path) -> Result<ResultFile> {
+    let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+    let f: ResultFile = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+    if !(MIN_READABLE_SCHEMA..=SCHEMA_VERSION).contains(&f.schema) {
+        bail!(
+            "{}: schema {} not supported (this build reads {MIN_READABLE_SCHEMA}..={SCHEMA_VERSION})",
+            p.display(),
+            f.schema
+        );
+    }
+    Ok(f)
+}
+
+/// The result files behind `paths`: a directory stands for the `.json`
+/// files in it (as `matrix` writes them), a file for itself. Each comes
+/// with where it was found, for messages.
+fn result_files(paths: &[PathBuf]) -> Result<Vec<(String, ResultFile)>> {
+    let mut out = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut inside: Vec<PathBuf> = fs::read_dir(p)
+                .with_context(|| format!("reading {}", p.display()))?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|f| f.is_file() && f.extension().is_some_and(|x| x == "json"))
+                .collect();
+            inside.sort();
+            if inside.is_empty() {
+                bail!("{}: no result files (.json) in this directory", p.display());
+            }
+            for f in inside {
+                out.push((p.display().to_string(), load(&f)?));
+            }
+        } else {
+            out.push((p.display().to_string(), load(p)?));
+        }
+    }
+    Ok(out)
+}
+
+fn sessions(paths: &[PathBuf], output: &Path, opts: Options) -> Result<()> {
+    use helicoprion_report::{sessions, sessions_report};
+    let analysis = match sessions::analyse(result_files(paths)?, opts) {
+        Ok(a) => a,
+        Err(why) => bail!("{}", why.join("\n  ")),
+    };
+    for (i, unverified) in analysis.unverified.iter().enumerate().filter(|(_, u)| !u.is_empty()) {
+        eprintln!(
+            "note:      session {}: not recorded, so not compared with session 1: {}",
+            i + 1,
+            unverified.join("; ")
+        );
+    }
+    print!("{}", sessions_report::text(&analysis));
+    fs::write(output, sessions_report::html(&analysis)).with_context(|| format!("writing {}", output.display()))?;
+    eprintln!("\nwrote {}", output.display());
+    Ok(())
+}
+
 fn compare(
     files: &[PathBuf],
     baseline: Option<String>,
@@ -366,21 +440,7 @@ fn compare(
     if files.len() > MAX {
         bail!("at most {MAX} result files per report (got {}); split into several reports", files.len());
     }
-    let parsed: Vec<ResultFile> = files
-        .iter()
-        .map(|p| {
-            let text = fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-            let f: ResultFile = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
-            if !(MIN_READABLE_SCHEMA..=SCHEMA_VERSION).contains(&f.schema) {
-                bail!(
-                    "{}: schema {} not supported (this build reads {MIN_READABLE_SCHEMA}..={SCHEMA_VERSION})",
-                    p.display(),
-                    f.schema
-                );
-            }
-            Ok(f)
-        })
-        .collect::<Result<_>>()?;
+    let parsed: Vec<ResultFile> = files.iter().map(|p| load(p)).collect::<Result<_>>()?;
 
     let base = match baseline {
         None => 0,
@@ -606,6 +666,25 @@ fn write_report_with(c: &Comparison, path: &Path, simple: bool) -> Result<()> {
 /// What a report highlights; shared by `compare` and `matrix`.
 #[derive(clap::Args, Clone, Copy)]
 struct Thresholds {
+    #[command(flatten)]
+    scoring: Scoring,
+    /// Plain-words result for readers who only want to know which
+    /// scheduler did better: the terminal shows a short "In short" instead
+    /// of the metric table, and the HTML report opens with it and folds
+    /// the charts and tables away. The numbers and the scoring are the same.
+    #[arg(long)]
+    simple: bool,
+}
+
+impl Thresholds {
+    fn options(self) -> Result<Options> {
+        self.scoring.options()
+    }
+}
+
+/// What a report scores.
+#[derive(clap::Args, Clone, Copy)]
+struct Scoring {
     /// Smallest change (in %) that is highlighted. Calibrate with an A/A run
     /// (the same scheduler twice): between-session drift is invisible to the
     /// per-session bootstrap.
@@ -620,15 +699,9 @@ struct Thresholds {
     /// but never highlighted or charted. 0 turns this off.
     #[arg(long, default_value_t = 1.0)]
     min_share: f64,
-    /// Plain-words result for readers who only want to know which
-    /// scheduler did better: the terminal shows a short "In short" instead
-    /// of the metric table, and the HTML report opens with it and folds
-    /// the charts and tables away. The numbers and the scoring are the same.
-    #[arg(long)]
-    simple: bool,
 }
 
-impl Thresholds {
+impl Scoring {
     fn options(self) -> Result<Options> {
         if !(self.min_effect.is_finite() && self.min_effect >= 0.0) {
             bail!("--min-effect must be >= 0");
