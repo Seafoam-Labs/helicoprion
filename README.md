@@ -109,6 +109,21 @@ helicoprion sessions monday/ tuesday/ friday/ -o sessions.html
 It refuses sessions that do not repeat one experiment, and says what
 differs. See [METHODOLOGY.md](METHODOLOGY.md#comparing-sessions).
 
+### Check the method itself
+
+Give `matrix` the same scheduler twice and it measures it as two arms.
+Nothing differs between them but when each ran, so whatever the report
+finds there is the noise of the measurement on your machine:
+
+```sh
+sudo helicoprion matrix --sched default --sched default -o aa/
+```
+
+The report's A/A check lists what differed and flags every change it would
+have scored as clear. Several such sessions, laid side by side with
+`sessions`, show how large that noise gets for each metric. See
+[METHODOLOGY.md](METHODOLOGY.md#aa-comparing-a-scheduler-with-itself).
+
 ## Result format
 
 Each `run` writes one JSON result file, and `matrix` writes one per

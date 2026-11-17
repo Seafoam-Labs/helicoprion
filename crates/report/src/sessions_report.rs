@@ -6,8 +6,8 @@ use crate::compare::{UnclearReason, Verdict};
 use crate::conditions::utc;
 use crate::esc;
 use crate::html::PAGE_CSS;
-use crate::sessions::{Agreement, Analysis, Consensus, Effect, Outcome};
-use crate::svg::{fmt_delta, fmt_interval, fmt_value};
+use crate::sessions::{Agreement, Analysis, Consensus, Coverage, Effect, NoiseAcross, Outcome};
+use crate::svg::{fmt_delta, fmt_interval, fmt_value, pct};
 use crate::theme::STYLE;
 
 /// How the sessions agree on the scored metrics of one scheduler on one
@@ -197,10 +197,185 @@ pub fn text(a: &Analysis) -> String {
             let _ = writeln!(out, "    of {} measurements: {}", t.metrics, parts.join(", "));
         }
     }
+    for (first, twin) in &a.pairs {
+        let of: Vec<&NoiseAcross> = a.noise.iter().filter(|n| &n.twin == twin).collect();
+        let _ = writeln!(out, "\nA/A: {twin} is {first} again");
+        if of.is_empty() {
+            let _ = writeln!(out, "  {}", inconclusive_words(a.sessions.len()));
+            continue;
+        }
+        for line in coverage_words(a.coverage(twin)) {
+            let _ = writeln!(out, "  {line}");
+        }
+        let cover = a.coverage(twin);
+        let alarmed = of.iter().filter(|n| n.false_alarms() > 0).count();
+        let sessions = (0..a.sessions.len())
+            .filter(|i| of.iter().any(|n| n.sessions[*i].as_ref().is_some_and(|x| x.false_alarm())))
+            .count();
+        match a.silencing_min_effect(twin) {
+            Some(silencing) => {
+                let _ = writeln!(
+                    out,
+                    "  false alarms: {alarmed} of {} metrics, in {sessions} of {} measured sessions; a --min-effect \
+                     above {}% would have scored none",
+                    of.len(),
+                    cover.measured,
+                    crate::calibration::above(silencing)
+                );
+            }
+            // No alarm is a finding only where something could be scored.
+            None if cover.scorable > 0 => {
+                let _ = writeln!(
+                    out,
+                    "  no false alarm in {} metrics over {} session{} that could score them",
+                    of.len(),
+                    cover.scorable,
+                    if cover.scorable == 1 { "" } else { "s" }
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  nothing could be scored, so nothing is known about false alarms");
+            }
+        }
+        let largest = of
+            .iter()
+            .filter_map(|n| Some((*n, n.largest()?)))
+            .max_by(|x, y| x.1.1.delta.median.abs().total_cmp(&y.1.1.delta.median.abs()));
+        if let Some((n, (session, noise))) = largest {
+            let _ = writeln!(
+                out,
+                "  largest change between the arms: {} · {} {} (session {})",
+                n.workload,
+                n.metric,
+                fmt_delta(&noise.delta),
+                session + 1
+            );
+        }
+    }
     if let Some(few) = few_words(a) {
         let _ = writeln!(out, "\n{few}");
     }
     out
+}
+
+/// What the sessions could not say about a pair, if anything: sessions
+/// without data, without an interval for any change, or not balanced.
+fn coverage_words(c: Coverage) -> Vec<String> {
+    let mut out = Vec::new();
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    if c.measured < c.sessions {
+        let missing = c.sessions - c.measured;
+        out.push(format!(
+            "measured in {} of {} sessions; {missing} session{} without comparable data for this pair say{} nothing \
+             about it",
+            c.measured,
+            c.sessions,
+            s(missing),
+            if missing == 1 { "s" } else { "" }
+        ));
+    }
+    if c.scorable < c.measured {
+        let unscorable = c.measured - c.scorable;
+        out.push(format!(
+            "{unscorable} measured session{} had too few rounds to score any change: no alarm there is no finding",
+            s(unscorable)
+        ));
+    }
+    if c.unbalanced > 0 {
+        out.push(format!(
+            "{} session{} did not balance the order of the arms: an effect of position is part of the change there",
+            c.unbalanced,
+            s(c.unbalanced)
+        ));
+    }
+    out
+}
+
+/// For a pair that was run and has no measurement to compare in any
+/// session.
+fn inconclusive_words(sessions: usize) -> String {
+    format!(
+        "no comparable measurements in any of the {sessions} sessions: the calibration is inconclusive, which is \
+         not the same as quiet"
+    )
+}
+
+/// What the A/A pairs found, session by session.
+fn noise_section(h: &mut String, a: &Analysis) {
+    if a.pairs.is_empty() {
+        return;
+    }
+    let n = a.sessions.len();
+    h.push_str("<h2>A/A across sessions</h2><p class=cap>Two arms of one scheduler, session by session: how large a difference the method finds where there is none.</p><details class=help><summary>How to read this</summary><p>A cell is the repeated arm against its first arm in that session, estimated and scored like any candidate against a baseline. It is red where the session scores it as a clear change, which between two arms of one scheduler is a false alarm. <em>False alarms</em> counts those sessions. <em>Largest</em> is the largest change in any session, scored or not: the noise this metric has shown on this machine. A threshold for the metric that sits below it has already been crossed without any difference between schedulers. <em>Later against earlier</em> is the effect of position within a round (the arm visited second against the arm visited first), smallest and largest over the sessions; a range that stays on one side is a position effect that repeats. These are observations of the noise, as many as there are sessions. They do not set a threshold.</p></details>");
+    for (first, twin) in &a.pairs {
+        let of: Vec<&NoiseAcross> = a.noise.iter().filter(|x| &x.twin == twin).collect();
+        if of.is_empty() {
+            let _ = write!(
+                h,
+                "<p class=cap><strong>{} is {} again</strong>: {}.</p>",
+                esc(twin),
+                esc(first),
+                inconclusive_words(n)
+            );
+            continue;
+        }
+        let alarmed = of.iter().filter(|x| x.false_alarms() > 0).count();
+        let mut line = format!(
+            "<strong>{} is {} again</strong>: {alarmed} of {} scored metrics raised a false alarm in some session",
+            esc(twin),
+            esc(first),
+            of.len()
+        );
+        if let Some(silencing) = a.silencing_min_effect(twin) {
+            let _ = write!(
+                line,
+                "; a --min-effect above {}% would have scored none of them",
+                crate::calibration::above(silencing)
+            );
+        }
+        for words in coverage_words(a.coverage(twin)) {
+            let _ = write!(line, ". <strong>Note</strong>: {}", esc(&words));
+        }
+        let _ = write!(h, "<p class=cap>{line}.</p><div class=wide><table><tr><th class=l>Workload · metric</th>");
+        for i in 0..n {
+            let _ = write!(h, "<th>{}</th>", i + 1);
+        }
+        h.push_str("<th class=l>False alarms</th><th>Largest</th><th class=l>Later against earlier</th></tr>");
+        for x in of {
+            let _ = write!(h, "<tr><td>{} · <code>{}</code></td>", esc(&x.workload), esc(&x.metric));
+            for s in &x.sessions {
+                match s {
+                    None => h.push_str("<td class=m>—</td>"),
+                    Some(s) => {
+                        let title = s
+                            .delta
+                            .ci
+                            .map(|(lo, hi)| {
+                                format!(" title=\"95% interval: {}\"", esc(&fmt_interval(&s.delta, lo, hi)))
+                            })
+                            .unwrap_or_default();
+                        let class = if s.false_alarm() { "bad" } else { "m" };
+                        let _ = write!(h, "<td class={class}{title}>{}</td>", fmt_delta(&s.delta));
+                    }
+                }
+            }
+            let alarms = x.false_alarms();
+            let alarms = if alarms == 0 {
+                format!("<span class=m>none in {}</span>", x.measured())
+            } else {
+                format!("<strong>{alarms} of {}</strong>", x.measured())
+            };
+            let largest = x.largest().map_or_else(|| "—".to_string(), |(_, s)| fmt_delta(&s.delta));
+            let orders: Vec<f64> = x.sessions.iter().flatten().filter_map(|s| Some(s.order?.median)).collect();
+            let order = match (orders.iter().copied().reduce(f64::min), orders.iter().copied().reduce(f64::max)) {
+                (Some(lo), Some(hi)) if orders.len() >= 2 => format!("{} … {}", pct(lo), pct(hi)),
+                (Some(only), _) => pct(only),
+                _ => "—".to_string(),
+            };
+            let _ = write!(h, "<td class=l>{alarms}</td><td>{largest}</td><td class=l>{order}</td></tr>");
+        }
+        h.push_str("</table></div>");
+    }
 }
 
 /// The self-contained HTML report.
@@ -273,6 +448,8 @@ pub fn html(a: &Analysis) -> String {
         let _ = write!(h, "<td class=l>{across}</td></tr>");
     }
     h.push_str("</table></div>");
+
+    noise_section(&mut h, a);
 
     let _ = write!(
         h,
@@ -577,5 +754,215 @@ scx_cosmos
         assert_eq!(words(vec![b, None, w]), "better in 1, worse in 1, measured in 2 of 3");
         assert_eq!(words(vec![u, None, None]), "not clear in the 1 measured session (1 of 3)");
         assert_eq!(words(vec![u, None, u]), "clear in none of 2 measured sessions (2 of 3)");
+    }
+
+    /// Three A/A sessions of the kernel's scheduler. In the first and the
+    /// third, the arm visited second in a round is 10% slower: an effect
+    /// of position. In the second, the repeated arm is 8% slower wherever
+    /// it stands: one false alarm.
+    fn aa() -> Analysis {
+        use crate::calibration::tests::aa_session;
+        let mut files = Vec::new();
+        for k in 0..3u64 {
+            files.extend(aa_session(
+                &format!("aa{k}"),
+                1000 * (k + 1),
+                &["default", "default #2"],
+                6,
+                move |label, _, pos| match (k, pos, label) {
+                    (1, _, "default") => 100.0,
+                    (1, _, _) => 108.0,
+                    (_, 0, _) => 100.0,
+                    _ => 110.0,
+                },
+            ));
+        }
+        analyse(files, Options::default()).unwrap()
+    }
+
+    #[test]
+    fn aa_pairs_are_laid_side_by_side_across_sessions() {
+        let a = aa();
+        assert_eq!(a.noise.len(), 2, "p99 and ops");
+        let p99 = a.noise.iter().find(|n| n.metric == "p99").unwrap();
+        assert_eq!((p99.first.as_str(), p99.twin.as_str()), ("default", "default #2"));
+        assert_eq!((p99.measured(), p99.false_alarms()), (3, 1));
+        let (session, largest) = p99.largest().unwrap();
+        assert_eq!(session, 1);
+        assert!((largest.delta.median + 8.0).abs() < 0.5, "{:?}", largest.delta);
+        // The position effect is there in the first and the third session,
+        // and no false alarm comes of it.
+        for k in [0, 2] {
+            let n = p99.sessions[k].as_ref().unwrap();
+            assert!((n.order.unwrap().median + 10.0).abs() < 0.5 && !n.false_alarm(), "{n:?}");
+        }
+        let silencing = a.silencing_min_effect("default #2").unwrap();
+        assert!((7.0..8.5).contains(&silencing), "{silencing}");
+        assert_eq!(a.silencing_min_effect("default"), None);
+
+        let text = text(&a);
+        assert!(text.contains(
+            "\nA/A: default #2 is default again\n  false alarms: 2 of 2 metrics, in 1 of 3 measured sessions; a --min-effect above 8.0% would have scored none\n  largest change between the arms: w · p99 \u{2212}8.0% (session 2)\n"
+        ), "{text}");
+
+        let html = html(&a);
+        let section =
+            &html[html.find("<h2>A/A across sessions</h2>").unwrap()..html.find("<h2>Effects against").unwrap()];
+        assert!(section.contains(
+            "<strong>default #2 is default again</strong>: 2 of 2 scored metrics raised a false alarm in some session; a --min-effect above 8.0% would have scored none of them."
+        ), "{section}");
+        let row = &section[section.find("<code>p99</code>").unwrap()..];
+        let row = &row[..row.find("</tr>").unwrap()];
+        // Scored in the second session only, and red only there.
+        assert_eq!((row.matches("<td class=bad").count(), row.matches("<td class=m").count()), (1, 2), "{row}");
+        assert!(row.contains("<td class=l><strong>1 of 3</strong></td><td>\u{2212}8.0%</td>"), "{row}");
+        assert!(row.ends_with("<td class=l>\u{2212}10.0% … \u{2212}0.3%</td>"), "{row}");
+
+        // Sessions without a repeated arm have no such section or lines.
+        let plain = analysis();
+        assert!(plain.noise.is_empty());
+        assert!(!super::html(&plain).contains("A/A across sessions") && !super::text(&plain).contains("A/A"));
+    }
+
+    /// No false alarm in any session is said as such.
+    #[test]
+    fn quiet_aa_sessions_are_reported_as_quiet() {
+        use crate::calibration::tests::aa_session;
+        let mut files = Vec::new();
+        for k in 0..2u64 {
+            files.extend(aa_session(&format!("aa{k}"), 1000 * (k + 1), &["default", "default #2"], 6, |_, r, _| {
+                100.0 + f64::from(r)
+            }));
+        }
+        let a = analyse(files, Options::default()).unwrap();
+        assert!(
+            text(&a).contains(
+                "A/A: default #2 is default again\n  no false alarm in 2 metrics over 2 sessions that could score them\n"
+            ),
+            "{}",
+            text(&a)
+        );
+        let html = html(&a);
+        assert!(html.contains("0 of 2 scored metrics raised a false alarm in some session."));
+        assert!(html.contains("<span class=m>none in 2</span>"));
+    }
+
+    /// Five A/A sessions, three of them without valid runs of the
+    /// repeated arm. "No false alarm" must not read as five sessions
+    /// that found none; nor may sessions too short to score anything.
+    #[test]
+    fn sessions_without_data_do_not_confirm_a_quiet_calibration() {
+        use crate::calibration::tests::aa_session;
+        let sessions = |rounds: u32, broken: &[u64]| {
+            let mut files = Vec::new();
+            for k in 0..5u64 {
+                let mut s =
+                    aa_session(&format!("aa{k}"), 1000 * (k + 1), &["default", "default #2"], rounds, |_, r, _| {
+                        100.0 + f64::from(r)
+                    });
+                if broken.contains(&k) {
+                    s[1].1.workloads[0].runs.iter_mut().for_each(|r| r.valid = false);
+                }
+                files.extend(s);
+            }
+            analyse(files, Options::default()).unwrap()
+        };
+
+        let a = sessions(6, &[2, 3, 4]);
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 2, scorable: 2, unbalanced: 0 });
+        let said = text(&a);
+        assert!(said.contains(
+            "A/A: default #2 is default again\n  measured in 2 of 5 sessions; 3 sessions without comparable data for this pair say nothing about it\n  no false alarm in 2 metrics over 2 sessions that could score them\n"
+        ), "{said}");
+        assert!(!said.contains("over 5 sessions"), "{said}");
+        let page = html(&a);
+        assert!(
+            page.contains("<strong>Note</strong>: measured in 2 of 5 sessions; 3 sessions without comparable data")
+        );
+        assert!(page.contains("<span class=m>none in 2</span>"));
+
+        // Two rounds are too few for an interval: nothing could be scored,
+        // which is not the same as nothing found.
+        let a = sessions(2, &[]);
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, scorable: 0, unbalanced: 0 });
+        let said = text(&a);
+        assert!(said.contains(
+            "  5 measured sessions had too few rounds to score any change: no alarm there is no finding\n  nothing could be scored, so nothing is known about false alarms\n"
+        ), "{said}");
+        assert!(!said.contains("no false alarm in"), "{said}");
+
+        // An odd number of rounds: measured and scorable, and not balanced.
+        let a = sessions(5, &[]);
+        assert_eq!(a.coverage("default #2").unbalanced, 5);
+        assert!(text(&a).contains("5 sessions did not balance the order of the arms"));
+        // All is well: no such lines.
+        let a = sessions(6, &[]);
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, scorable: 5, unbalanced: 0 });
+        let said = text(&a);
+        assert!(said.contains("A/A: default #2 is default again\n  no false alarm in 2 metrics over 5 sessions that could score them\n"), "{said}");
+    }
+
+    /// A session counts as able to score only when some change there has
+    /// an interval. A minor population is given as the reason a change is
+    /// unscored before its missing interval is, and must not make a
+    /// two-round session look scorable.
+    #[test]
+    fn a_session_without_any_interval_is_not_scorable() {
+        use crate::calibration::tests::aa_session;
+        let mut files = Vec::new();
+        for k in 0..2u64 {
+            let mut s = aa_session(&format!("aa{k}"), 1000 * (k + 1), &["default", "default #2"], 2, |_, r, _| {
+                100.0 + f64::from(r)
+            });
+            for (_, f) in s.iter_mut() {
+                for r in &mut f.workloads[0].runs {
+                    for m in r.metrics.values_mut() {
+                        m.share = Some(0.001);
+                    }
+                }
+            }
+            files.extend(s);
+        }
+        let a = analyse(files, Options::default()).unwrap();
+        let all: Vec<_> = a.noise.iter().flat_map(|n| n.sessions.iter().flatten()).collect();
+        assert_eq!(all.len(), 4);
+        assert!(all.iter().all(|n| n.unclear == Some(UnclearReason::MinorPopulation) && n.delta.ci.is_none()));
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 2, measured: 2, scorable: 0, unbalanced: 0 });
+        let said = text(&a);
+        assert!(said.contains("nothing could be scored, so nothing is known about false alarms"), "{said}");
+        assert!(!said.contains("no false alarm in"), "{said}");
+    }
+
+    /// Five A/A sessions in which every run of the repeated arm is
+    /// invalid. The pair was run; that nothing came of it is said, rather
+    /// than the calibration vanishing from the report.
+    #[test]
+    fn a_pair_without_any_measurement_is_reported_as_inconclusive() {
+        use crate::calibration::tests::aa_session;
+        let mut files = Vec::new();
+        for k in 0..5u64 {
+            let mut s = aa_session(&format!("aa{k}"), 1000 * (k + 1), &["default", "default #2"], 6, |_, r, _| {
+                100.0 + f64::from(r)
+            });
+            s[1].1.workloads[0].runs.iter_mut().for_each(|r| r.valid = false);
+            files.extend(s);
+        }
+        let a = analyse(files, Options::default()).unwrap();
+        assert_eq!(a.pairs, [("default".to_string(), "default #2".to_string())]);
+        assert!(a.noise.is_empty());
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 0, scorable: 0, unbalanced: 0 });
+        let said = text(&a);
+        assert!(said.contains(
+            "\nA/A: default #2 is default again\n  no comparable measurements in any of the 5 sessions: the calibration is inconclusive, which is not the same as quiet\n"
+        ), "{said}");
+        assert!(!said.contains("no false alarm"), "{said}");
+        let page = html(&a);
+        assert!(page.contains("<h2>A/A across sessions</h2>"));
+        assert!(page.contains(
+            "<p class=cap><strong>default #2 is default again</strong>: no comparable measurements in any of the 5 sessions: the calibration is inconclusive, which is not the same as quiet.</p>"
+        ));
+
+        // Sessions without a repeated arm have no pairs at all.
+        assert!(analysis().pairs.is_empty());
     }
 }

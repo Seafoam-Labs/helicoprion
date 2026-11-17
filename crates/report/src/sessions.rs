@@ -15,6 +15,7 @@
 
 use helicoprion_core::{Better, ResultFile, Scheduler, SystemInfo};
 
+use crate::calibration::Noise;
 use crate::compare::{Comparison, Delta, Options, SessionKey, UnclearReason, Verdict, session_key};
 use crate::conditions::utc;
 
@@ -254,6 +255,10 @@ pub fn check(reference: &Session, other: &Session) -> Check {
     for spec in reference.schedulers() {
         let (Some(x), Some(y)) = (reference.file(spec), other.file(spec)) else { continue };
         differ(&format!("{spec}: scheduler"), identity(&x.scheduler), identity(&y.scheduler));
+        // An arm that repeats another in one session and stands alone in
+        // the other is not the same arm.
+        let twin = |f: &ResultFile| f.design.as_ref().and_then(|d| d.twin_of.clone()).unwrap_or_else(|| "none".into());
+        differ(&format!("{spec}: repeats"), twin(x), twin(y));
         if x.scheduler.is_ext() || y.scheduler.is_ext() {
             let options = |f: &ResultFile| f.design.as_ref().and_then(|d| d.options.clone());
             match (options(x), options(y)) {
@@ -440,9 +445,97 @@ pub struct Analysis {
     pub verdicts: Vec<Verdicts>,
     pub effects: Vec<Effect>,
     pub levels: Vec<Level>,
+    /// The A/A pairs of the experiment, as (first arm, repeated arm), in
+    /// the order of the scheduler list. Kept apart from what was measured
+    /// for them: a pair whose every measurement failed is still a pair
+    /// that was run, with nothing to show for it.
+    pub pairs: Vec<(String, String)>,
+    /// What the A/A pairs of the sessions found, metric by metric; empty
+    /// without repeated arms, and for a pair without any measurement.
+    pub noise: Vec<NoiseAcross>,
+}
+
+/// One scored metric of one A/A pair (`calibration`), session by session:
+/// how large the difference between two arms of one scheduler gets, and
+/// how often it is scored as clear.
+#[derive(Debug, Clone)]
+pub struct NoiseAcross {
+    /// Labels of the pair's arms.
+    pub first: String,
+    pub twin: String,
+    pub workload: String,
+    pub metric: String,
+    /// One per session; `None` where the pair has no estimate.
+    pub sessions: Vec<Option<Noise>>,
+}
+
+impl NoiseAcross {
+    pub fn measured(&self) -> usize {
+        self.sessions.iter().flatten().count()
+    }
+
+    /// Sessions that scored the change between the arms as clear.
+    pub fn false_alarms(&self) -> usize {
+        self.sessions.iter().flatten().filter(|n| n.false_alarm()).count()
+    }
+
+    /// The session with the largest change between the arms, scored or
+    /// not: (index of the session, its estimate).
+    pub fn largest(&self) -> Option<(usize, &Noise)> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| Some((i, n.as_ref()?)))
+            .max_by(|a, b| a.1.delta.median.abs().total_cmp(&b.1.delta.median.abs()))
+    }
+}
+
+/// How much the sessions could say about one A/A pair. A session
+/// without data for the pair found no false alarm, and found nothing
+/// else either: it is not a session that confirms anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coverage {
+    pub sessions: usize,
+    /// Sessions with an estimate for some metric of the pair.
+    pub measured: usize,
+    /// Of those: sessions where some change has an interval, so that it
+    /// could have been scored. The others had too few rounds for any.
+    /// Taken from the estimates themselves, not from the reason a change
+    /// went unscored: a minor population is named as the reason before
+    /// the missing interval is.
+    pub scorable: usize,
+    /// Of the measured: sessions where the order of the arms was not
+    /// balanced (`Noise::balanced`).
+    pub unbalanced: usize,
 }
 
 impl Analysis {
+    /// What the sessions could say about the pair of `twin`.
+    pub fn coverage(&self, twin: &str) -> Coverage {
+        let of: Vec<&NoiseAcross> = self.noise.iter().filter(|n| n.twin == twin).collect();
+        let in_session = |i: usize| of.iter().filter_map(move |n| n.sessions[i].as_ref());
+        let count = |pred: &dyn Fn(usize) -> bool| (0..self.sessions.len()).filter(|i| pred(*i)).count();
+        Coverage {
+            sessions: self.sessions.len(),
+            measured: count(&|i| in_session(i).next().is_some()),
+            scorable: count(&|i| in_session(i).any(|n| n.delta.ci.is_some())),
+            unbalanced: count(&|i| in_session(i).any(|n| !n.balanced())),
+        }
+    }
+
+    /// The `--min-effect` above which no session would have scored a
+    /// change between the arms of `twin` and its first arm: the largest
+    /// false alarm, in percent. `None` when there was none.
+    pub fn silencing_min_effect(&self, twin: &str) -> Option<f64> {
+        self.noise
+            .iter()
+            .filter(|n| n.twin == twin)
+            .flat_map(|n| n.sessions.iter().flatten())
+            .filter(|n| n.false_alarm())
+            .map(|n| n.delta.median.abs())
+            .reduce(f64::max)
+    }
+
     /// Too few sessions for even a first idea of how often a result would
     /// repeat (`SESSIONS_TO_GENERALISE`).
     pub fn few(&self) -> bool {
@@ -551,8 +644,36 @@ pub fn analyse(files: Vec<(String, ResultFile)>, opts: Options) -> Result<Analys
     }
     verdicts.sort_by_key(|v| v.scheduler);
 
+    // The A/A pairs, each session's own, metric by metric. The pairs
+    // themselves come from the design, whatever was measured.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut noise: Vec<NoiseAcross> = Vec::new();
+    for (si, c) in comparisons.iter().enumerate() {
+        for cal in crate::calibration::calibrate(c) {
+            let pair = (cal.first.clone(), cal.twin.clone());
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+            for m in cal.metrics {
+                let at =
+                    noise.iter().position(|n| n.twin == cal.twin && n.workload == m.workload && n.metric == m.metric);
+                let at = at.unwrap_or_else(|| {
+                    noise.push(NoiseAcross {
+                        first: cal.first.clone(),
+                        twin: cal.twin.clone(),
+                        workload: m.workload.clone(),
+                        metric: m.metric.clone(),
+                        sessions: vec![None; comparisons.len()],
+                    });
+                    noise.len() - 1
+                });
+                noise[at].sessions[si] = Some(m);
+            }
+        }
+    }
+
     let unverified = checks.into_iter().map(|c| c.unverified).collect();
-    Ok(Analysis { schedulers, sessions, comparisons, unverified, verdicts, effects, levels })
+    Ok(Analysis { schedulers, sessions, comparisons, unverified, verdicts, effects, levels, pairs, noise })
 }
 
 #[cfg(test)]
@@ -819,6 +940,11 @@ pub(crate) mod tests {
             "{:?}",
             c.differs
         );
+
+        // An arm that repeats another in one session and stands alone in
+        // the other.
+        let c = two(|o| o[2].1.design.as_mut().unwrap().twin_of = Some("scx_lavd".into()));
+        assert_eq!(c.differs, ["scx_cosmos: repeats: scx_lavd here, none in the reference"]);
 
         // Runs that failed do not make another protocol: a session whose
         // last round lost a run still planned the same rounds.

@@ -357,6 +357,16 @@ session are not independent samples of how sessions differ.
   scored the same way in all of them, in some only, as better in some and as
   worse in others, or in none, with the smallest and largest estimate. A
   change that a session does not score does not count, whatever its sign.
+- **A/A across sessions**, when the sessions have a repeated arm: each
+  scored metric of the pair, session by session, with the sessions that
+  scored it as a clear change (false alarms), the largest change in any
+  session, and the range of the position effect. The largest change is the
+  noise that metric has shown on this machine; a threshold below it has
+  already been crossed without any difference between schedulers. The report
+  says how many sessions measured the pair at all, how many had enough
+  rounds to score a change and how many did not balance the order of the
+  arms: a session without data, or too short to score anything, found no
+  false alarm and confirms nothing.
 - **Levels**: the measured values themselves, session by session, with the
   largest session median over the smallest. This is the stability of the
   result apart from any comparison. When a scheduler's own values hardly
