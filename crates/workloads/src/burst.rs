@@ -710,12 +710,14 @@ mod tests {
     /// between its work and its look must not pass for one still working.
     #[test]
     fn a_burst_after_the_work_was_done_is_not_an_overrun() {
-        let w = quick(1);
-        // Three bursts, 2 ms apart. Woken by the first, the task is done
-        // after 50 µs and off its CPU for 3 ms: the second burst comes
+        // Three bursts, 20 ms apart: wide enough that neither 50 µs of
+        // work nor the waker being late on a busy test machine reaches
+        // the next burst by itself. Woken by the first, the task is done
+        // at once and off its CPU for 30 ms: the second burst comes
         // meanwhile.
-        let hooks = Hooks { slow_after_work: Some((0, Duration::from_millis(3))), ..Default::default() };
-        let r = run(&w, Duration::from_millis(6), &hooks);
+        let w = WakeBurst { period: Duration::from_millis(20), ..quick(1) };
+        let hooks = Hooks { slow_after_work: Some((0, Duration::from_millis(30))), ..Default::default() };
+        let r = run(&w, Duration::from_millis(60), &hooks);
         let c = &r.counters;
         accounted(&r);
         assert_eq!(c["wakeups_overrun"], 0, "{c:?}");
@@ -724,8 +726,8 @@ mod tests {
 
         // The same delay before the work is done is an overrun: what
         // differs is only when the burst came.
-        let hooks = Hooks { slow_task: Some((0, Duration::from_millis(3))), ..Default::default() };
-        let r = run(&w, Duration::from_millis(6), &hooks);
+        let hooks = Hooks { slow_task: Some((0, Duration::from_millis(30))), ..Default::default() };
+        let r = run(&w, Duration::from_millis(60), &hooks);
         accounted(&r);
         assert!(r.counters["wakeups_overrun"] >= 1, "{:?}", r.counters);
     }
