@@ -54,6 +54,11 @@ enum Cmd {
         /// trip); results then compare with ones recorded without them.
         #[arg(long)]
         no_cpu_diag: bool,
+        /// Also read every worker thread's scheduler statistics (time
+        /// waiting for a CPU, preemptions, migrations). A run with them is
+        /// only compared with other runs with them.
+        #[arg(long)]
+        sched_diag: bool,
     },
     /// Interleave several schedulers, switched with scxcli (scx.service).
     ///
@@ -122,6 +127,11 @@ enum Cmd {
         /// Skip the same-/cross-CPU diagnostics.
         #[arg(long)]
         no_cpu_diag: bool,
+        /// Also read every worker thread's scheduler statistics (time
+        /// waiting for a CPU, preemptions, migrations). A session with
+        /// them is only compared with other sessions with them.
+        #[arg(long)]
+        sched_diag: bool,
         /// Output directory (default: helicoprion-matrix-<unix time>).
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -163,7 +173,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Info { json } => info(json),
-        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag } => run(RunArgs {
+        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag, sched_diag } => run(RunArgs {
             suite,
             runs,
             warmup,
@@ -171,7 +181,7 @@ fn main() -> Result<()> {
             cooldown,
             label,
             output,
-            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag },
+            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag },
         }),
         Cmd::Matrix {
             scheds,
@@ -189,6 +199,7 @@ fn main() -> Result<()> {
             scxcli,
             systemctl,
             no_cpu_diag,
+            sched_diag,
             output,
             thresholds,
         } => matrix_cmd(MatrixArgs {
@@ -206,7 +217,7 @@ fn main() -> Result<()> {
             allow_ops_mismatch,
             scxcli,
             systemctl,
-            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag },
+            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag },
             output,
             opts: thresholds.options()?,
             simple: thresholds.simple,

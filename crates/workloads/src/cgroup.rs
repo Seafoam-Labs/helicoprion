@@ -91,6 +91,7 @@ use serde_json::json;
 
 use crate::Workload;
 use crate::clock::Alive;
+use crate::schedstat::{self, Collector};
 
 /// How long the threads may take to join their groups before the run is
 /// abandoned.
@@ -137,6 +138,8 @@ pub struct CgroupFair {
     pub threads: (usize, usize),
     /// CPUs of the machine: what `cpu_used_pct` is a share of.
     pub cpus: usize,
+    /// Read every thread's scheduler statistics.
+    pub sched_diag: bool,
 }
 
 impl Workload for CgroupFair {
@@ -153,14 +156,15 @@ impl Workload for CgroupFair {
     }
 
     fn params(&self) -> serde_json::Value {
-        json!({
+        let params = json!({
             "weight_a": self.weights.0,
             "weight_b": self.weights.1,
             "threads_a": self.threads.0,
             "threads_b": self.threads.1,
             // What `cpu_used_pct` is a share of.
             "cpus": self.cpus,
-        })
+        });
+        schedstat::mark(params, self.sched_diag)
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -426,13 +430,14 @@ impl CgroupFair {
         let state = Arc::new(AtomicU8::new(WAIT));
         let ready = Arc::new(AtomicUsize::new(0));
         let slots: Arc<[Slot]> = (0..total).map(|_| Slot::default()).collect();
+        let stats = Arc::new(Collector::new(self.sched_diag));
         let mut handles = Vec::with_capacity(total);
         let mut failed: Option<String> = None;
         for i in 0..total {
             let group = if i < self.threads.0 { "a" } else { "b" };
             let (state, ready, slots, hooks) =
                 (Arc::clone(&state), Arc::clone(&ready), Arc::clone(&slots), hooks.clone());
-            let parent = groups.parent.clone();
+            let (parent, stats) = (groups.parent.clone(), Arc::clone(&stats));
             let body = move || -> Result<(), String> {
                 let _alive = Alive::new(&hooks.alive);
                 Groups::join(&parent, group)?;
@@ -442,6 +447,8 @@ impl CgroupFair {
                 while state.load(Ordering::Acquire) == WAIT {
                     std::thread::sleep(Duration::from_micros(200));
                 }
+                // All of its work, the time before the window included.
+                let _watching = stats.watch();
                 burn(&state, &slots[i].0, i as u64);
                 Ok(())
             };
@@ -499,7 +506,11 @@ impl CgroupFair {
                 Err(also) => format!("{why}; and {also}"),
             }),
             (None, _) if restored.is_err() => invalid(restored.unwrap_err()),
-            (None, Some(m)) => self.summarize(&m),
+            (None, Some(m)) => {
+                let mut r = self.summarize(&m);
+                stats.record(&mut r);
+                r
+            }
             (None, None) => invalid("nothing was measured".into()),
         }
     }
@@ -590,7 +601,13 @@ mod tests {
 
     /// Sized for the machine the test runs on, as a run has to be.
     fn quick() -> CgroupFair {
-        CgroupFair { case: "weighted", weights: (100, 300), threads: (2, 2), cpus: allowed_cpus().unwrap().len() }
+        CgroupFair {
+            case: "weighted",
+            weights: (100, 300),
+            threads: (2, 2),
+            cpus: allowed_cpus().unwrap().len(),
+            sched_diag: false,
+        }
     }
 
     fn fast() -> Hooks {
@@ -653,7 +670,7 @@ mod tests {
 
     #[test]
     fn metrics_say_which_rule_the_split_followed() {
-        let w = CgroupFair { case: "equal", weights: (100, 100), threads: (4, 12), cpus: 4 };
+        let w = CgroupFair { case: "equal", weights: (100, 100), threads: (4, 12), cpus: 4, sched_diag: false };
         // Three seconds on four CPUs; the first group got a quarter.
         let m = Measured { cpu: (3_000_000_000, 9_000_000_000), work: 6000, window: Duration::from_secs(3) };
         let r = w.summarize(&m);
@@ -728,6 +745,25 @@ mod tests {
         }
     }
 
+    /// With scheduler statistics, where the machine lets the test
+    /// create groups: busy threads that never sleep, so what they have
+    /// is time on a CPU, time waiting for one and preemptions.
+    #[test]
+    fn scheduler_statistics_cover_every_thread() {
+        let _one = MOVES.lock().unwrap_or_else(|e| e.into_inner());
+        let w = CgroupFair { sched_diag: true, ..quick() };
+        assert_eq!(w.params()["sched_diag"], true);
+        assert!(quick().params().get("sched_diag").is_none());
+        let r = w.run_with(Duration::from_millis(200), &Hooks { no_cpu_controller: true, ..fast() });
+        if r.invalid_reason.is_some() {
+            return;
+        }
+        let c = &r.counters;
+        assert_eq!(c["sched_threads"], 4);
+        assert!(c["sched_run_ms"] > 0 && c["sched_runnable_ms"] >= c["sched_run_ms"], "{c:?}");
+        assert!(r.metrics.contains_key("sched_wait_pct"));
+    }
+
     /// A process that cannot be put back where it came from: the run
     /// says so and does not count, whatever it measured.
     #[test]
@@ -788,7 +824,7 @@ mod tests {
         // Sized for two CPUs under a quota, run on sixteen: four threads
         // with a CPU each. Both groups get half, as they would under a
         // scheduler that follows the weights, and it must not be scored.
-        let w = CgroupFair { case: "weighted", weights: (100, 300), threads: (2, 2), cpus: 2 };
+        let w = CgroupFair { case: "weighted", weights: (100, 300), threads: (2, 2), cpus: 2, sched_diag: false };
         let m = Measured { cpu: (2_000_000_000, 2_000_000_000), work: 4000, window: Duration::from_secs(1) };
         let r = w.summarize(&m);
         let why = r.invalid_reason.expect("invalid");

@@ -111,6 +111,8 @@ pub struct WakePingPong {
     /// Record the CPU of each reply and continuation (same-/cross-CPU
     /// split). Costs one `sched_getcpu` (a few ns) inside each round trip.
     pub cpu_diag: bool,
+    /// Read every worker's scheduler statistics.
+    pub sched_diag: bool,
 }
 
 impl Workload for WakePingPong {
@@ -129,11 +131,12 @@ impl Workload for WakePingPong {
     fn params(&self) -> serde_json::Value {
         // `cpu_diag` only appears when on, so a run without it compares
         // with results recorded before the option existed.
-        if self.cpu_diag {
+        let params = if self.cpu_diag {
             json!({ "pairs": self.pairs, "hogs": self.hogs, "cpu_diag": true })
         } else {
             json!({ "pairs": self.pairs, "hogs": self.hogs })
-        }
+        };
+        crate::schedstat::mark(params, self.sched_diag)
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -172,7 +175,8 @@ impl WakePingPong {
             None
         };
 
-        let mut crew = Crew::new(fault, self.cpu_diag);
+        let mut crew = Crew::new(fault, self.cpu_diag, self.sched_diag);
+        let shared = Arc::clone(&crew.shared);
         for i in 0..self.pairs {
             if let Err(e) = crew.spawn_pair(i, duration) {
                 // `crew` and `hogs` are dropped on return: everything stops.
@@ -199,7 +203,11 @@ impl WakePingPong {
         let outcome = crew.finish();
         drop(hogs);
         match outcome {
-            Ok((pings, pongs)) => summarize(&pings, &pongs, start, hog, self.cpu_diag),
+            Ok((pings, pongs)) => {
+                let mut r = summarize(&pings, &pongs, start, hog, self.cpu_diag);
+                shared.stats.record(&mut r);
+                r
+            }
             Err(why) => invalid(why),
         }
     }
@@ -313,6 +321,8 @@ struct Shared {
     start: OnceLock<Instant>,
     tokens: Mutex<Vec<Arc<PairLine>>>,
     cpu_diag: bool,
+    /// What the kernel counted for each worker, if asked for.
+    stats: crate::schedstat::Collector,
     error: Mutex<Option<String>>,
     fault: Fault,
 }
@@ -366,7 +376,7 @@ struct Crew {
 }
 
 impl Crew {
-    fn new(fault: Fault, cpu_diag: bool) -> Self {
+    fn new(fault: Fault, cpu_diag: bool, sched_diag: bool) -> Self {
         Crew {
             shared: Arc::new(Shared {
                 gate: AtomicU32::new(0),
@@ -375,6 +385,7 @@ impl Crew {
                 start: OnceLock::new(),
                 tokens: Mutex::new(Vec::new()),
                 cpu_diag,
+                stats: crate::schedstat::Collector::new(sched_diag),
                 error: Mutex::new(None),
                 fault,
             }),
@@ -507,6 +518,9 @@ fn ping(line: &PairLine, sh: &Shared, duration: Duration) -> PingOut {
     let token = &line.token;
     let mut out = PingOut::default();
     let mut prev_cpu: Option<u32> = None;
+    // Before it reports ready, so that nothing is read once the gate is
+    // open: only the wait at the gate comes on top of the work.
+    let _watching = sh.stats.watch();
     if ready_then_wait_gate(sh) {
         let start = *sh.start.get().expect("start is set before the gate opens");
         let deadline = start + duration;
@@ -601,6 +615,7 @@ fn ping(line: &PairLine, sh: &Shared, duration: Duration) -> PingOut {
 fn pong(line: &PairLine, sh: &Shared) -> Counts {
     let token = &line.token;
     let mut c = Counts::default();
+    let _watching = sh.stats.watch();
     if !ready_then_wait_gate(sh) {
         return c;
     }
@@ -810,10 +825,33 @@ mod tests {
         rx.recv_timeout(limit).expect("workload did not finish in time (hang)")
     }
 
+    /// With scheduler statistics: both threads of every pair, read
+    /// before they report ready and after their last round trip.
+    #[test]
+    fn scheduler_statistics_cover_both_sides() {
+        let w = WakePingPong { pairs: 2, hogs: 0, cpu_diag: true, sched_diag: true };
+        assert_eq!(w.params(), json!({ "pairs": 2, "hogs": 0, "cpu_diag": true, "sched_diag": true }));
+        let r = run_bounded(w, Duration::from_millis(200), Fault::None, Duration::from_secs(20));
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        let c = &r.counters;
+        assert_eq!(c["sched_threads"], 4);
+        assert!(c["sched_run_ms"] > 0 && c["sched_switches"] > 0, "{c:?}");
+        // Threads that hand a token back and forth give the CPU up of
+        // their own accord. The two counts are not compared: a
+        // FUTEX_WAIT that reports sleeping is not necessarily a switch,
+        // and switches have other causes than these waits.
+        assert!(c["sched_voluntary"] > 0, "{c:?}");
+        // Without the option the parameters are what they were.
+        let w = WakePingPong { pairs: 1, hogs: 0, cpu_diag: true, sched_diag: false };
+        assert_eq!(w.params(), json!({ "pairs": 1, "hogs": 0, "cpu_diag": true }));
+        let r = run_bounded(w, Duration::from_millis(50), Fault::None, Duration::from_secs(20));
+        assert!(!r.counters.keys().chain(r.metrics.keys()).any(|k| k.starts_with("sched_")));
+    }
+
     #[test]
     fn populations_partition_round_trips() {
         let r = run_bounded(
-            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true },
+            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true, sched_diag: false },
             Duration::from_millis(150),
             Fault::None,
             Duration::from_secs(10),
@@ -868,7 +906,7 @@ mod tests {
 
     #[test]
     fn cpu_diagnostics_can_be_turned_off() {
-        let w = WakePingPong { pairs: 1, hogs: 0, cpu_diag: false };
+        let w = WakePingPong { pairs: 1, hogs: 0, cpu_diag: false, sched_diag: false };
         assert_eq!(w.params(), json!({ "pairs": 1, "hogs": 0 }), "same params as results without the option");
         let r = run_bounded(w, Duration::from_millis(100), Fault::None, Duration::from_secs(10));
         assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
@@ -887,7 +925,7 @@ mod tests {
     #[test]
     fn hog_rate_is_reported() {
         let r = run_bounded(
-            WakePingPong { pairs: 1, hogs: 1, cpu_diag: true },
+            WakePingPong { pairs: 1, hogs: 1, cpu_diag: true, sched_diag: false },
             Duration::from_millis(100),
             Fault::None,
             Duration::from_secs(10),
@@ -934,7 +972,7 @@ mod tests {
     fn assert_fault_aborts_promptly(fault: Fault, needle: &str) {
         // 60 s requested: only the abort path can finish within the limit.
         let r = run_bounded(
-            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true },
+            WakePingPong { pairs: 2, hogs: 0, cpu_diag: true, sched_diag: false },
             Duration::from_secs(60),
             fault,
             Duration::from_secs(10),
@@ -962,7 +1000,7 @@ mod tests {
     fn crew_drop_without_start_does_not_hang() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut crew = Crew::new(Fault::None, true);
+            let mut crew = Crew::new(Fault::None, true, false);
             crew.spawn_pair(0, Duration::from_secs(60)).unwrap();
             crew.spawn_pair(1, Duration::from_secs(60)).unwrap();
             drop(crew); // gate never opened: Drop must release and join.

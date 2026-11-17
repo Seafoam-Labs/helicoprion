@@ -9,6 +9,7 @@ pub mod hog;
 pub mod periodic;
 pub mod runner;
 pub mod samples;
+mod schedstat;
 pub mod wake_pingpong;
 
 use std::time::Duration;
@@ -38,18 +39,20 @@ pub trait Workload: Send + Sync {
 pub struct SuiteOpts {
     /// Same-/cross-CPU diagnostics in wake-pingpong.
     pub cpu_diag: bool,
+    /// Every worker thread's scheduler statistics, in all workloads.
+    pub sched_diag: bool,
 }
 
 impl Default for SuiteOpts {
     fn default() -> Self {
-        SuiteOpts { cpu_diag: true }
+        SuiteOpts { cpu_diag: true, sched_diag: false }
     }
 }
 
 pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Workload>>> {
     let pairs = (cpus / 2).max(1);
     let pingpong = |hogs: usize| -> Box<dyn Workload> {
-        Box::new(wake_pingpong::WakePingPong { pairs, hogs, cpu_diag: opts.cpu_diag })
+        Box::new(wake_pingpong::WakePingPong { pairs, hogs, cpu_diag: opts.cpu_diag, sched_diag: opts.sched_diag })
     };
     // A few periodic tasks whatever the machine: the question is how late
     // each wakes, not how many fit. 1 ms and 100 µs: a tenth of a CPU per
@@ -61,6 +64,7 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
             period: std::time::Duration::from_millis(1),
             work: std::time::Duration::from_micros(100),
             hogs,
+            sched_diag: opts.sched_diag,
         })
     };
     // A group woken at once, in three sizes relative to the machine: it
@@ -73,6 +77,7 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
             tasks: tasks.max(1),
             period: std::time::Duration::from_millis(2),
             work: std::time::Duration::from_micros(200),
+            sched_diag: opts.sched_diag,
         })
     };
     let bursts = || vec![burst("half", cpus / 2), burst("full", cpus), burst("double", cpus * 2)];
@@ -81,10 +86,22 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
     // times the weight: a scheduler that treats every thread alike fails
     // the first, one that knows groups and ignores weights the second.
     let cgroups = || -> Vec<Box<dyn Workload>> {
-        let n = cpus.max(1);
+        let (n, sched_diag) = (cpus.max(1), opts.sched_diag);
         vec![
-            Box::new(cgroup::CgroupFair { case: "equal", weights: (100, 100), threads: (n, 3 * n), cpus: n }),
-            Box::new(cgroup::CgroupFair { case: "weighted", weights: (100, 300), threads: (n, n), cpus: n }),
+            Box::new(cgroup::CgroupFair {
+                case: "equal",
+                weights: (100, 100),
+                threads: (n, 3 * n),
+                cpus: n,
+                sched_diag,
+            }),
+            Box::new(cgroup::CgroupFair {
+                case: "weighted",
+                weights: (100, 300),
+                threads: (n, n),
+                cpus: n,
+                sched_diag,
+            }),
         ]
     };
     match name {
@@ -140,6 +157,14 @@ mod tests {
             assert!(super::suite(name, 2, SuiteOpts::default()).is_some(), "{name}");
         }
         assert!(super::suite("nope", 2, SuiteOpts::default()).is_none());
+        // Scheduler statistics are off unless asked for, and a workload
+        // that reads them says so in its parameters, all of them alike.
+        for (on, marked) in [(false, None), (true, Some(true))] {
+            let opts = SuiteOpts { sched_diag: on, ..SuiteOpts::default() };
+            for w in super::suite("all", 4, opts).unwrap() {
+                assert_eq!(w.params().get("sched_diag").and_then(|v| v.as_bool()), marked, "{}", w.name());
+            }
+        }
         // The loaded variant keeps every CPU busy; the tasks stay few.
         let w = super::suite("periodic", 16, SuiteOpts::default()).unwrap();
         assert_eq!(w[1].params()["hogs"], 16);

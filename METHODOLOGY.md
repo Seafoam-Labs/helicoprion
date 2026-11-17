@@ -376,6 +376,78 @@ have is invalid. Both reject some set-ups that could be measured with more
 work, which is better than reporting that a scheduler ignores weights it
 follows.
 
+### Scheduler statistics (`--sched-diag`)
+
+The workloads measure what a task experiences, a latency or a share. With
+`--sched-diag`, `run` and `matrix` also record what the kernel counted for
+every worker thread while it worked, which says something about how the
+scheduler got there. A long tail with tasks that waited on a run queue is
+another thing than one with tasks that were preempted in the middle of their
+work, or one with tasks that were moved from CPU to CPU.
+
+Each worker thread reads its own counters from `/proc/thread-self` when its
+work begins and when it ends, and the differences are summed over the
+threads. No tracing and no rights are needed.
+
+| Source | What it gives |
+|---|---|
+| `schedstat` | Time on a CPU, time runnable and waiting for one, and the number of times the thread was given a CPU |
+| `status` | Voluntary switches, where the thread slept or yielded, and involuntary ones, where the CPU was taken from it |
+| `sched` | `se.nr_migrations`, where the kernel provides the file |
+
+From these come five metrics, all informational:
+
+| Metric | Meaning |
+|---|---|
+| `sched_wait_pct` | Share of the time the threads wanted a CPU that they spent waiting for one |
+| `sched_slice_us` | Average time on a CPU per stint |
+| `sched_preempt_pct` | Share of the switches that took the CPU away from a thread |
+| `sched_switches_per_s` | Switches per second, all threads together |
+| `sched_migrations_per_s` | Changes of CPU per second, all threads together |
+
+The sums behind them are in the counters `sched_threads`, `sched_run_ms`,
+`sched_wait_ms`, `sched_runnable_ms`, `sched_slices`, `sched_switches`,
+`sched_voluntary`, `sched_involuntary` and `sched_migrations`. Migrations
+are only reported when every thread has them. If a thread cannot read its
+`schedstat` or `status`, the run is invalid, since the statistics were asked
+for. So is a run after which no thread has any time on a CPU in its
+`schedstat`: a kernel built without scheduler statistics
+(`CONFIG_SCHED_INFO`) still has the file, and it holds zeros.
+
+None of this is scored. The counters describe a mechanism, and no mechanism
+is better as such: fewer migrations are good where they keep caches warm and
+bad where they leave a task waiting behind another one. They are there to
+explain a difference the scored metrics show, not to make one.
+
+The readings are taken by the threads that are measured, at these points:
+
+| Workload | Threads | From | To |
+|---|---|---|---|
+| `wake-pingpong` | Both threads of every pair | Before the thread reports ready | After its last round trip |
+| `periodic-wake` | The tasks | After the start is fixed, before the first release | After the last period |
+| `wake-burst` | The tasks, not the waker | Before the task reports ready | When the task leaves |
+| `cgroup-fair` | The threads of both groups | When the threads start working | When they stop |
+
+Nothing is read inside what is timed, but the readings are not free and
+they add a little that is not the workload: the wait at the start gate in
+`wake-pingpong`, the half second before the window in `cgroup-fair`. The
+option is therefore off by default, and a run with it has the workload
+parameter `sched_diag`, so that it is never compared with a run without it.
+The CPU hogs of the loaded variants are not included.
+
+A `FUTEX_WAIT` that reports sleeping does not necessarily imply a context
+switch: when the wake-up comes after the thread was queued and before it
+left its CPU, the wait returns the same way and the thread never stopped
+running. In `wake-pingpong` the voluntary switches can therefore be fewer
+than the waits that slept. Their difference is not a count of hand-offs that
+needed no scheduling, though. The two counters do not correspond one to one:
+the statistics cover both threads of a pair and the wait at the start gate,
+and a thread gives the CPU up for other reasons than these waits.
+
+The statistics are sums over a whole run. A high `sched_wait_pct` next to a
+long tail fits tasks waiting on a run queue, and does not show that the
+slowest wake-ups of the run were the ones that waited.
+
 ## Reading the results
 
 ### Change against the baseline

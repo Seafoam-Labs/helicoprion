@@ -105,6 +105,7 @@ use crate::Workload;
 use crate::clock::{Alive, PreciseTimers, TIMER_SLACK_NS, burn, now_ns, ns, sleep_until};
 use crate::futex::{self, Wait};
 use crate::samples::{min_samples_for, population};
+use crate::schedstat::{self, Collector};
 
 pub const POP_START: &str = "start";
 pub const POP_ALL_RUNNING: &str = "all_running";
@@ -154,6 +155,8 @@ pub struct WakeBurst {
     pub period: Duration,
     /// CPU time of work per task and burst.
     pub work: Duration,
+    /// Read every task's scheduler statistics.
+    pub sched_diag: bool,
 }
 
 impl Workload for WakeBurst {
@@ -172,12 +175,13 @@ impl Workload for WakeBurst {
     }
 
     fn params(&self) -> serde_json::Value {
-        json!({
+        let params = json!({
             "tasks": self.tasks,
             "period_us": self.period.as_micros() as u64,
             "work_us": self.work.as_micros() as u64,
             "timer_slack_ns": TIMER_SLACK_NS,
-        })
+        });
+        schedstat::mark(params, self.sched_diag)
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -250,12 +254,16 @@ impl WakeBurst {
             released: (0..bursts + 1).map(|_| AtomicU64::new(0)).collect(),
             ready: AtomicUsize::new(0),
         });
+        let stats = Arc::new(Collector::new(self.sched_diag));
         let mut handles = Vec::with_capacity(self.tasks);
         let mut failed: Option<String> = None;
         for i in 0..self.tasks {
-            let (sh, hooks) = (Arc::clone(&shared), hooks.clone());
+            let (sh, hooks, stats) = (Arc::clone(&shared), hooks.clone(), Arc::clone(&stats));
             let body = move || -> Result<TaskOut, String> {
                 let _alive = Alive::new(&hooks.alive);
+                // Before it reports ready: nothing but the sleep until
+                // the first burst lies between this and its work.
+                let _watching = stats.watch();
                 if hooks.stall_task != Some(i) {
                     sh.ready.fetch_add(1, Ordering::Release);
                 }
@@ -309,7 +317,11 @@ impl WakeBurst {
         }
         match failed {
             Some(why) => invalid(why),
-            None => summarize(&outs, &waker, bursts as u64, period),
+            None => {
+                let mut r = summarize(&outs, &waker, bursts as u64, period);
+                stats.record(&mut r);
+                r
+            }
         }
     }
 }
@@ -543,7 +555,13 @@ mod tests {
     use helicoprion_core::Better;
 
     fn quick(tasks: usize) -> WakeBurst {
-        WakeBurst { size: "full", tasks, period: Duration::from_millis(2), work: Duration::from_micros(50) }
+        WakeBurst {
+            size: "full",
+            tasks,
+            period: Duration::from_millis(2),
+            work: Duration::from_micros(50),
+            sched_diag: false,
+        }
     }
 
     /// A run for a test of something else than the waker's lateness: on
@@ -628,6 +646,23 @@ mod tests {
         assert_eq!((r.counters["bursts_planned"], r.counters["bursts"]), (1, 1));
     }
 
+    /// With scheduler statistics: the tasks' counters, not the waker's.
+    #[test]
+    fn scheduler_statistics_cover_every_task() {
+        let w = WakeBurst { sched_diag: true, ..quick(2) };
+        assert_eq!(w.params()["sched_diag"], true);
+        assert!(quick(2).params().get("sched_diag").is_none());
+        let r = run(&w, Duration::from_millis(200), &Hooks::default());
+        let c = &r.counters;
+        assert_eq!(c["sched_threads"], 2);
+        // The tasks sleep between bursts of their own accord, nearly
+        // once per wake-up (a wait can end before the task left its CPU).
+        assert!(c["sched_voluntary"] >= c["wakeups_ran"] / 2, "{c:?}");
+        assert!(r.metrics.contains_key("sched_wait_pct"));
+        let r = run(&quick(2), Duration::from_millis(50), &Hooks::default());
+        assert!(!r.counters.keys().chain(r.metrics.keys()).any(|k| k.starts_with("sched_")));
+    }
+
     /// The waker's thread gets the timer slack it came with back.
     #[test]
     fn the_calling_thread_keeps_its_timer_slack() {
@@ -651,7 +686,13 @@ mod tests {
         // on one, four more are released. `run` refuses these parameters;
         // the mechanism is what is tested. The bounds leave room for a
         // waker that is late itself on a busy test machine.
-        let w = WakeBurst { size: "full", tasks: 1, period: Duration::from_millis(2), work: Duration::from_millis(9) };
+        let w = WakeBurst {
+            size: "full",
+            tasks: 1,
+            period: Duration::from_millis(2),
+            work: Duration::from_millis(9),
+            sched_diag: false,
+        };
         let r = run(&w, Duration::from_millis(150), &Hooks::default());
         let c = &r.counters;
         assert!(c["wakeups_ran"] >= 3, "{c:?}");
@@ -668,7 +709,13 @@ mod tests {
     /// sleep with nobody left to wake it.
     #[test]
     fn a_task_at_work_when_the_run_ends_leaves() {
-        let w = WakeBurst { size: "full", tasks: 1, period: Duration::from_millis(2), work: Duration::from_millis(40) };
+        let w = WakeBurst {
+            size: "full",
+            tasks: 1,
+            period: Duration::from_millis(2),
+            work: Duration::from_millis(40),
+            sched_diag: false,
+        };
         let hooks = Hooks::default();
         let r = run(&w, Duration::from_millis(6), &hooks);
         assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);

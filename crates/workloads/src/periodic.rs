@@ -70,6 +70,7 @@ use crate::Workload;
 use crate::clock::{Alive, TIMER_SLACK_NS, burn, now_ns, ns, set_timer_slack, sleep_until};
 use crate::hog::Hogs;
 use crate::samples::population;
+use crate::schedstat::{self, Collector};
 
 pub const POP_WAKE: &str = "wake";
 pub const POP_RESPONSE: &str = "response";
@@ -105,6 +106,8 @@ pub struct PeriodicWake {
     /// CPU time of work per period.
     pub work: Duration,
     pub hogs: usize,
+    /// Read every task's scheduler statistics.
+    pub sched_diag: bool,
 }
 
 impl Workload for PeriodicWake {
@@ -123,13 +126,14 @@ impl Workload for PeriodicWake {
     }
 
     fn params(&self) -> serde_json::Value {
-        json!({
+        let params = json!({
             "tasks": self.tasks,
             "period_us": self.period.as_micros() as u64,
             "work_us": self.work.as_micros() as u64,
             "hogs": self.hogs,
             "timer_slack_ns": TIMER_SLACK_NS,
-        })
+        });
+        schedstat::mark(params, self.sched_diag)
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -164,6 +168,7 @@ impl PeriodicWake {
             None
         };
 
+        let stats = Arc::new(Collector::new(self.sched_diag));
         let start = Arc::new(AtomicU64::new(NOT_STARTED));
         let ready = Arc::new(AtomicUsize::new(0));
         let (period, work, span) = (ns(self.period), ns(self.work), ns(duration));
@@ -171,6 +176,7 @@ impl PeriodicWake {
         let mut failed: Option<String> = None;
         for i in 0..self.tasks {
             let (task_start, task_ready, hooks) = (Arc::clone(&start), Arc::clone(&ready), hooks.clone());
+            let stats = Arc::clone(&stats);
             // Phases spread over one period.
             let phase = period * i as u64 / self.tasks as u64;
             let body = move || -> Result<TaskOut, String> {
@@ -189,6 +195,9 @@ impl PeriodicWake {
                 if hooks.panic_task == Some(i) {
                     panic!("periodic task {i} failing on purpose");
                 }
+                // From here to the end of its last period; the first
+                // release is still `LEAD` away.
+                let _watching = stats.watch();
                 Ok(task(t0 + phase, t0 + span, period, work))
             };
             let spawned = if hooks.fail_spawn_at == Some(i) {
@@ -246,7 +255,11 @@ impl PeriodicWake {
         drop(hogs);
         match failed {
             Some(why) => invalid(why),
-            None => summarize(&outs, duration, began, hog),
+            None => {
+                let mut r = summarize(&outs, duration, began, hog);
+                stats.record(&mut r);
+                r
+            }
         }
     }
 }
@@ -360,7 +373,13 @@ mod tests {
     use helicoprion_core::Better;
 
     fn quick(hogs: usize) -> PeriodicWake {
-        PeriodicWake { tasks: 2, period: Duration::from_millis(1), work: Duration::from_micros(50), hogs }
+        PeriodicWake {
+            tasks: 2,
+            period: Duration::from_millis(1),
+            work: Duration::from_micros(50),
+            hogs,
+            sched_diag: false,
+        }
     }
 
     #[test]
@@ -428,6 +447,30 @@ mod tests {
         assert!(window.start_s <= 0.0 && window.end_s >= 0.15, "{window:?}");
         // Still the same number of periods due as without load.
         assert!((298..=300).contains(&r.counters["periods_due"]), "{:?}", r.counters);
+    }
+
+    /// With scheduler statistics: one set of counters per task, from its
+    /// first release to its last period, and a parameter that keeps such
+    /// a run apart from one without.
+    #[test]
+    fn scheduler_statistics_cover_every_task() {
+        let w = PeriodicWake { sched_diag: true, ..quick(0) };
+        assert_eq!(w.params()["sched_diag"], true);
+        assert!(quick(0).params().get("sched_diag").is_none());
+        let r = w.run(Duration::from_millis(200));
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        let c = &r.counters;
+        assert_eq!(c["sched_threads"], 2);
+        // A task sleeps once per period: at least that many times it
+        // gave the CPU up, and about as often it was given one.
+        assert!(c["sched_voluntary"] >= c["periods_ran"] - 2, "{c:?}");
+        assert!(c["sched_slices"] >= c["periods_ran"] - 2, "{c:?}");
+        // 50 µs of work per period, 400 periods: some 20 ms on a CPU.
+        assert!((10..200).contains(&c["sched_run_ms"]), "{c:?}");
+        assert!(r.metrics.contains_key("sched_wait_pct") && r.metrics.contains_key("sched_preempt_pct"));
+        // Without the option nothing of it is there.
+        let r = quick(0).run(Duration::from_millis(50));
+        assert!(!r.counters.keys().chain(r.metrics.keys()).any(|k| k.starts_with("sched_")));
     }
 
     #[test]

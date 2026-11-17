@@ -92,6 +92,12 @@ half as many threads as CPUs, as many and twice as many, and the control
 groups once with unequal thread counts and once with unequal weights.
 `cgroups` needs root and cgroup v2 with the `cpu` controller.
 
+`--sched-diag` also records what the kernel counted for the worker threads:
+how long they waited for a CPU, how often they were preempted and how often
+they changed CPU. These numbers are not scored. They help explain a
+difference, and a session with them is only compared with other sessions
+with them.
+
 ### Compare existing result files
 
 `compare` reads the result files of earlier `run` or `matrix` sessions,
