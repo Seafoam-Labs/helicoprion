@@ -2510,6 +2510,60 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(what.contains(" It also runs two control groups of busy tasks"), "{what}");
     }
 
+    /// A session run with `--sched-diag`: the plain view says how the
+    /// scheduler got to its numbers, without scoring any of it, and the
+    /// diagnostics show the shares.
+    #[test]
+    fn scheduler_statistics_are_shown_and_not_scored() {
+        let session = |diag: bool| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "wake-burst/double".into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    r.metrics.clear();
+                    r.metrics.insert("start_p50".into(), Metric::lower(if is_cand { 20.0 } else { 40.0 }, "us"));
+                    if diag {
+                        let (wait, preempt, moves) = if is_cand { (56.4, 0.1, 281.0) } else { (31.8, 12.0, 1500.0) };
+                        r.metrics.insert("sched_wait_pct".into(), Metric::info(wait, "%"));
+                        r.metrics.insert("sched_preempt_pct".into(), Metric::info(preempt, "%"));
+                        r.metrics.insert("sched_migrations_per_s".into(), Metric::info(moves, "1/s"));
+                        for (name, n) in [
+                            ("sched_wait_ms", if is_cand { 564 } else { 318 }),
+                            ("sched_runnable_ms", 1000),
+                            ("sched_involuntary", if is_cand { 1 } else { 120 }),
+                            ("sched_switches", 1000),
+                        ] {
+                            r.counters.insert(name.into(), n);
+                        }
+                    }
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let c = session(true);
+        let text = crate::simple::text(&c);
+        assert!(
+            text.contains(
+                "• How the scheduler got there (observed, not scored; base in brackets): the tasks waited for a CPU \
+                 56% of the time they wanted one (32%); 0.1% of their switches took the CPU away from them (12%); they \
+                 changed CPU 281 times a second (1500)\n"
+            ),
+            "{text}"
+        );
+        // One measurement is scored, as without the statistics.
+        assert!(text.contains("• Of 1 measurements, 1 clearly better and 0 clearly worse"), "{text}");
+        assert_eq!(c.summary()[0].verdict(), Verdict::Better);
+        let html = crate::html::report(&c);
+        let share = |label: &str, base: &str, cand: &str| {
+            format!("<td><strong>{label}</strong></td><td><strong>{base}</strong></td><td><strong>{cand}</strong></td>")
+        };
+        assert!(html.contains(&share("time the threads wanted a CPU and waited for one", "31.8%", "56.4%")), "{html}");
+        assert!(html.contains(&share("switches that took the CPU away from a thread", "12.0%", "0.1%")), "{html}");
+        assert!(html.contains("<code>sched_runnable_ms</code>"));
+        // Without them the line is not there.
+        assert!(!crate::simple::text(&session(false)).contains("How the scheduler got there"));
+    }
+
     /// The summary's largest changes read largest first: multiples before
     /// percentages, each by the number shown.
     #[test]

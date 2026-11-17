@@ -304,6 +304,36 @@ fn split(c: &Comparison, workload: &str, i: usize) -> Option<String> {
     Some(line)
 }
 
+/// What the kernel counted for the worker threads, where the session
+/// was run with `--sched-diag`: how the scheduler got to the numbers
+/// above. Observed, not scored, and each figure with the baseline's in
+/// brackets, since on its own none of them is good or bad.
+fn mechanism(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let both = |metric: &str| {
+        let row = c.rows.iter().find(|r| r.workload == workload && r.metric == metric)?;
+        medians(row, c.baseline, i)
+    };
+    let pct = |v: f64| if v < 10.0 { format!("{v:.1}%") } else { format!("{v:.0}%") };
+    let parts: Vec<String> = [
+        both("sched_wait_pct")
+            .map(|(b, v)| format!("the tasks waited for a CPU {} of the time they wanted one ({})", pct(v), pct(b))),
+        both("sched_preempt_pct")
+            .map(|(b, v)| format!("{} of their switches took the CPU away from them ({})", pct(v), pct(b))),
+        both("sched_migrations_per_s")
+            .map(|(b, v)| format!("they changed CPU {} times a second ({})", fmt_value(v), fmt_value(b))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| {
+        format!(
+            "How the scheduler got there (observed, not scored; {} in brackets): {}",
+            c.series[c.baseline].label,
+            parts.join("; ")
+        )
+    })
+}
+
 /// Why a change is not scored, for a reader who sees "1434 → 42.2 µs" next
 /// to "no reliable difference" and wonders whether the benchmark is broken.
 /// The reason is `Comparison::unclear_reason`'s, the one the scoring
@@ -397,6 +427,8 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                     ("closer", "further"),
                 ),
                 point(c, w, i, "cpu_used_pct", "CPU time used", ("more", "less")),
+                // Any workload, where it was recorded.
+                mechanism(c, w, i),
                 background(c, w, i),
             ]
             .into_iter()
