@@ -73,11 +73,16 @@
 //! of the clock decides whether a release is still due, is the time the
 //! tasks measure from, and gives how late the release was
 //! (`release_late`, informational). From that reading to the return of
-//! the wake call is `wake_call`, informational as well: the waker can
-//! lose its CPU in between, and that time is in every `start` of the
-//! burst without being the tasks' wake-up. A release
-//! that is already a whole period past when the waker gets to it is left
-//! out instead of following the next one at once (`bursts_skipped`).
+//! the wake call is `wake_call`, informational as well. The waker can
+//! lose its CPU in that interval: before the tasks are woken, and the
+//! time is in every `start` of the burst without being the tasks'
+//! wake-up; or after, and only `wake_call` is long. A large value says
+//! that the waker's side may have added to the start delays, not which
+//! of them.
+//!
+//! A release that is already a whole period past when the waker gets to
+//! it is left out instead of following the next one at once
+//! (`bursts_skipped`).
 //! Every scheduler is meant to get the same bursts, so a run in which
 //! more than `MAX_SKIPPED_PCT` of them were left out is invalid: a
 //! scheduler must not look better for having been handed less work.
