@@ -4,6 +4,7 @@
 pub mod compare;
 pub mod conditions;
 pub mod html;
+pub mod sessions;
 pub mod simple;
 pub mod stats;
 pub mod svg;
