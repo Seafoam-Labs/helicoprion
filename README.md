@@ -8,18 +8,123 @@
   A small, scheduler-focused CPU benchmark for Linux.
 </p>
 
-It detects the running scheduler (EEVDF, EEVDF+BORE, or a sched-ext BPF
-scheduler), runs built-in workloads, and compares results in the terminal and
-in a self-contained HTML report with charts.
+helicoprion detects the running scheduler, runs its built-in workloads and
+compares the results in the terminal and in a self-contained HTML report with
+charts. It recognises EEVDF, EEVDF with BORE and sched-ext BPF schedulers, and
+it needs no external benchmark programs or downloaded assets.
 
-No external benchmark programs or downloaded assets are needed. A release
-build produces one dynamically linked (glibc) binary; a static build is also
-possible (see below).
+How the comparisons are run and scored is explained in
+[METHODOLOGY.md](METHODOLOGY.md).
 
-For the experimental design, scheduler switching, workload definitions,
-statistics, and limitations, see [METHODOLOGY.md](METHODOLOGY.md).
+## Install
 
-## Layout
+### From crates.io
+
+```sh
+cargo install helicoprion
+```
+
+### From a package
+
+Packages for Arch, Fedora and openSUSE are in [packages/](packages).
+
+### From source
+
+```sh
+cargo build --release
+```
+
+The binary is `target/release/helicoprion` and links dynamically against
+glibc. A static binary can be built for musl instead, although CI does not
+test this yet:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+## Quick start
+
+### Check the current scheduler
+
+`info` shows the kernel, the CPU and the scheduler in charge. `run` measures
+that scheduler and writes the results to a file.
+
+```sh
+helicoprion info
+helicoprion run -o current.json
+```
+
+### Compare schedulers
+
+Use `matrix` to compare schedulers. It switches between them through scxcli
+and `scx.service`, visits each of them once per round in alternating order,
+and restores the previous scheduler when it is done. Run it as root,
+otherwise polkit asks for authorization at every switch.
+
+The easiest way is to compare the installed schedulers that scxcli
+recommends against the kernel's own scheduler:
+
+```sh
+sudo helicoprion matrix --recommended --simple
+```
+
+To pick the schedulers yourself, name each of them with `--sched`. The first
+one is the baseline.
+
+```sh
+sudo helicoprion matrix --sched default --sched scx_lavd --sched scx_cosmos \
+    --rounds 5 -o comparison/
+```
+
+Both run five rounds by default, and `--recommended` cannot be combined with
+`--sched`. `--simple` adds a summary in plain words, and the HTML report in
+the output directory still has all the data and charts.
+
+### Compare existing result files
+
+`compare` reads the result files of earlier `run` or `matrix` sessions,
+prints a table in the terminal and writes an HTML report that needs no
+JavaScript. `--svg-dir` also saves every chart as an SVG file.
+
+```sh
+helicoprion compare default.json lavd.json -o report.html --svg-dir charts/
+```
+
+Separate `run` sessions can drift apart, for example as the machine warms up,
+so prefer `matrix` when the comparison has to be fair.
+
+## Result format
+
+Each `run` writes one JSON result file, and `matrix` writes one per
+scheduler. The current format is schema 4, and `compare` also reads schema 3.
+The schema number goes up with every incompatible change.
+
+A file records the tool version, the label, the system, the expected
+scheduler, whether a scheduler restart can be detected
+(`restart_detectable`), the design of the `matrix` session if there is one,
+and the parameters and runs of each workload. Each run stores:
+
+- `sched_before` and `sched_after`, the scheduler readings used to check that
+  the run is valid.
+- `metrics`, each with its value, its unit and which direction is better.
+  These are what `compare` compares.
+- `visit` and `round`, the scheduler visit and the round the run belongs to
+  in a `matrix` session.
+- `counters`, diagnostics that are not compared.
+- `windows`, the real start and end of each measurement, relative to the
+  common start.
+- `latency_histograms`, the full latency distribution of each population.
+  Buckets are exact below 64 ns and at most 1.6% of their value wide above
+  that, and only the filled ones are stored, as `[lower, upper, count]` with
+  inclusive bounds. Raw samples are not kept.
+- `quantile_curves`, the quantiles of each population derived from its
+  histogram, when it has enough samples. The latency quantile charts plot
+  these.
+
+The full definition is in `crates/core/src/result.rs`.
+
+## Project layout
 
 ```
 crates/core       scheduler detection, system info, result types
@@ -28,94 +133,8 @@ crates/report     statistics, SVG charts, HTML report
 crates/cli        the helicoprion binary
 ```
 
-Adding a workload: implement `helicoprion_workloads::Workload` and register it
-in `suite()`.
-
-## Install
-
-From crates.io:
-
-```sh
-cargo install helicoprion
-```
-
-Packages for Arch, Fedora and openSUSE are in [packages/](packages).
-
-## Quick start
-
-Or build the binary from a checkout, and inspect the active scheduler:
-
-```sh
-cargo build --release
-B=target/release/helicoprion
-$B info
-$B run -o current.json
-```
-
-For a scheduler comparison, **prefer `matrix`**. It switches schedulers through
-`scxcli`/`scx.service`, interleaves visits across rounds, and attempts to
-restore the previous scheduler and service state afterward. Run it as root
-because switching schedulers otherwise prompts for polkit authorization.
-
-```sh
-# Installed schedulers from the scx recommended catalog, plus kernel default:
-sudo "$B" matrix --recommended --simple
-
-# Or choose the candidates explicitly (first scheduler = baseline):
-sudo "$B" matrix --sched default --sched scx_lavd --sched scx_cosmos \
-    --rounds 5 -o comparison/
-```
-
-`--recommended` uses installed entries from `scxcli list recommended` and
-runs five rounds by default. It cannot be combined with `--sched`.
-`--simple` adds a plain-language summary with reasons for inconclusive
-results; the HTML report still contains the complete data and charts.
-
-To compare **existing** result files without running a new matrix session:
-
-```sh
-$B compare default.json lavd.json -o report.html --svg-dir charts/
-```
-
-`compare` prints a terminal table and writes a standalone, light/dark-aware
-HTML report (no JavaScript). `--svg-dir` also exports individual SVG charts.
-Separate `run` sessions may drift independently; use `matrix` for controlled
-comparisons. For exact switching, restore, pairing and scoring behavior, see
-[METHODOLOGY.md](METHODOLOGY.md).
-
-## Static build
-
-Not verified in CI yet:
-
-```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-file target/x86_64-unknown-linux-musl/release/helicoprion   # expect "statically linked"
-```
-
-## Result format
-
-Each `run` writes a JSON result file; `matrix` writes one JSON file per
-scheduler. The current format is `schema: 4` (`compare` also reads schema 3).
-Files record the tool version, label, system metadata, expected scheduler,
-`restart_detectable`, optional matrix `design`, and each workload's parameters
-and runs. Each run stores:
-
-* `sched_before` / `sched_after` — the readings the validity check used;
-* `metrics` — value, unit, and direction (compared across files);
-* `visit`, `round` — in a `matrix` session, which scheduler visit and round
-  the run belongs to;
-* `counters` — diagnostics (not compared);
-* `windows` — actual measurement boundaries relative to the common start;
-* `latency_histograms` — per population, the full distribution in a log-linear encoding
-  (exact below 64 ns, then 64 sub-buckets per power of two, so bucket width
-  ≤1.6% of the value; min/max exact), stored sparse as `[lower, upper,
-  count]` with inclusive bounds. Raw samples are not kept;
-* `quantile_curves` — per population, the quantile function derived from
-  that histogram (only where the sample count supports it). The "latency
-  quantiles" charts plot exactly this.
-
-See `crates/core/src/result.rs`. `schema` is bumped on incompatible changes.
+To add a workload, implement `helicoprion_workloads::Workload` and register
+it in `suite()`.
 
 ## License
 
