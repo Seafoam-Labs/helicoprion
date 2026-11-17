@@ -627,6 +627,7 @@ pub(crate) mod tests {
                         rounds,
                         schedulers: scheds.iter().map(|s| s.to_string()).collect(),
                         spec: (*spec).into(),
+                        twin_of: None,
                         session_id: Some(id.into()),
                         settle_s: Some(3.0),
                         order: Some("alternating".into()),

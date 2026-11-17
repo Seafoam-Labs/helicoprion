@@ -81,7 +81,10 @@ impl Spec {
 /// A spec with what it must look like once running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
+    /// The spec as given; a repeated one is numbered, `default #2`.
     pub label: String,
+    /// For a repeated spec: the label of its first arm.
+    pub twin_of: Option<String>,
     pub spec: Spec,
     /// Process name scxcli must report, or `default`.
     pub process: String,
@@ -102,20 +105,32 @@ fn str_list(v: Option<&Value>) -> Vec<String> {
 /// Resolve specs; profile ids are looked up in `scxcli list --json`, so the
 /// scheduler and options a profile stands for can be verified after the
 /// switch.
-pub fn resolve(labels: &[String], ctl: &dyn Control, timeout: Duration) -> Result<Vec<Target>> {
-    let specs: Vec<Spec> = labels.iter().map(|s| Spec::parse(s)).collect::<Result<_>>()?;
+///
+/// A spec given more than once is measured as that many arms: the same
+/// scheduler with the same options, visited separately in every round
+/// like any other entry. Such an A/A pair differs in nothing but when it
+/// ran, so what the report finds between its arms is what the method
+/// finds where there is nothing to find. Repeated arms are numbered
+/// (`default`, `default #2`) and name their first arm as their twin.
+pub fn resolve(given: &[String], ctl: &dyn Control, timeout: Duration) -> Result<Vec<Target>> {
+    let specs: Vec<Spec> = given.iter().map(|s| Spec::parse(s)).collect::<Result<_>>()?;
+    let mut labels: Vec<String> = Vec::with_capacity(given.len());
+    let mut twins: Vec<Option<String>> = Vec::with_capacity(given.len());
     for (i, s) in specs.iter().enumerate() {
-        if specs[..i].contains(s) {
-            bail!("{:?} is listed twice", labels[i]);
-        }
+        let earlier = specs[..i].iter().filter(|x| *x == s).count();
+        let first = specs[..i].iter().position(|x| x == s);
+        twins.push(first.map(|f| labels[f].clone()));
+        labels.push(if earlier == 0 { given[i].clone() } else { format!("{} #{}", given[i], earlier + 1) });
     }
+    let labels = &labels;
     let needs_catalog = specs.iter().any(|s| matches!(s, Spec::Start(id) if !id.starts_with("scx_")));
     let listing = if needs_catalog { Some(ctl.list(timeout)?) } else { None };
 
     labels
         .iter()
+        .zip(twins)
         .zip(specs)
-        .map(|(label, spec)| {
+        .map(|((label, twin_of), spec)| {
             let (process, args) = match &spec {
                 Spec::Default => ("default".to_string(), None),
                 Spec::Start(id) if id.starts_with("scx_") => (id.clone(), None),
@@ -137,9 +152,37 @@ pub fn resolve(labels: &[String], ctl: &dyn Control, timeout: Duration) -> Resul
                 }
                 Spec::Run { sched, args } => (basename(sched), Some(args.clone())),
             };
-            Ok(Target { label: label.clone(), spec, process, args })
+            Ok(Target { label: label.clone(), twin_of, spec, process, args })
         })
         .collect()
+}
+
+/// Rounds of a session when `--rounds` is not given.
+pub const DEFAULT_ROUNDS: u32 = 5;
+
+/// The number of rounds to run. With a repeated scheduler (A/A) it must
+/// be even, and is 6 unless given.
+///
+/// The order of visits is reversed from one round to the next, so over an
+/// even number of rounds each arm of a pair comes before the other as
+/// often as after it. Over an odd number one arm leads once more, and an
+/// effect of position (the later visit on a warmer machine, say) ends up
+/// in the estimate of the difference between the arms: with five rounds
+/// and a later visit that is 10% slower, the median of the per-round
+/// changes between two identical arms is −10%. The scoring cannot repair
+/// that; the design has to.
+pub fn rounds_for(requested: Option<u32>, targets: &[Target]) -> Result<u32> {
+    let repeated = targets.iter().any(|t| t.twin_of.is_some());
+    match requested {
+        Some(r) if repeated && !r.is_multiple_of(2) => bail!(
+            "--rounds {r}: with a repeated scheduler (A/A) the number of rounds must be even, so that each arm \
+             comes first in a round as often as second; use --rounds {}",
+            if r == 1 { "2".to_string() } else { format!("{} or {}", r - 1, r + 1) }
+        ),
+        Some(r) => Ok(r),
+        None if repeated => Ok(DEFAULT_ROUNDS + 1),
+        None => Ok(DEFAULT_ROUNDS),
+    }
 }
 
 /// Most schedulers one matrix takes: the report has one colour each.
@@ -483,11 +526,18 @@ impl<'a> RestoreGuard<'a> {
         match (&prior.selection, prior.active) {
             (Some((sched, args)), true) => Target {
                 label: "previous scheduler".into(),
+                twin_of: None,
                 spec: Spec::Default, // unused: nothing is started from this target
                 process: basename(sched),
                 args: Some(args.clone()),
             },
-            _ => Target { label: "previous state".into(), spec: Spec::Default, process: "default".into(), args: None },
+            _ => Target {
+                label: "previous state".into(),
+                twin_of: None,
+                spec: Spec::Default,
+                process: "default".into(),
+                args: None,
+            },
         }
     }
 
@@ -776,6 +826,7 @@ impl Session<'_> {
                 rounds: self.rounds,
                 schedulers: labels,
                 spec: self.targets[i].label.clone(),
+                twin_of: self.targets[i].twin_of.clone(),
                 session_id: Some(self.session_id.clone()),
                 settle_s: Some(self.switch.settle.as_secs_f64()),
                 order: Some("alternating".into()),
@@ -1136,6 +1187,71 @@ mod tests {
         assert!(Spec::parse("  ").is_err());
     }
 
+    /// The same spec more than once: arms of an A/A comparison, numbered,
+    /// each naming the first as its twin. Only identical specs are twins.
+    #[test]
+    fn a_repeated_spec_is_measured_as_separate_arms() {
+        let sim = Sim::new(false, false, None);
+        let given: Vec<String> =
+            ["default", "scx_lavd", "default", "scx_lavd -a", "scx_lavd", "default"].map(String::from).to_vec();
+        let t = resolve(&given, &sim, Duration::from_secs(1)).unwrap();
+        let arms: Vec<(&str, Option<&str>)> = t.iter().map(|t| (t.label.as_str(), t.twin_of.as_deref())).collect();
+        assert_eq!(
+            arms,
+            [
+                ("default", None),
+                ("scx_lavd", None),
+                ("default #2", Some("default")),
+                // Other options: another configuration, no twin.
+                ("scx_lavd -a", None),
+                ("scx_lavd #2", Some("scx_lavd")),
+                ("default #3", Some("default")),
+            ]
+        );
+        // A twin is switched to and verified like its first arm.
+        assert_eq!((t[2].spec.clone(), t[2].process.as_str()), (Spec::Default, "default"));
+        assert_eq!(t[4].spec, t[1].spec);
+
+        // Rounds: even with a repeated arm, whatever else is in the list.
+        assert_eq!(rounds_for(None, &t).unwrap(), 6);
+        assert_eq!(rounds_for(Some(4), &t).unwrap(), 4);
+        let e = rounds_for(Some(5), &t).unwrap_err().to_string();
+        assert!(e.contains("must be even") && e.contains("use --rounds 4 or 6"), "{e}");
+        assert!(rounds_for(Some(1), &t).unwrap_err().to_string().ends_with("use --rounds 2"));
+        // Without one: five by default, and any number asked for.
+        let plain = resolve(&given[..2], &sim, Duration::from_secs(1)).unwrap();
+        assert_eq!((rounds_for(None, &plain).unwrap(), rounds_for(Some(3), &plain).unwrap()), (5, 3));
+
+        // A whole session: the kernel's scheduler against itself, and a
+        // BPF scheduler against itself next to it.
+        let w: Vec<Box<dyn Workload>> = vec![Box::new(Quick)];
+        let dir = tmp_dir("twins");
+        let before = prior_of(&sim);
+        let s = session(&sim, &["default", "default", "scx_lavd", "scx_lavd"], 2, &w, &dir);
+        let out = go(&sim, &s, None);
+        assert!(out.error.is_none() && out.restore_error.is_none(), "{:?}", out.error);
+        assert_eq!(out.visits, 8);
+        let labels = ["default", "default #2", "scx_lavd", "scx_lavd #2"];
+        for (i, f) in out.files.iter().enumerate() {
+            let d = f.design.as_ref().unwrap();
+            assert_eq!((f.label.as_str(), d.spec.as_str()), (labels[i], labels[i]));
+            assert_eq!(d.schedulers, labels);
+            assert_eq!(d.twin_of.as_deref(), [None, Some("default"), None, Some("scx_lavd")][i]);
+            // Every arm has its own runs, in every round.
+            assert_eq!(f.workloads[0].runs.len(), 4);
+            assert_eq!(f.scheduler.is_ext(), i >= 2);
+            assert!(dir.join(file_name(i, labels[i])).exists());
+        }
+        // The twins were visited separately: eight visits, no two alike.
+        let mut visits: Vec<u32> =
+            out.files.iter().flat_map(|f| f.workloads[0].runs.iter().filter_map(|r| r.visit)).collect();
+        visits.sort();
+        visits.dedup();
+        assert_eq!(visits, (0..8).collect::<Vec<_>>());
+        assert!(prior_of(&sim).same_as(&before));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn profiles_resolve_to_scheduler_and_options() {
         let sim = Sim::new(false, false, None);
@@ -1148,7 +1264,6 @@ mod tests {
         assert_eq!((t[1].process.as_str(), t[1].args.clone()), ("scx_cosmos", Some(vec!["-a".into()])));
         assert!(resolve(&["missing".to_string()], &sim, Duration::ZERO).is_err());
         assert!(resolve(&["nosuch".to_string()], &sim, Duration::ZERO).is_err());
-        assert!(resolve(&["scx_a".to_string(), "scx_a".to_string()], &sim, Duration::ZERO).is_err());
     }
 
     #[test]
@@ -1349,6 +1464,7 @@ mod tests {
     fn profile_with_wrong_options_does_not_settle() {
         let t = Target {
             label: "latency".into(),
+            twin_of: None,
             spec: Spec::Start("latency".into()),
             process: "scx_eevdf".into(),
             args: Some(vec!["--slice-us".into(), "1600".into()]),
@@ -1394,6 +1510,7 @@ mod tests {
     fn switch_timeout_reports_why_not_a_zero_time_limit() {
         let target = Target {
             label: "scx_panda".into(),
+            twin_of: None,
             spec: Spec::Start("scx_panda".into()),
             process: "scx_panda".into(),
             args: None,

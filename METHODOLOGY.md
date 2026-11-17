@@ -28,6 +28,21 @@ argument. The first one is the baseline. Profile ids are looked up in
 `scxcli list --json` up front, so helicoprion knows which scheduler and
 options to expect after each switch.
 
+The same entry given twice is measured as two arms, `default` and
+`default #2`: the same scheduler with the same options, visited separately
+in every round like any other entry. Such an A/A pair differs in nothing but
+when it ran, so what a report finds between its arms is what the method
+finds where there is nothing to find. The second arm's result file names
+the first as its twin (`twin_of`).
+
+With a repeated entry the number of rounds must be even, and is 6 unless
+`--rounds` says otherwise. The order of visits is reversed from round to
+round, so over an even number each arm of a pair comes first as often as
+second. Over five rounds one arm would lead three times, and an effect of
+position would end up in the difference between the arms: if the later
+visit of a round is 10% slower, two identical arms differ by a median of
+10% over five rounds and by under 1% over six.
+
 `--recommended` instead compares every installed scheduler from
 `scxcli list recommended` against the kernel's own scheduler. With the
 default five rounds this takes about 11 minutes for five schedulers. The

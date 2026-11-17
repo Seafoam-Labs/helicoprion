@@ -66,7 +66,9 @@ enum Cmd {
         /// Scheduler to include, as scxcli takes it: `default` (kernel),
         /// a scheduler (`scx_lavd`), a catalog profile id, or a scheduler
         /// with options in one argument (`"scx_bpfland -s 5000"`). Repeat;
-        /// the first one is the report's baseline.
+        /// the first one is the report's baseline. The same entry twice
+        /// is measured as two arms (an A/A comparison): what differs
+        /// between them is not the scheduler.
         #[arg(long = "sched", required_unless_present = "recommended")]
         scheds: Vec<String>,
         /// Compare the schedulers scxcli recommends (`scxcli list
@@ -76,9 +78,12 @@ enum Cmd {
         /// whole benchmark: `sudo helicoprion matrix --recommended`.
         #[arg(long, conflicts_with = "scheds")]
         recommended: bool,
-        /// Rounds; each visits every scheduler once.
-        #[arg(long, default_value_t = 5)]
-        rounds: u32,
+        /// Rounds: every scheduler is visited once per round. 5 by
+        /// default; 6 when a scheduler is repeated (A/A), where the
+        /// number must be even so that each arm comes first in a round
+        /// as often as second.
+        #[arg(long)]
+        rounds: Option<u32>,
         #[arg(long, default_value = "quick", value_parser = clap::builder::PossibleValuesParser::new(SUITES))]
         suite: String,
         /// Measured runs per workload per visit.
@@ -496,7 +501,7 @@ fn progress(ev: Event<'_>) {
 struct MatrixArgs {
     scheds: Vec<String>,
     recommended: bool,
-    rounds: u32,
+    rounds: Option<u32>,
     suite: String,
     runs_per_visit: usize,
     warmup: usize,
@@ -517,7 +522,7 @@ struct MatrixArgs {
 fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     use matrix::{Control, Prior, ScxCli, Session, SwitchCfg, interrupted, prepare_out_dir, resolve, run_matrix};
 
-    if a.rounds == 0 || a.runs_per_visit == 0 {
+    if a.rounds == Some(0) || a.runs_per_visit == 0 {
         bail!("--rounds and --runs-per-visit must be at least 1");
     }
     for (name, v) in [
@@ -534,7 +539,7 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
         bail!("--cooldown must be >= 0");
     }
     if a.scheds.len() > matrix::MAX_SCHEDS {
-        bail!("at most {} schedulers per matrix (one report colour each)", matrix::MAX_SCHEDS);
+        bail!("at most {} schedulers per matrix, repeated ones included (one report colour each)", matrix::MAX_SCHEDS);
     }
     let cmd_timeout = Duration::from_secs_f64(a.command_timeout);
     let ctl = ScxCli { bin: a.scxcli.clone(), systemctl: a.systemctl.clone() };
@@ -558,6 +563,10 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
         a.scheds.clone()
     };
     let targets = resolve(&scheds, &ctl, cmd_timeout)?;
+    let rounds = matrix::rounds_for(a.rounds, &targets)?;
+    if a.rounds.is_none() && rounds != matrix::DEFAULT_ROUNDS {
+        eprintln!("rounds:    {rounds}, an even number, since a scheduler is repeated (A/A)");
+    }
     let sys = SystemInfo::collect();
     let workloads = suite(&a.suite, sys.usable_cpus, a.suite_opts).context("unknown suite")?;
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -579,9 +588,9 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     eprintln!(
         "matrix:    {} schedulers × {} rounds, {} workloads, ≈{:.0} min → {}",
         targets.len(),
-        a.rounds,
+        rounds,
         workloads.len(),
-        per_visit * (targets.len() as u32 * a.rounds) as f64 / 60.0,
+        per_visit * (targets.len() as u32 * rounds) as f64 / 60.0,
         out_dir.display()
     );
     matrix::install_sigint();
@@ -589,7 +598,7 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
     let session = Session {
         targets,
         suite: a.suite.clone(),
-        rounds: a.rounds,
+        rounds,
         runs_per_visit: a.runs_per_visit,
         warmup: a.warmup,
         duration: Duration::from_secs_f64(a.duration),

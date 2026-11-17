@@ -17,7 +17,7 @@ use crate::{Reading, Scheduler, SystemInfo};
 ///    `Metric::share` was added later as an optional field; files without it
 ///    are still schema 4. So were `RunResult::before`/`after`,
 ///    `SystemInfo::temp_sensor`, `ResultFile::protocol` and the settle
-///    time, visit order and scheduler options of `Design`.
+///    time, visit order, scheduler options and `twin_of` of `Design`.
 pub const SCHEMA_VERSION: u32 = 4;
 /// Oldest schema `compare` can read.
 pub const MIN_READABLE_SCHEMA: u32 = 3;
@@ -138,8 +138,14 @@ pub struct Design {
     pub rounds: u32,
     /// Every scheduler spec of the session, in first-round order.
     pub schedulers: Vec<String>,
-    /// The spec this file holds results for.
+    /// The entry of `schedulers` this file holds results for.
     pub spec: String,
+    /// Set when this file is a repeated arm: the entry of `schedulers`
+    /// that is the same scheduler with the same options, measured as an
+    /// arm of its own (an A/A comparison). Whatever differs between the
+    /// two is not the scheduler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twin_of: Option<String>,
     /// Random identifier shared by every file of one session; pairing by
     /// round requires equal ids. Files without it (written before the field
     /// existed) are identified by start time and scheduler list instead.
