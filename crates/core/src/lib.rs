@@ -11,7 +11,7 @@ pub use result::{
     WorkloadResult,
 };
 pub use sched::Scheduler;
-pub use system::{Freq, Probe, Reading, SystemInfo};
+pub use system::{Freq, Probe, Reading, SystemInfo, Topology};
 
 use std::fs;
 use std::path::Path;

@@ -16,6 +16,12 @@ pub struct SystemInfo {
     pub cpu_model: Option<String>,
     /// CPUs this process may run on (affinity-aware).
     pub usable_cpus: usize,
+    /// Which ones, e.g. `0-15` or `8-15` (`Cpus_allowed_list`). Two
+    /// sessions on eight CPUs each are not the same setup when one has
+    /// 0-7 and the other 8-15: other cores, perhaps another cache domain
+    /// or another kind of core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cpus: Option<String>,
     /// `/sys/devices/system/cpu/online`, e.g. `0-15`.
     pub online_cpus: Option<String>,
     pub smt_active: Option<bool>,
@@ -31,6 +37,56 @@ pub struct SystemInfo {
     /// when no CPU temperature sensor was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_sensor: Option<String>,
+    /// The build behind the release string: `#1 SMP PREEMPT_DYNAMIC` and
+    /// the build date (`/proc/sys/kernel/version`). Two builds of one
+    /// release differ here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_build: Option<String>,
+    /// The preemption model in effect (`none`, `voluntary`, `full`,
+    /// `lazy`), from debugfs: readable by root only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt: Option<String>,
+    /// Kernel command line parameters that change scheduling, timing or
+    /// CPU power management, as given. Only those: the rest of a command
+    /// line (root device, UUIDs) says nothing about a result and does not
+    /// belong in a file that gets shared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmdline: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<Topology>,
+    /// CPUs isolated from the scheduler, e.g. `2-3`; absent when none are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated_cpus: Option<String>,
+    /// cpufreq driver, e.g. `amd-pstate-epp`, summarised like `governor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpufreq_driver: Option<String>,
+    /// Highest frequency of the cpufreq policies in kHz, summarised like
+    /// `governor`: differs between the cores of a hybrid CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_freq_khz: Option<String>,
+    /// Frequency boost (turbo) allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boost: Option<bool>,
+    /// Running on mains power; `None` on a machine without a battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// Seconds since boot when the session started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_s: Option<f64>,
+}
+
+/// How the online CPUs are grouped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Topology {
+    pub packages: u32,
+    /// Physical cores; fewer than the CPUs when SMT is on.
+    pub cores: u32,
+    /// Groups of CPUs sharing a last-level (L3) cache; `None` when the
+    /// kernel reports no L3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l3_domains: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numa_nodes: Option<u32>,
 }
 
 impl SystemInfo {
@@ -40,6 +96,7 @@ impl SystemInfo {
             kernel: kernel_release(),
             cpu_model: cpu_model(),
             usable_cpus: usable_cpus(),
+            allowed_cpus: fs::read_to_string("/proc/self/status").ok().and_then(|s| allowed_cpus(&s)),
             online_cpus: read_trimmed("/sys/devices/system/cpu/online"),
             smt_active: read_trimmed("/sys/devices/system/cpu/smt/active").map(|v| v == "1"),
             governor: across_policies(cpufreq, "scaling_governor"),
@@ -48,8 +105,141 @@ impl SystemInfo {
             thp: read_trimmed("/sys/kernel/mm/transparent_hugepage/enabled").map(|s| selected_option(&s)),
             loadavg_1m: loadavg_1m(),
             temp_sensor: Probe::find().sensor().map(str::to_string),
+            kernel_build: read_trimmed("/proc/sys/kernel/version"),
+            preempt: read_trimmed("/sys/kernel/debug/sched/preempt").map(|s| selected_option(&s)),
+            cmdline: read_trimmed("/proc/cmdline").map(|s| relevant_cmdline(&s)).unwrap_or_default(),
+            topology: topology(Path::new("/sys/devices/system")),
+            isolated_cpus: read_trimmed("/sys/devices/system/cpu/isolated"),
+            cpufreq_driver: across_policies(cpufreq, "scaling_driver"),
+            max_freq_khz: across_policies(cpufreq, "cpuinfo_max_freq"),
+            boost: boost(Path::new("/sys/devices/system/cpu")),
+            on_ac: on_ac(Path::new("/sys/class/power_supply")),
+            uptime_s: read_trimmed("/proc/uptime")
+                .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok())),
         }
     }
+}
+
+/// `Cpus_allowed_list` of a `/proc/<pid>/status`.
+fn allowed_cpus(status: &str) -> Option<String> {
+    let list = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?.trim();
+    (!list.is_empty()).then(|| list.to_string())
+}
+
+/// Kernel parameters worth recording, by name (the part before `=`).
+/// Scheduling and isolation, preemption and timer ticks, CPU frequency
+/// and idle states, SMT, and CPU vulnerability mitigations, which change
+/// the cost of every switch into the kernel.
+const CMDLINE_KEYS: &[&str] = &[
+    "isolcpus",
+    "nohz",
+    "nohz_full",
+    "rcu_nocbs",
+    "rcu_nocb_poll",
+    "irqaffinity",
+    "preempt",
+    "threadirqs",
+    "skew_tick",
+    "nosmt",
+    "maxcpus",
+    "nr_cpus",
+    "numa_balancing",
+    "transparent_hugepage",
+    "amd_pstate",
+    "amd_prefcore",
+    "intel_pstate",
+    "idle",
+    "tsc",
+    "clocksource",
+    "split_lock_detect",
+    "mitigations",
+    "nopti",
+    "pti",
+    "nospectre_v1",
+    "nospectre_v2",
+    "spectre_v2",
+    "spectre_v2_user",
+    "spectre_bhi",
+    "spec_store_bypass_disable",
+    "retbleed",
+    "spec_rstack_overflow",
+    "l1tf",
+    "mds",
+    "tsx_async_abort",
+    "srbds",
+    "mmio_stale_data",
+    "gather_data_sampling",
+    "reg_file_data_sampling",
+];
+/// And whole families, by prefix.
+const CMDLINE_PREFIXES: &[&str] = &["sched_", "cpufreq.", "cpuidle.", "intel_idle.", "processor."];
+
+fn relevant_cmdline(cmdline: &str) -> Vec<String> {
+    cmdline
+        .split_whitespace()
+        .filter(|word| {
+            let key = word.split('=').next().unwrap_or(word);
+            CMDLINE_KEYS.contains(&key) || CMDLINE_PREFIXES.iter().any(|p| key.starts_with(p))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Packages, cores, L3 groups and NUMA nodes of the online CPUs, from
+/// `<root>/cpu/cpuN` and `<root>/node/nodeN`.
+fn topology(root: &Path) -> Option<Topology> {
+    use std::collections::BTreeSet;
+    let numbered = |dir: PathBuf, prefix: &'static str| {
+        fs::read_dir(dir).into_iter().flatten().flatten().filter_map(move |e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let n = name.strip_prefix(prefix)?;
+            (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| e.path())
+        })
+    };
+    let (mut packages, mut cores, mut l3) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for cpu in numbered(root.join("cpu"), "cpu") {
+        // Offline CPUs have no topology directory.
+        let Some(package) = read_trimmed(cpu.join("topology/physical_package_id")) else { continue };
+        let core = read_trimmed(cpu.join("topology/core_id")).unwrap_or_default();
+        cores.insert((package.clone(), core));
+        packages.insert(package);
+        for index in numbered(cpu.join("cache"), "index") {
+            if read_trimmed(index.join("level")).as_deref() == Some("3")
+                && let Some(shared) = read_trimmed(index.join("shared_cpu_list"))
+            {
+                l3.insert(shared);
+            }
+        }
+    }
+    if packages.is_empty() {
+        return None;
+    }
+    let nodes = numbered(root.join("node"), "node").count() as u32;
+    Some(Topology {
+        packages: packages.len() as u32,
+        cores: cores.len() as u32,
+        l3_domains: (!l3.is_empty()).then_some(l3.len() as u32),
+        numa_nodes: (nodes > 0).then_some(nodes),
+    })
+}
+
+/// Frequency boost allowed: the cpufreq switch, or intel_pstate's
+/// inverted `no_turbo`.
+fn boost(cpu: &Path) -> Option<bool> {
+    read_trimmed(cpu.join("cpufreq/boost"))
+        .map(|v| v == "1")
+        .or_else(|| read_trimmed(cpu.join("intel_pstate/no_turbo")).map(|v| v == "0"))
+}
+
+/// On mains power, if there is a mains supply to ask.
+fn on_ac(power_supply: &Path) -> Option<bool> {
+    let mains: Vec<bool> = fs::read_dir(power_supply)
+        .ok()?
+        .flatten()
+        .filter(|e| read_trimmed(e.path().join("type")).as_deref() == Some("Mains"))
+        .filter_map(|e| read_trimmed(e.path().join("online")).map(|v| v == "1"))
+        .collect();
+    (!mains.is_empty()).then(|| mains.contains(&true))
 }
 
 fn loadavg_1m() -> Option<f64> {
@@ -215,9 +405,17 @@ fn cpu_model() -> Option<String> {
     })
 }
 
-/// `always [madvise] never` -> `madvise`
+/// `always [madvise] never` -> `madvise`; `none voluntary (full) lazy` ->
+/// `full`.
 fn selected_option(s: &str) -> String {
-    s.split_whitespace().find_map(|w| w.strip_prefix('[').and_then(|w| w.strip_suffix(']'))).unwrap_or(s).to_string()
+    s.split_whitespace()
+        .find_map(|w| {
+            w.strip_prefix('[')
+                .and_then(|w| w.strip_suffix(']'))
+                .or_else(|| w.strip_prefix('(').and_then(|w| w.strip_suffix(')')))
+        })
+        .unwrap_or(s)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -301,5 +499,88 @@ mod tests {
     fn thp_selected() {
         assert_eq!(super::selected_option("always [madvise] never"), "madvise");
         assert_eq!(super::selected_option("weird"), "weird");
+        // The preemption model in debugfs.
+        assert_eq!(super::selected_option("none voluntary (full) lazy"), "full");
+    }
+
+    #[test]
+    fn allowed_cpus_are_read_from_the_status() {
+        let status = "Name:\thelicoprion\nCpus_allowed:\tff00\nCpus_allowed_list:\t8-15\nMems_allowed_list:\t0\n";
+        assert_eq!(super::allowed_cpus(status).as_deref(), Some("8-15"));
+        assert_eq!(super::allowed_cpus("Name:\tx\nCpus_allowed:\tff\n"), None);
+        // This process has some.
+        assert!(super::SystemInfo::collect().allowed_cpus.is_some());
+    }
+
+    #[test]
+    fn only_relevant_kernel_parameters_are_kept() {
+        let cmdline = "BOOT_IMAGE=/vmlinuz-linux root=UUID=0a1b2c3d-1111-2222-3333-444455556666 rw \
+                       cryptdevice=UUID=deadbeef:root quiet splash mitigations=off nowatchdog \
+                       amd_pstate=active isolcpus=2-3 nohz_full=2-3 preempt=full threadirqs \
+                       intel_idle.max_cstate=1 processor.max_cstate=1 sched_verbose resume=/dev/nvme0n1p3";
+        assert_eq!(
+            super::relevant_cmdline(cmdline),
+            [
+                "mitigations=off",
+                "amd_pstate=active",
+                "isolcpus=2-3",
+                "nohz_full=2-3",
+                "preempt=full",
+                "threadirqs",
+                "intel_idle.max_cstate=1",
+                "processor.max_cstate=1",
+                "sched_verbose"
+            ]
+        );
+        // Nothing that identifies the machine or its disks.
+        assert!(super::relevant_cmdline("root=UUID=abc rootflags=subvol=@ init=/sbin/init").is_empty());
+    }
+
+    #[test]
+    fn topology_boost_and_power_are_read() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("helicoprion-topology-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let put = |rel: String, text: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        };
+        // One package, 4 cores with SMT, two L3 groups of 4 CPUs; CPU 8 is
+        // offline and has no topology.
+        for cpu in 0..8 {
+            put(format!("sys/cpu/cpu{cpu}/topology/physical_package_id"), "0\n");
+            put(format!("sys/cpu/cpu{cpu}/topology/core_id"), &format!("{}\n", cpu / 2));
+            put(format!("sys/cpu/cpu{cpu}/cache/index0/level"), "1\n");
+            put(format!("sys/cpu/cpu{cpu}/cache/index0/shared_cpu_list"), &format!("{cpu}\n"));
+            put(format!("sys/cpu/cpu{cpu}/cache/index3/level"), "3\n");
+            let shared = if cpu < 4 { "0-3\n" } else { "4-7\n" };
+            put(format!("sys/cpu/cpu{cpu}/cache/index3/shared_cpu_list"), shared);
+        }
+        put("sys/cpu/cpu8/online".into(), "0\n");
+        // Not CPUs: cpufreq, cpuidle.
+        put("sys/cpu/cpufreq/boost".into(), "1\n");
+        put("sys/cpu/cpuidle/current_driver".into(), "acpi_idle\n");
+        put("sys/node/node0/cpulist".into(), "0-7\n");
+        put("sys/node/has_cpu".into(), "0\n");
+
+        let t = super::topology(&root.join("sys")).unwrap();
+        assert_eq!((t.packages, t.cores, t.l3_domains, t.numa_nodes), (1, 4, Some(2), Some(1)));
+        assert_eq!(super::topology(&root.join("missing")), None);
+
+        assert_eq!(super::boost(&root.join("sys/cpu")), Some(true));
+        put("intel/intel_pstate/no_turbo".into(), "1\n");
+        assert_eq!(super::boost(&root.join("intel")), Some(false));
+        assert_eq!(super::boost(&root.join("missing")), None);
+
+        // A laptop on battery; a desktop has no mains supply to ask.
+        put("power/BAT0/type".into(), "Battery\n");
+        assert_eq!(super::on_ac(&root.join("power")), None);
+        put("power/AC/type".into(), "Mains\n");
+        put("power/AC/online".into(), "0\n");
+        assert_eq!(super::on_ac(&root.join("power")), Some(false));
+        put("power/AC/online".into(), "1\n");
+        assert_eq!(super::on_ac(&root.join("power")), Some(true));
+        fs::remove_dir_all(&root).unwrap();
     }
 }

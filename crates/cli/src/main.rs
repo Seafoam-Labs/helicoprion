@@ -211,12 +211,49 @@ fn info(json: bool) -> Result<()> {
     println!("Kernel:     {}", sys.kernel);
     println!("CPU:        {}", opt(&sys.cpu_model));
     println!(
-        "CPUs:       {} usable (online: {}, SMT: {})",
+        "CPUs:       {} usable{} (online: {}, SMT: {})",
         sys.usable_cpus,
+        sys.allowed_cpus.as_ref().map(|a| format!(": {a}")).unwrap_or_default(),
         opt(&sys.online_cpus),
         sys.smt_active.map_or("?", |s| if s { "on" } else { "off" })
     );
+    if let Some(t) = &sys.topology {
+        let count = |n: Option<u32>, what: &str| n.map(|n| format!(", {n} {what}")).unwrap_or_default();
+        println!(
+            "Topology:   {} package(s), {} cores{}{}",
+            t.packages,
+            t.cores,
+            count(t.l3_domains, "L3 domain(s)"),
+            count(t.numa_nodes, "NUMA node(s)")
+        );
+    }
+    if let Some(isolated) = &sys.isolated_cpus {
+        println!("Isolated:   {isolated}");
+    }
+    if let Some(build) = &sys.kernel_build {
+        println!("Build:      {build}");
+    }
+    if let Some(preempt) = &sys.preempt {
+        println!("Preemption: {preempt}");
+    }
+    if !sys.cmdline.is_empty() {
+        println!("Cmdline:    {}", sys.cmdline.join(" "));
+    }
     println!("Governor:   {} (EPP: {})", opt(&sys.governor), opt(&sys.epp));
+    if let Some(driver) = &sys.cpufreq_driver {
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        println!(
+            "Cpufreq:    {driver}{}{}",
+            sys.max_freq_khz.as_ref().map(|f| format!(", max {f} kHz")).unwrap_or_default(),
+            sys.boost.map(|b| format!(", boost {}", on_off(b))).unwrap_or_default()
+        );
+    }
+    if let Some(ac) = sys.on_ac {
+        println!("Power:      {}", if ac { "mains" } else { "battery" });
+    }
+    if let Some(sensor) = &sys.temp_sensor {
+        println!("Temp from:  {sensor}");
+    }
     if let Some(p) = &sys.platform_profile {
         println!("Profile:    {p}");
     }
