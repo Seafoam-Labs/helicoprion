@@ -427,6 +427,12 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 // their work is done; the last is what whoever handed
                 // out the batch waits for.
                 point(c, w, i, "start_p50", "Typical wake-up delay", delays),
+                // More tasks than CPUs: no median, which would sit on the
+                // step between the tasks that run at once and those that
+                // wait. The quartiles are of all wake-ups together, and
+                // are called that: the tasks are not sorted into kinds.
+                point(c, w, i, "start_p25", "Wake-up delay, lower quartile", delays),
+                point(c, w, i, "start_p75", "Wake-up delay, upper quartile", delays),
                 slowest("start", "wake-ups", ""),
                 point(c, w, i, "all_running_p50", "Until the whole group runs, typically", delays),
                 point(c, w, i, "all_done_p50", "Until the whole group is done, typically", delays),

@@ -2435,6 +2435,37 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(crate::simple::what(&c).starts_with("The test wakes a whole group"));
     }
 
+    /// A burst with more tasks than CPUs has no median of the start
+    /// delay, and the plain view shows its two quartiles as quartiles.
+    /// Files from before the change still have their median line.
+    #[test]
+    fn a_crowded_burst_is_described_by_its_quartiles() {
+        let session = |quartiles: bool| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "wake-burst/double".into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    r.metrics.clear();
+                    let k = if is_cand { 0.5 } else { 1.0 };
+                    if quartiles {
+                        r.metrics.insert("start_p25".into(), Metric::lower(30.0 * k, "us"));
+                        r.metrics.insert("start_p75".into(), Metric::lower(230.0 * k, "us"));
+                    } else {
+                        r.metrics.insert("start_p50".into(), Metric::lower(130.0 * k, "us"));
+                    }
+                }
+            }
+            crate::simple::text(&Comparison::build(files, 0))
+        };
+        let text = session(true);
+        assert!(text.contains("• Wake-up delay, lower quartile: 2.0× shorter (30.0 → 15.0 µs)"), "{text}");
+        assert!(text.contains("• Wake-up delay, upper quartile: 2.0× shorter (230 → 115 µs)"), "{text}");
+        assert!(!text.contains("Typical wake-up delay"), "{text}");
+        let old = session(false);
+        assert!(old.contains("• Typical wake-up delay: 2.0× shorter (130 → 65.0 µs)"), "{old}");
+        assert!(!old.contains("quartile"), "{old}");
+    }
+
     /// cgroup-fair in the plain view: the split, what the weights ask
     /// for, and whether the split is the one a scheduler without groups
     /// or without weights gives.
