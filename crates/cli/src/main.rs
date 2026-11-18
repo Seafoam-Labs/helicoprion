@@ -406,6 +406,15 @@ fn load(p: &Path) -> Result<ResultFile> {
 fn result_files(paths: &[PathBuf]) -> Result<Vec<(String, ResultFile)>> {
     let mut out = Vec::new();
     for p in paths {
+        if !p.exists() {
+            // Before anything is read: "reading s2/: No such file or
+            // directory" does not say what was expected there.
+            bail!(
+                "{}: there is no such directory or file. A session is a directory written by `matrix -o`, or the result \
+                 files (.json) in it",
+                p.display()
+            );
+        }
         if p.is_dir() {
             let mut inside: Vec<PathBuf> = fs::read_dir(p)
                 .with_context(|| format!("reading {}", p.display()))?
@@ -744,4 +753,28 @@ impl Scoring {
 
 fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_that_is_not_there_is_named() {
+        let missing = std::env::temp_dir().join(format!("helicoprion-no-such-session-{}", std::process::id()));
+        let why = result_files(std::slice::from_ref(&missing)).unwrap_err().to_string();
+        assert_eq!(
+            why,
+            format!(
+                "{}: there is no such directory or file. A session is a directory written by `matrix -o`, or the \
+                 result files (.json) in it",
+                missing.display()
+            )
+        );
+        // A directory that is there and holds no results says that.
+        fs::create_dir_all(&missing).unwrap();
+        let why = result_files(std::slice::from_ref(&missing)).unwrap_err().to_string();
+        fs::remove_dir(&missing).unwrap();
+        assert!(why.ends_with("no result files (.json) in this directory"), "{why}");
+    }
 }
