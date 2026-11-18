@@ -503,7 +503,7 @@ pub struct Coverage {
     /// Taken from the estimates themselves, not from the reason a change
     /// went unscored: a minor population is named as the reason before
     /// the missing interval is.
-    pub scorable: usize,
+    pub with_interval: usize,
     /// Of the measured: sessions where the order of the arms was not
     /// balanced (`Noise::balanced`).
     pub unbalanced: usize,
@@ -518,7 +518,7 @@ impl Analysis {
         Coverage {
             sessions: self.sessions.len(),
             measured: count(&|i| in_session(i).next().is_some()),
-            scorable: count(&|i| in_session(i).any(|n| n.delta.ci.is_some())),
+            with_interval: count(&|i| in_session(i).any(|n| n.delta.ci.is_some())),
             unbalanced: count(&|i| in_session(i).any(|n| !n.balanced())),
         }
     }

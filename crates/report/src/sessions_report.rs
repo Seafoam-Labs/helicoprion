@@ -224,13 +224,13 @@ pub fn text(a: &Analysis) -> String {
                 );
             }
             // No alarm is a finding only where something could be scored.
-            None if cover.scorable > 0 => {
+            None if cover.with_interval > 0 => {
                 let _ = writeln!(
                     out,
                     "  no false alarm in {} metrics over {} session{} that could score them",
                     of.len(),
-                    cover.scorable,
-                    if cover.scorable == 1 { "" } else { "s" }
+                    cover.with_interval,
+                    if cover.with_interval == 1 { "" } else { "s" }
                 );
             }
             None => {
@@ -274,11 +274,11 @@ fn coverage_words(c: Coverage) -> Vec<String> {
             if missing == 1 { "s" } else { "" }
         ));
     }
-    if c.scorable < c.measured {
-        let unscorable = c.measured - c.scorable;
+    if c.with_interval < c.measured {
+        let without = c.measured - c.with_interval;
         out.push(format!(
-            "{unscorable} measured session{} had too few rounds to score any change: no alarm there is no finding",
-            s(unscorable)
+            "{without} measured session{} had too few rounds to score any change: no alarm there is no finding",
+            s(without)
         ));
     }
     if c.unbalanced > 0 {
@@ -869,7 +869,7 @@ scx_cosmos
         };
 
         let a = sessions(6, &[2, 3, 4]);
-        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 2, scorable: 2, unbalanced: 0 });
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 2, with_interval: 2, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains(
             "A/A: default #2 is default again\n  measured in 2 of 5 sessions; 3 sessions without comparable data for this pair say nothing about it\n  no false alarm in 2 metrics over 2 sessions that could score them\n"
@@ -884,20 +884,20 @@ scx_cosmos
         // Two rounds are too few for an interval: nothing could be scored,
         // which is not the same as nothing found.
         let a = sessions(2, &[]);
-        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, scorable: 0, unbalanced: 0 });
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, with_interval: 0, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains(
             "  5 measured sessions had too few rounds to score any change: no alarm there is no finding\n  nothing could be scored, so nothing is known about false alarms\n"
         ), "{said}");
         assert!(!said.contains("no false alarm in"), "{said}");
 
-        // An odd number of rounds: measured and scorable, and not balanced.
+        // An odd number of rounds: measured, with an interval, and not balanced.
         let a = sessions(5, &[]);
         assert_eq!(a.coverage("default #2").unbalanced, 5);
         assert!(text(&a).contains("5 sessions did not balance the order of the arms"));
         // All is well: no such lines.
         let a = sessions(6, &[]);
-        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, scorable: 5, unbalanced: 0 });
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, with_interval: 5, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains("A/A: default #2 is default again\n  no false alarm in 2 metrics over 5 sessions that could score them\n"), "{said}");
     }
@@ -927,7 +927,7 @@ scx_cosmos
         let all: Vec<_> = a.noise.iter().flat_map(|n| n.sessions.iter().flatten()).collect();
         assert_eq!(all.len(), 4);
         assert!(all.iter().all(|n| n.unclear == Some(UnclearReason::MinorPopulation) && n.delta.ci.is_none()));
-        assert_eq!(a.coverage("default #2"), Coverage { sessions: 2, measured: 2, scorable: 0, unbalanced: 0 });
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 2, measured: 2, with_interval: 0, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains("nothing could be scored, so nothing is known about false alarms"), "{said}");
         assert!(!said.contains("no false alarm in"), "{said}");
@@ -950,7 +950,7 @@ scx_cosmos
         let a = analyse(files, Options::default()).unwrap();
         assert_eq!(a.pairs, [("default".to_string(), "default #2".to_string())]);
         assert!(a.noise.is_empty());
-        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 0, scorable: 0, unbalanced: 0 });
+        assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 0, with_interval: 0, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains(
             "\nA/A: default #2 is default again\n  no comparable measurements in any of the 5 sessions: the calibration is inconclusive, which is not the same as quiet\n"
