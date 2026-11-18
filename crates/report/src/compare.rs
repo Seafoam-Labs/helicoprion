@@ -406,6 +406,20 @@ pub struct Diagnostics {
     pub workload: String,
     pub valid_runs: usize,
     pub counters: BTreeMap<String, u64>,
+    /// What the workload was set up with, as `name=value` pairs: the
+    /// same in every run, and so not something to sum.
+    pub params: String,
+}
+
+/// A workload's parameters on one line.
+fn params_line(params: &serde_json::Value) -> String {
+    match params.as_object() {
+        Some(map) => {
+            let value = |v: &serde_json::Value| v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            map.iter().map(|(k, v)| format!("{k}={}", value(v))).collect::<Vec<_>>().join(", ")
+        }
+        None => String::new(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -772,7 +786,13 @@ impl Comparison {
                     }
                 }
                 if !counters.is_empty() {
-                    diagnostics.push(Diagnostics { series: si, workload: w.name.clone(), valid_runs, counters });
+                    diagnostics.push(Diagnostics {
+                        series: si,
+                        workload: w.name.clone(),
+                        valid_runs,
+                        counters,
+                        params: params_line(&w.params),
+                    });
                 }
             }
         }
@@ -2400,6 +2420,36 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let html = crate::html::report(&c);
         assert!(html.contains(&crate::esc(crate::simple::WHAT_BURST)), "{html}");
         assert!(html.contains("<code>wakeups_overrun</code>") && html.contains("<code>wake_call</code>"));
+        assert!(html.contains("<code>idle_latency_us</code>"));
+        {
+            // The bound on idle latency is a parameter of the workload. Five
+            // runs with a bound of 1 µs are shown with 1, once, and not with
+            // the 5 a counter summed over the runs would give.
+            let mut files = drifting_session();
+            for f in &mut files {
+                f.workloads[0].name = "wake-burst/half".into();
+                f.workloads[0].params = serde_json::json!({ "tasks": 8, "idle": "shallow", "idle_latency_us": 1 });
+                assert!(f.workloads[0].runs.len() >= 5);
+                for r in f.workloads[0].runs.iter_mut() {
+                    r.counters.insert("bursts".into(), 2490);
+                }
+            }
+            let shallow = Comparison::build(files.clone(), 0);
+            assert_eq!(shallow.diagnostics[0].params, "idle=shallow, idle_latency_us=1, tasks=8");
+            let html = crate::html::report(&shallow);
+            assert!(html.contains("<p class=sub>Parameters: idle=shallow, idle_latency_us=1, tasks=8</p>"), "{html}");
+            assert!(!html.contains("<td>idle_latency_us</td>"), "not among the counters: {html}");
+            // Another bound is another experiment: said, and not compared.
+            files[1].workloads[0].params = serde_json::json!({ "tasks": 8, "idle": "shallow", "idle_latency_us": 2 });
+            let mixed = Comparison::build(files, 0);
+            let html = crate::html::report(&mixed);
+            assert!(html.contains("<p class=sub>Parameters differ:"), "{html}");
+            assert!(
+                html.contains("idle_latency_us=1, tasks=8;") && html.contains("idle_latency_us=2, tasks=8;"),
+                "{html}"
+            );
+            assert!(mixed.warnings.iter().any(|w| w.contains("not compared")), "{:?}", mixed.warnings);
+        }
         let share = |label: &str, base: &str, cand: &str| {
             format!("<td><strong>{label}</strong></td><td><strong>{base}</strong></td><td><strong>{cand}</strong></td>")
         };
