@@ -101,6 +101,20 @@ impl Recorder {
         (self.count > 0).then_some(self.max)
     }
 
+    /// How many values lie in the bucket that holds `v` or in a higher
+    /// one. Every value of `v` or more is counted, `v` itself included,
+    /// and with them the values that share its bucket from below: the
+    /// threshold is `v` to within the width of a bucket, at most 1.6%
+    /// under it and exact below 64. `threshold_of` says where it is.
+    pub fn count_from_bucket_of(&self, v: u64) -> u64 {
+        self.counts[index(v)..].iter().sum()
+    }
+
+    /// The smallest value `count_from_bucket_of(v)` counts.
+    pub fn threshold_of(v: u64) -> u64 {
+        bounds(index(v)).0
+    }
+
     /// Sparse, self-describing form for result files.
     pub fn to_histogram(&self, unit: &str) -> Histogram {
         Histogram {
@@ -137,6 +151,32 @@ pub struct Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_at_or_above_a_threshold_are_counted() {
+        let mut r = Recorder::default();
+        for v in [3, 40, 999_000, 1_000_000, 1_400_000, 1_400_000, 5_000_000] {
+            r.record(v);
+        }
+        let from = |v: u64| r.count_from_bucket_of(v);
+        // Exact below 64.
+        assert_eq!((from(0), from(3), from(4), from(41)), (7, 7, 6, 5));
+        // Above, from the lower edge of the bucket that holds the
+        // threshold. A value of exactly a millisecond is counted, as
+        // every value above it is; 999 µs lies in the bucket below and
+        // is not.
+        assert_eq!(from(1_000_000), 4);
+        assert_eq!(Recorder::threshold_of(1_000_000), 999_424);
+        assert_eq!(from(999_424), 4);
+        assert_eq!(from(999_423), 5);
+        assert_eq!(from(2_000_000), 1);
+        assert_eq!(Recorder::default().count_from_bucket_of(0), 0);
+        // Never above the threshold asked for, and within 1.6% of it.
+        for v in [64, 1000, 1_000_000, 123_456_789] {
+            let edge = Recorder::threshold_of(v);
+            assert!(edge <= v && (v - edge) as f64 <= v as f64 / 64.0, "{v}: {edge}");
+        }
+    }
 
     #[test]
     fn index_bounds_roundtrip() {

@@ -163,6 +163,23 @@ how many threads were really woken. A quantile is only reported when at
 least ten samples lie beyond it, which means 20 samples for p50, 1000 for
 p99 and 10000 for p99.9, so a small population never shows a made-up tail.
 
+`rtt_blocked_slow_pct` is the share of the blocked round trips that took
+about a millisecond or more, a hundred times a wake-up on an idle CPU and
+about what waiting out another task's turn costs. The denominator is the
+blocked round trips, not all of them. The threshold is approximate because
+the count is taken from the histogram: every round trip of a millisecond or
+more is counted, and with them those from 999.4 µs on, which share a bucket
+with it. It is scored, and lower is better. It
+exists because a percentile can sit on a step. With every CPU kept busy,
+about one blocked round trip in a thousand takes some 1.4 ms under the
+kernel's scheduler and the rest take microseconds, so `rtt_blocked_p99.9`
+read 34 µs in one run and 1434 µs in the next of the same session, depending
+on whether the slow ones were just under or just over a thousandth. Between
+sessions that looked like a drifting baseline. The share says how many slow
+round trips there were without a step to fall off, and is reported from
+10000 blocked round trips on; `roundtrips_slow` is their number. The
+percentile stays, and is unstable wherever the share is near 0.1%.
+
 ### Same CPU and cross CPU
 
 The ponger reads its CPU with `sched_getcpu` just before handing the token

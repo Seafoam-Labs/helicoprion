@@ -83,6 +83,12 @@ const ABORT: u32 = 2;
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const POP_BLOCKED: &str = "rtt_blocked";
+/// A round trip that slept and took about this long is counted as slow:
+/// a millisecond, a hundred times a wake-up on an idle CPU and about what
+/// waiting out another task's turn on the CPU costs. About, because the
+/// count is taken from the histogram: every round trip of a millisecond
+/// or more, and those of the last 0.6 µs under it that share its bucket.
+const SLOW_NS: u64 = 1_000_000;
 pub const POP_FAST: &str = "rtt_fast";
 pub const POP_BLOCKED_SAME: &str = "rtt_blocked_same_cpu";
 pub const POP_BLOCKED_CROSS: &str = "rtt_blocked_cross_cpu";
@@ -747,6 +753,22 @@ fn summarize(pings: &[PingOut], pongs: &[Counts], start: Instant, hog: Option<Ho
 
     let blocked_curve = population_metrics(&mut r.metrics, POP_BLOCKED, &blocked, roundtrips);
     let fast_curve = population_metrics(&mut r.metrics, POP_FAST, &fast, roundtrips);
+    // How many of the round trips that slept took a millisecond or
+    // more. Their 99.9th percentile sits on a step where about one in a
+    // thousand is that slow: a little under and it reads tens of
+    // microseconds, a little over and it reads more than a thousand.
+    // The share says the same thing without the step.
+    // To the resolution of the histogram: counted from the lower edge of
+    // the bucket that holds the threshold, 999.4 µs.
+    let slow = blocked.count_from_bucket_of(SLOW_NS);
+    if blocked.count() >= min_samples_for(0.999) {
+        let pct = slow as f64 / blocked.count() as f64 * 100.0;
+        r.metrics.insert(
+            "rtt_blocked_slow_pct".into(),
+            Metric::lower(pct, "%").share(share_of(blocked.count(), roundtrips)),
+        );
+    }
+    r.counters.insert("roundtrips_slow".into(), slow);
     if cpu_diag {
         sub_population_metrics(&mut r.metrics, POP_BLOCKED_SAME, &blocked_same, roundtrips);
         sub_population_metrics(&mut r.metrics, POP_BLOCKED_CROSS, &blocked_cross, roundtrips);
@@ -846,6 +868,30 @@ mod tests {
         assert_eq!(w.params(), json!({ "pairs": 1, "hogs": 0, "cpu_diag": true }));
         let r = run_bounded(w, Duration::from_millis(50), Fault::None, Duration::from_secs(20));
         assert!(!r.counters.keys().chain(r.metrics.keys()).any(|k| k.starts_with("sched_")));
+    }
+
+    /// The share of slow round trips: of those that slept, how many took
+    /// a millisecond or more, from the same histogram as the percentiles.
+    #[test]
+    fn slow_round_trips_are_a_share_of_the_blocked_ones() {
+        let w = WakePingPong { pairs: 2, hogs: 0, cpu_diag: true, sched_diag: false };
+        let r = run_bounded(w, Duration::from_millis(400), Fault::None, Duration::from_secs(20));
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        let blocked = r.latency_histograms[POP_BLOCKED].count;
+        let slow = r.counters["roundtrips_slow"];
+        assert!(slow <= blocked);
+        match r.metrics.get("rtt_blocked_slow_pct") {
+            Some(m) => {
+                assert!(blocked >= 10_000);
+                assert_eq!((m.better, m.unit.as_str()), (helicoprion_core::Better::Lower, "%"));
+                assert!((m.value - slow as f64 / blocked as f64 * 100.0).abs() < 1e-9);
+                // Judged with its population, like the percentiles.
+                assert_eq!(m.share, r.metrics["rtt_blocked_p50"].share);
+            }
+            // Too few round trips slept for a share to a hundredth of a
+            // percent: none is made up.
+            None => assert!(blocked < 10_000),
+        }
     }
 
     #[test]
