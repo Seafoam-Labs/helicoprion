@@ -458,6 +458,9 @@ mod tests {
         assert_eq!(w.params()["sched_diag"], true);
         assert!(quick(0).params().get("sched_diag").is_none());
         let r = w.run(Duration::from_millis(200));
+        if !schedstat::kept(&r) {
+            return;
+        }
         assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
         let c = &r.counters;
         assert_eq!(c["sched_threads"], 2);

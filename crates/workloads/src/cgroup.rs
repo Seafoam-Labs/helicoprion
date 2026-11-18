@@ -755,7 +755,8 @@ mod tests {
         assert_eq!(w.params()["sched_diag"], true);
         assert!(quick().params().get("sched_diag").is_none());
         let r = w.run_with(Duration::from_millis(200), &Hooks { no_cpu_controller: true, ..fast() });
-        if r.invalid_reason.is_some() {
+        // No groups here, or a kernel without the statistics.
+        if !schedstat::kept(&r) || r.invalid_reason.is_some() {
             return;
         }
         let c = &r.counters;

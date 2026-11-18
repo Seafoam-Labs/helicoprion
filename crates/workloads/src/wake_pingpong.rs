@@ -854,6 +854,9 @@ mod tests {
         let w = WakePingPong { pairs: 2, hogs: 0, cpu_diag: true, sched_diag: true };
         assert_eq!(w.params(), json!({ "pairs": 2, "hogs": 0, "cpu_diag": true, "sched_diag": true }));
         let r = run_bounded(w, Duration::from_millis(200), Fault::None, Duration::from_secs(20));
+        if !crate::schedstat::kept(&r) {
+            return;
+        }
         assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
         let c = &r.counters;
         assert_eq!(c["sched_threads"], 4);

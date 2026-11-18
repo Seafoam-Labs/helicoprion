@@ -719,6 +719,9 @@ mod tests {
         let w = WakeBurst { sched_diag: true, ..quick(2) };
         assert_eq!(w.params()["sched_diag"], true);
         assert!(quick(2).params().get("sched_diag").is_none());
+        if !schedstat::kept(&w.run_with(Duration::from_millis(50), &Hooks::default())) {
+            return;
+        }
         let r = run(&w, Duration::from_millis(200), &Hooks::default());
         let c = &r.counters;
         assert_eq!(c["sched_threads"], 2);

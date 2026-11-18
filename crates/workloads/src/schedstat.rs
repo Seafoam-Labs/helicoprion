@@ -59,12 +59,24 @@ fn field(text: &str, name: &str) -> Option<u64> {
     })
 }
 
+/// How a reason starts when the kernel has no such statistics at all,
+/// as opposed to a reading that failed: the first is a property of the
+/// machine, the second may be a fault of this code.
+const NOT_KEPT: &str = "this kernel does not keep them: ";
+
 fn read() -> Result<Stats, String> {
     let file = |name: &str| {
         std::fs::read_to_string(format!("/proc/thread-self/{name}"))
             .map_err(|e| format!("/proc/thread-self/{name}: {e}"))
     };
-    let (run_ns, wait_ns, slices) = parse_schedstat(&file("schedstat")?)
+    // No such file is a kernel built without them, not a failed reading.
+    let schedstat = match std::fs::read_to_string("/proc/thread-self/schedstat") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{NOT_KEPT}there is no /proc/thread-self/schedstat (CONFIG_SCHED_INFO?)"));
+        }
+        other => other.map_err(|e| format!("/proc/thread-self/schedstat: {e}"))?,
+    };
+    let (run_ns, wait_ns, slices) = parse_schedstat(&schedstat)
         .ok_or("/proc/thread-self/schedstat does not hold three numbers (a kernel without scheduler statistics?)")?;
     let status = file("status")?;
     let switches = |name: &str| field(&status, name).ok_or(format!("/proc/thread-self/status has no {name}"));
@@ -142,8 +154,11 @@ impl Collector {
             match t {
                 Ok(u) => usages.push(u),
                 Err(why) => {
-                    r.invalid_reason =
-                        Some(format!("scheduler statistics were asked for and could not be read: {why}"));
+                    r.invalid_reason = Some(if why.starts_with(NOT_KEPT) {
+                        format!("scheduler statistics were asked for and {why}")
+                    } else {
+                        format!("scheduler statistics were asked for and could not be read: {why}")
+                    });
                     return;
                 }
             }
@@ -153,11 +168,10 @@ impl Collector {
         // nothing counted. Only known after the work: a thread that has
         // just started has zeros on any kernel.
         if !usages.is_empty() && usages.iter().all(|u| u.stats.run_ns == 0 && u.stats.slices == 0) {
-            r.invalid_reason = Some(
-                "scheduler statistics were asked for and this kernel does not keep them: no thread has any time on \
-                 a CPU in /proc/thread-self/schedstat after its work (CONFIG_SCHED_INFO?)"
-                    .into(),
-            );
+            r.invalid_reason = Some(format!(
+                "scheduler statistics were asked for and {NOT_KEPT}no thread has any time on a CPU in \
+                 /proc/thread-self/schedstat after its work (CONFIG_SCHED_INFO?)"
+            ));
             return;
         }
         summarize(r, &usages);
@@ -224,6 +238,23 @@ fn summarize(r: &mut RunResult, usages: &[Usage]) {
     }
 }
 
+/// For tests that run a workload with these statistics: whether the
+/// kernel the test runs on keeps them. Where it does not, the run is
+/// invalid and says so, which is what such a test can check there, and
+/// the rest of it has nothing to look at. Only that: statistics that
+/// are kept and could not be read are a failure of the collector, and
+/// the test goes on to find the run invalid.
+#[cfg(test)]
+pub(crate) fn kept(r: &RunResult) -> bool {
+    match r.invalid_reason.as_deref() {
+        Some(why) if why.starts_with(&format!("scheduler statistics were asked for and {NOT_KEPT}")) => {
+            assert!(!r.metrics.keys().chain(r.counters.keys()).any(|k| k.starts_with("sched_")), "{:?}", r.metrics);
+            false
+        }
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +298,10 @@ mod tests {
         });
         let mut r = RunResult::default();
         c.record(&mut r);
+        // On a kernel without these statistics: said, and nothing else.
+        if !kept(&r) {
+            return;
+        }
         assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
         let n = &r.counters;
         assert_eq!(n["sched_threads"], 1);
@@ -282,6 +317,42 @@ mod tests {
             r.metrics
         );
         assert!(r.metrics["sched_switches_per_s"].value > 0.0);
+    }
+
+    /// What the tests of the workloads go by on a kernel without the
+    /// statistics: the run says so, and they stop there.
+    #[test]
+    fn a_kernel_without_statistics_is_recognised_by_the_tests() {
+        let c = Collector::new(true);
+        let zeros = Usage { stats: Stats::default(), secs: 1.0 };
+        c.threads.lock().unwrap().push(Ok(zeros));
+        let mut r = RunResult::default();
+        c.record(&mut r);
+        assert!(!kept(&r), "{:?}", r.invalid_reason);
+        // So is a kernel that has no such file.
+        let c = Collector::new(true);
+        c.threads.lock().unwrap().push(Err(format!("{NOT_KEPT}there is no /proc/thread-self/schedstat")));
+        let mut r = RunResult::default();
+        c.record(&mut r);
+        assert_eq!(
+            r.invalid_reason.as_deref(),
+            Some(
+                "scheduler statistics were asked for and this kernel does not keep them: there is no \
+                 /proc/thread-self/schedstat"
+            )
+        );
+        assert!(!kept(&r));
+        // A reading that failed where the statistics exist is not the
+        // kernel's doing: the test goes on, and fails on the invalid run.
+        let c = Collector::new(true);
+        c.threads.lock().unwrap().push(Err("/proc/thread-self/status has no voluntary_ctxt_switches".into()));
+        let mut r = RunResult::default();
+        c.record(&mut r);
+        assert!(r.invalid_reason.as_deref().unwrap().contains("could not be read"), "{:?}", r.invalid_reason);
+        assert!(kept(&r));
+        // Any other outcome is for the test to judge.
+        assert!(kept(&RunResult::default()));
+        assert!(kept(&RunResult { invalid_reason: Some("a burst thread panicked".into()), ..Default::default() }));
     }
 
     #[test]
