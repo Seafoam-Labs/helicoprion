@@ -143,7 +143,7 @@ it is, so that its results remain comparable with earlier ones.
 | `periodic-wake/loaded` | The same, while one CPU hog thread per CPU keeps every CPU busy | The same, plus hog work per second |
 | `wake-burst/half` | One thread wakes a group of sleeping threads with one call every 2 ms, half as many as there are CPUs; each works for 200 µs of CPU time and sleeps again | p50, p99, p99.9 and max in µs of the time until a task runs, until the whole group runs and until the whole group is done, and the share of wake-ups that found the task still at work |
 | `wake-burst/full` | The same with as many tasks as CPUs | The same |
-| `wake-burst/double` | The same with twice as many tasks as CPUs | The same |
+| `wake-burst/double` | The same with twice as many tasks as CPUs | The same, with the quartiles of the time until a task runs in place of its median |
 | `cgroup-fair/equal` | Two control groups of busy threads with the same `cpu.weight`, one with as many threads as CPUs and one with three times as many | How closely the split of CPU time follows the weights, the share of all CPU time that was used, the first group's share, and work per second |
 | `cgroup-fair/weighted` | The same with as many threads as CPUs in both groups and three times the weight for the second | The same |
 
@@ -249,6 +249,18 @@ call, so `start` includes the time the waker needs to get to a task. With
 twice as many tasks as CPUs, how long the second half waits is the
 scheduler's choice between letting the first ones finish and slicing, and
 `all_running` and `all_done` show the two sides of it.
+
+With more tasks than CPUs the typical `start` is two things, a task that
+finds a CPU and one that waits for it, and a median sits on the step between
+them: under one scheduler, in the runs of one session, it came out anywhere
+from 24 to 206 µs. `wake-burst/double` therefore has the lower and the upper
+quartile of the start delay in its place, `start_p25` and `start_p75`. They
+are quartiles of all the wake-ups together. The tasks are not sorted into
+those that found a CPU and those that waited. Where about half of them wait,
+the lower quartile lies among the ones that did not and the upper among the
+ones that did, which is why the two are stable where the median is not.
+Where the split is another one, they are still the quartiles and nothing
+more. The median is still on the quantile curve.
 
 A wake-up is only measured for a task that slept in `FUTEX_WAIT` when its
 burst was released, and every such wake-up is measured. A task woken by the

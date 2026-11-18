@@ -35,6 +35,19 @@
 //! CPU; how long is the scheduler's choice (let the first ones finish, or
 //! slice), and `all_running` and `all_done` show the two sides of it.
 //!
+//! The typical `start` is then two things, a task that finds a CPU and
+//! one that waits for it, and a median sits on the step between them:
+//! under one scheduler, in runs of one session, it came out anywhere
+//! from 24 to 206 µs. With more tasks than CPUs the lower and the upper
+//! quartile of the start delay stand in for it, `start_p25` and
+//! `start_p75`. They are quartiles of all the wake-ups together: the
+//! tasks are not sorted into those that found a CPU and those that
+//! waited. Where about half of them wait, the lower quartile lies among
+//! the ones that did not and the upper among the ones that did, which
+//! is why the two are stable where the median is not; where the split
+//! is another one, they are still the quartiles and nothing more. The
+//! median is still on the curve in the results.
+//!
 //! # Every wake-up is accounted for
 //!
 //! A wake-up is only measured for a task that slept in `FUTEX_WAIT` when
@@ -205,7 +218,11 @@ impl Workload for WakeBurst {
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
-        &["start_p50", "start_p99", "all_done_p99"]
+        if self.crowded() {
+            &["start_p25", "start_p75", "all_done_p99"]
+        } else {
+            &["start_p50", "start_p99", "all_done_p99"]
+        }
     }
 
     fn progress_note(&self, r: &RunResult) -> Option<String> {
@@ -264,6 +281,11 @@ struct TaskOut {
 }
 
 impl WakeBurst {
+    /// More tasks than CPUs: part of every burst has to wait for one.
+    fn crowded(&self) -> bool {
+        self.tasks > std::thread::available_parallelism().map_or(1, usize::from)
+    }
+
     fn run_with(&self, duration: Duration, hooks: &Hooks) -> RunResult {
         let invalid = |why: String| RunResult { invalid_reason: Some(why), ..Default::default() };
         let (period, work) = (ns(self.period), ns(self.work));
@@ -338,7 +360,7 @@ impl WakeBurst {
         match failed {
             Some(why) => invalid(why),
             None => {
-                let mut r = summarize(&outs, &waker, bursts as u64, period);
+                let mut r = summarize(&outs, &waker, bursts as u64, period, self.crowded());
                 stats.record(&mut r);
                 r
             }
@@ -486,7 +508,10 @@ fn task(sh: &Shared, work: u64, panic: bool, slow: Slow) -> Result<TaskOut, Stri
     }
 }
 
-fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64) -> RunResult {
+/// Samples from which a quartile is taken.
+const MIN_FOR_QUARTILES: u64 = 100;
+
+fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64, crowded: bool) -> RunResult {
     let window = (planned * period) as f64 / 1e9;
     let mut r = RunResult { duration_s: window, ..Default::default() };
     // A late waker releases fewer bursts. Each is the same trial, but at
@@ -538,6 +563,15 @@ fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64) -> RunR
         }
         if !curve.is_empty() {
             r.quantile_curves.insert(name.into(), curve);
+        }
+    }
+    // A median on the step between the tasks that run at once and the
+    // ones that wait: the quartiles of the same samples instead, which
+    // lie on either side of it when about half of the tasks wait.
+    if crowded && start.count() >= MIN_FOR_QUARTILES {
+        r.metrics.remove("start_p50");
+        for (q, name) in [(0.25, "start_p25"), (0.75, "start_p75")] {
+            r.metrics.insert(name.into(), Metric::lower(start.quantile(q).unwrap_or(0.0) / 1000.0, "us"));
         }
     }
     // Scored, like periodic-wake's missed deadlines: zero is a value, and
@@ -671,7 +705,6 @@ mod tests {
             w.params(),
             json!({ "tasks": 4, "period_us": 2000, "work_us": 50, "timer_slack_ns": 1, "spaced_from": "release" })
         );
-        assert_eq!(w.headline_metrics(), ["start_p50", "start_p99", "all_done_p99"]);
         // Work that does not fit its period is refused, not measured.
         let bad = WakeBurst { work: Duration::from_millis(2), ..quick(1) };
         assert!(bad.run(Duration::from_millis(10)).invalid_reason.unwrap().contains("shorter than the period"));
@@ -812,6 +845,52 @@ mod tests {
         let r = run(&w, Duration::from_millis(60), &hooks);
         accounted(&r);
         assert!(r.counters["wakeups_overrun"] >= 1, "{:?}", r.counters);
+    }
+
+    /// More tasks than CPUs: a quartile on each side of the step, and no
+    /// median on it. The same samples as when they fit give a median.
+    #[test]
+    fn a_crowded_burst_is_typified_by_its_quartiles() {
+        let n = 2000usize;
+        // Half of the tasks run at once, half wait for the work of the
+        // first: 30 µs and 230 µs, a few nanoseconds apart at the step.
+        let task = |slow: bool| {
+            let mut out = TaskOut { running: vec![0; n + 1], done: vec![0; n + 1], ..Default::default() };
+            for b in 1..=n {
+                let running = if slow { 230_000 } else { 30_000 } + b as u64;
+                out.start.record(running);
+                out.running[b] = running + 1;
+                out.done[b] = running + 200_001;
+                out.ran += 1;
+            }
+            out
+        };
+        let outs = [task(false), task(true)];
+        let mut waker = Waker { released: n as u64, ..Default::default() };
+        waker.late.record(1000);
+        let r = summarize(&outs, &waker, n as u64, 2_000_000, true);
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        let m = |name: &str| r.metrics[name].value;
+        assert!(!r.metrics.contains_key("start_p50"), "{:?}", r.metrics.keys());
+        assert!((25.0..35.0).contains(&m("start_p25")) && (225.0..240.0).contains(&m("start_p75")), "{:?}", r.metrics);
+        assert_eq!(r.metrics["start_p25"].better, Better::Lower);
+        // The tail and the per-burst times are what they are otherwise,
+        // and the median stays on the curve for whoever wants it.
+        assert!(r.metrics.contains_key("start_p99") && r.metrics.contains_key("all_done_p50"));
+        assert!(r.quantile_curves[POP_START].iter().any(|(q, _)| *q == 0.5));
+
+        let r = summarize(&outs, &waker, n as u64, 2_000_000, false);
+        assert!(r.metrics.contains_key("start_p50"));
+        assert!(!r.metrics.contains_key("start_p25") && !r.metrics.contains_key("start_p75"));
+
+        // By the machine: a group of one always fits.
+        assert!(!quick(1).crowded());
+        assert!(WakeBurst { tasks: 100_000, ..quick(1) }.crowded());
+        assert_eq!(quick(1).headline_metrics(), ["start_p50", "start_p99", "all_done_p99"]);
+        assert_eq!(
+            WakeBurst { tasks: 100_000, ..quick(1) }.headline_metrics(),
+            ["start_p25", "start_p75", "all_done_p99"]
+        );
     }
 
     /// However late the waker is, two bursts are never closer than a
