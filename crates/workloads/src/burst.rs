@@ -12,8 +12,9 @@
 //!
 //! # What is measured
 //!
-//! Bursts are released by the clock, `period` apart, so every scheduler
-//! is asked for the same work at the same moments. For each burst the
+//! Bursts are released at least `period` apart, each one a period after
+//! the one before it actually came, so that every burst finds the tasks
+//! with the same time to finish and go back to sleep. For each burst the
 //! waker notes the time, right before the call that wakes the group
 //! (`FUTEX_WAKE` for all waiters of one futex). From that instant:
 //!
@@ -69,23 +70,38 @@
 //! # The waker
 //!
 //! The waker runs with a timer slack of 1 ns, set and read back as in
-//! periodic-wake, so that the bursts come when they are due. One reading
-//! of the clock decides whether a release is still due, is the time the
-//! tasks measure from, and gives how late the release was
-//! (`release_late`, informational). From that reading to the return of
-//! the wake call is `wake_call`, informational as well. The waker can
-//! lose its CPU in that interval: before the tasks are woken, and the
-//! time is in every `start` of the burst without being the tasks'
-//! wake-up; or after, and only `wake_call` is long. A large value says
-//! that the waker's side may have added to the start delays, not which
-//! of them.
+//! periodic-wake. Each burst is due one period after the burst before it
+//! was released, not at a fixed instant. A waker that comes late to a
+//! fixed grid releases its burst close to the next one, and then tasks
+//! overrun because of the waker: on a machine that is idle between
+//! bursts the waker is the first thing to wake up and pays for it, by
+//! half a millisecond at the median on the machine this was found on.
+//! Spaced from the release, a late burst only makes the gap longer.
 //!
-//! A release that is already a whole period past when the waker gets to
-//! it is left out instead of following the next one at once
-//! (`bursts_skipped`).
-//! Every scheduler is meant to get the same bursts, so a run in which
-//! more than `MAX_SKIPPED_PCT` of them were left out is invalid: a
-//! scheduler must not look better for having been handed less work.
+//! One reading of the clock is the release: it is the time the tasks
+//! measure from, it gives how late the release was against when it was
+//! due (`release_late`, informational, with its distribution in the
+//! results), and the next burst is due a period after it. From that
+//! reading to the return of the wake call is `wake_call`, informational
+//! as well. The waker can lose its CPU in that interval: before the
+//! tasks are woken, and the time is in every `start` of the burst
+//! without being the tasks' wake-up; or after, and only `wake_call` is
+//! long. A large value says that the waker's side may have added to the
+//! start delays, not which of them.
+//!
+//! A late waker therefore releases fewer bursts in the same time
+//! (`bursts` of `bursts_planned`, what a waker that is never late would
+//! release). The workload regulates itself, and the price is that two
+//! schedulers are not necessarily asked for the same amount of work: one
+//! under which the waker runs later gets fewer bursts, with longer rests
+//! between them. Each burst is still the same trial, so the latencies
+//! per burst stand, but the rate belongs to the result and has to be
+//! read with it: `bursts_per_s`, informational, is there for that, and
+//! a report puts the rates of the two sides next to each other. How far
+//! they may differ before the comparison is no longer one is not known
+//! yet and no limit is set on it; only a run that got fewer than
+//! `MIN_BURSTS_PCT` of the planned bursts is invalid outright, since at
+//! half the rate the machine sleeps twice as long between bursts.
 //!
 //! # Start and failure
 //!
@@ -116,9 +132,10 @@ pub const POP_ALL_DONE: &str = "all_done";
 const LEAD: Duration = Duration::from_millis(5);
 /// How long the tasks may take to report ready before the run is abandoned.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// The share of the planned bursts the waker may leave out, in percent,
-/// before the run no longer is the load that was asked for.
-const MAX_SKIPPED_PCT: f64 = 1.0;
+/// The share of the planned bursts, in percent, below which a run no
+/// longer is the workload that was asked for.
+const MIN_BURSTS_PCT: f64 = 50.0;
+pub const POP_RELEASE_LATE: &str = "release_late";
 /// Set in the futex word when the run is over; the rest of the word is
 /// the number of bursts released. One word for both: a task reads how
 /// many bursts there were and whether more will come in one piece.
@@ -180,6 +197,9 @@ impl Workload for WakeBurst {
             "period_us": self.period.as_micros() as u64,
             "work_us": self.work.as_micros() as u64,
             "timer_slack_ns": TIMER_SLACK_NS,
+            // Results from when bursts were due at fixed instants have
+            // no such entry, and are not compared with these.
+            "spaced_from": "release",
         });
         schedstat::mark(params, self.sched_diag)
     }
@@ -331,9 +351,6 @@ impl WakeBurst {
 struct Waker {
     /// Bursts released.
     released: u64,
-    /// Releases that were already a period past when the waker got to
-    /// them, and were left out.
-    skipped: u64,
     /// Tasks the wake calls found asleep.
     woken: u64,
     /// How late the waker was for the bursts it released.
@@ -342,30 +359,30 @@ struct Waker {
     call: Recorder,
 }
 
-/// Release `bursts` bursts, `period` apart, and wait one more period for
-/// the last one.
-fn wake_bursts(sh: &Shared, bursts: usize, period: u64, slow: Option<(u64, Duration)>) -> Result<Waker, String> {
+/// Release bursts for `planned` periods, each one `period` after the one
+/// before it was released, and wait one more period for the last one.
+fn wake_bursts(sh: &Shared, planned: usize, period: u64, slow: Option<(u64, Duration)>) -> Result<Waker, String> {
     // Bursts when they are due, not up to 50 µs later; the calling
     // thread gets its own slack back afterwards.
     let _precise = PreciseTimers::new()?;
     let mut w = Waker::default();
-    let first = now_ns() + ns(LEAD);
-    for k in 0..bursts as u64 {
-        let release = first + k * period;
-        sleep_until(release);
-        if let Some((_, by)) = slow.filter(|(at, _)| *at == k) {
+    let mut due = now_ns() + ns(LEAD);
+    let end = due + planned as u64 * period;
+    let mut last = due;
+    while due < end {
+        sleep_until(due);
+        if let Some((_, by)) = slow.filter(|(at, _)| *at == w.released) {
             std::thread::sleep(by);
         }
-        // The waker itself can be late. A release a whole period past
-        // would follow the next one at once: leave it out.
+        // `at` is the release: what is recorded as late, what the tasks
+        // measure from and what the next burst is spaced from are one
+        // reading.
         let at = now_ns();
-        if at >= release + period {
-            w.skipped += 1;
-            continue;
+        if at >= end {
+            // Too late for the window: the run is over.
+            break;
         }
-        // `at` is the release: what was checked, what is recorded as
-        // late and what the tasks measure from are one reading.
-        w.late.record(at.saturating_sub(release));
+        w.late.record(at.saturating_sub(due));
         w.released += 1;
         // The time first, then the number: a task that sees burst `b`
         // finds its time.
@@ -373,8 +390,13 @@ fn wake_bursts(sh: &Shared, bursts: usize, period: u64, slow: Option<(u64, Durat
         sh.word.store(w.released as u32, Ordering::Release);
         w.woken += u64::from(futex::wake(&sh.word, i32::MAX).map_err(|e| format!("futex wake: {e}"))?);
         w.call.record(now_ns().saturating_sub(at));
+        // A period after it came, not after it was due: however late
+        // the waker was, the tasks get a whole period before the next.
+        last = at;
+        due = at + period;
     }
-    sleep_until(first + bursts as u64 * period);
+    // The last burst gets its period as well.
+    sleep_until(end.max(last + period));
     Ok(w)
 }
 
@@ -467,13 +489,13 @@ fn task(sh: &Shared, work: u64, panic: bool, slow: Slow) -> Result<TaskOut, Stri
 fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64) -> RunResult {
     let window = (planned * period) as f64 / 1e9;
     let mut r = RunResult { duration_s: window, ..Default::default() };
-    // The load is the bursts: a run that got clearly fewer of them than
-    // planned is not the run another scheduler got.
-    if waker.skipped as f64 * 100.0 > planned as f64 * MAX_SKIPPED_PCT {
+    // A late waker releases fewer bursts. Each is the same trial, but at
+    // under half the rate the machine sleeps twice as long between them.
+    if (waker.released as f64) * 100.0 < planned as f64 * MIN_BURSTS_PCT {
         r.invalid_reason = Some(format!(
-            "the waker was a whole period late for {} of {planned} bursts and left them out: not the load that was \
+            "the waker released {} of the {planned} bursts a punctual one would have: not the workload that was \
              asked for",
-            waker.skipped
+            waker.released
         ));
         return r;
     }
@@ -521,6 +543,14 @@ fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64) -> RunR
     // Scored, like periodic-wake's missed deadlines: zero is a value, and
     // a baseline of zero leaves the change undefined.
     r.metrics.insert("overrun_pct".into(), Metric::lower(overrun as f64 / due as f64 * 100.0, "%"));
+    // The distribution of the waker's lateness goes into the results:
+    // its quantiles alone did not show what it looked like.
+    if waker.late.count() > 0 {
+        r.latency_histograms.insert(POP_RELEASE_LATE.into(), waker.late.to_histogram("ns"));
+    }
+    // How much work was asked for: under a scheduler that runs the waker
+    // later it is less, and a comparison has to show that.
+    r.metrics.insert("bursts_per_s".into(), Metric::info(waker.released as f64 / window, "1/s"));
     // How late the waker was, and how long its wake calls took: what
     // the load looked like, not a quality of the tasks' wake-ups.
     for (name, rec) in [("release_late", &waker.late), ("wake_call", &waker.call)] {
@@ -539,7 +569,6 @@ fn summarize(outs: &[TaskOut], waker: &Waker, planned: u64, period: u64) -> RunR
     c.insert("bursts_planned".into(), planned);
     c.insert("bursts".into(), waker.released);
     c.insert("bursts_complete".into(), complete);
-    c.insert("bursts_skipped".into(), waker.skipped);
     c.insert("wakeups_due".into(), due);
     c.insert("wakeups_ran".into(), ran);
     c.insert("wakeups_overrun".into(), overrun);
@@ -570,7 +599,7 @@ mod tests {
     fn run(w: &WakeBurst, duration: Duration, hooks: &Hooks) -> RunResult {
         let mut r = w.run_with(duration, hooks);
         for _ in 0..5 {
-            if !r.invalid_reason.as_deref().is_some_and(|why| why.contains("left them out")) {
+            if !r.invalid_reason.as_deref().is_some_and(|why| why.contains("a punctual one would have")) {
                 break;
             }
             r = w.run_with(duration, hooks);
@@ -582,7 +611,8 @@ mod tests {
     /// Every burst released is, for every task, one of three things.
     fn accounted(r: &RunResult) {
         let c = &r.counters;
-        assert_eq!(c["bursts"] + c["bursts_skipped"], c["bursts_planned"], "{c:?}");
+        assert!(c["bursts"] <= c["bursts_planned"], "{c:?}");
+        assert_eq!(r.latency_histograms[POP_RELEASE_LATE].count, c["bursts"]);
         assert_eq!(c["wakeups_due"], c["wakeups_ran"] + c["wakeups_overrun"] + c["wakeups_not_asleep"], "{c:?}");
         // What the wake calls woke is what the tasks measured.
         assert_eq!(c["tasks_found_asleep"], c["wakeups_ran"], "{c:?}");
@@ -616,10 +646,11 @@ mod tests {
         let expected = c["wakeups_overrun"] as f64 / c["wakeups_due"] as f64 * 100.0;
         assert!((overrun.value - expected).abs() < 1e-9 && (0.0..=100.0).contains(&overrun.value));
         // How late the waker was describes the load, and is not scored.
-        for name in ["release_late_p50", "release_late_max", "wake_call_p50", "wake_call_max"] {
-            assert_eq!((r.metrics[name].better, r.metrics[name].unit.as_str()), (Better::Neither, "us"), "{name}");
+        // Neither is the rate of bursts: how much was asked for.
+        assert!((m("bursts_per_s") - c["bursts"] as f64 / 0.3).abs() < 1e-6, "{:?}", r.metrics["bursts_per_s"]);
+        for name in ["release_late_p50", "release_late_max", "wake_call_p50", "wake_call_max", "bursts_per_s"] {
+            assert_eq!(r.metrics[name].better, Better::Neither, "{name}");
         }
-        assert!(m("release_late_p50") < 2000.0, "a release a period late is left out");
         // 300 starts carry a p50 and not a p99; 150 bursts likewise.
         assert!(!r.metrics.contains_key("start_p99") && !r.metrics.contains_key("all_done_p99"));
         assert!(!r.metrics.contains_key("release_late_p99") && !r.metrics.contains_key("wake_call_p99"));
@@ -636,7 +667,10 @@ mod tests {
     fn parameters_identify_the_workload() {
         let w = WakeBurst { size: "double", ..quick(4) };
         assert_eq!(w.name(), "wake-burst/double");
-        assert_eq!(w.params(), json!({ "tasks": 4, "period_us": 2000, "work_us": 50, "timer_slack_ns": 1 }));
+        assert_eq!(
+            w.params(),
+            json!({ "tasks": 4, "period_us": 2000, "work_us": 50, "timer_slack_ns": 1, "spaced_from": "release" })
+        );
         assert_eq!(w.headline_metrics(), ["start_p50", "start_p99", "all_done_p99"]);
         // Work that does not fit its period is refused, not measured.
         let bad = WakeBurst { work: Duration::from_millis(2), ..quick(1) };
@@ -721,7 +755,8 @@ mod tests {
         assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);
         // Woken by the first burst, and still at it when the others came.
         let c = &r.counters;
-        assert_eq!((c["wakeups_ran"], c["wakeups_overrun"], c["wakeups_not_asleep"]), (1, 2, 0), "{c:?}");
+        assert_eq!((c["wakeups_ran"], c["wakeups_overrun"], c["wakeups_not_asleep"]), (1, c["bursts"] - 1, 0), "{c:?}");
+        assert!(c["bursts"] >= 2, "{c:?}");
         accounted(&r);
         assert!(r.metrics["all_done_max"].value >= 40_000.0);
     }
@@ -733,19 +768,19 @@ mod tests {
     #[test]
     fn a_wakeup_acted_on_after_the_run_is_over_is_measured() {
         let w = quick(2);
-        // Three bursts in 6 ms; the first task runs 30 ms after it was
+        // A few bursts in 6 ms; the first task runs 30 ms after it was
         // woken by the first of them.
         let hooks = Hooks { slow_task: Some((0, Duration::from_millis(30))), ..Default::default() };
         let r = run(&w, Duration::from_millis(6), &hooks);
         assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);
         let c = &r.counters;
-        assert_eq!((c["bursts"], c["wakeups_due"]), (3, 6), "{c:?}");
+        assert!(c["bursts"] >= 2 && c["wakeups_due"] == c["bursts"] * 2, "{c:?}");
         accounted(&r);
-        // The slow one: woken once, and the two bursts that came while it
-        // waited for its CPU found it busy. The other: three wake-ups,
+        // The slow one: woken once, and the bursts that came while it
+        // waited for its CPU found it busy. The other: woken by each,
         // unless one found it between its work and its sleep.
-        assert_eq!(c["wakeups_overrun"], 2, "{c:?}");
-        assert_eq!(c["wakeups_ran"] + c["wakeups_not_asleep"], 4, "{c:?}");
+        assert_eq!(c["wakeups_overrun"], c["bursts"] - 1, "{c:?}");
+        assert_eq!(c["wakeups_ran"] + c["wakeups_not_asleep"], c["bursts"] + 1, "{c:?}");
         // Its 30 ms are in the results, for the task and for its group.
         assert!(r.metrics["start_max"].value >= 30_000.0, "{:?}", r.metrics["start_max"]);
         assert!(c["bursts_complete"] >= 1 && r.metrics["all_running_max"].value >= 30_000.0, "{c:?}");
@@ -779,29 +814,55 @@ mod tests {
         assert!(r.counters["wakeups_overrun"] >= 1, "{:?}", r.counters);
     }
 
-    /// A waker that is late itself delivers less load. A little of that
-    /// is counted and shown; more makes the run invalid instead of
-    /// letting it pass for a run with fewer bursts and nothing lost.
+    /// However late the waker is, two bursts are never closer than a
+    /// period: a late burst makes the gap longer, and does not land
+    /// next to the one after it, where it would find tasks at work
+    /// through no fault of theirs.
     #[test]
-    fn bursts_the_waker_leaves_out_are_not_a_better_result() {
+    fn bursts_are_a_period_apart_however_late_the_waker_is() {
+        let period = ns(Duration::from_millis(2));
+        let shared = |planned: usize| Shared {
+            word: AtomicU32::new(0),
+            released: (0..planned + 1).map(|_| AtomicU64::new(0)).collect(),
+            ready: AtomicUsize::new(0),
+        };
+        // Nobody sleeps on the word: the waker alone is under test.
+        let sh = shared(50);
+        // Late for the sixth burst by more than a period.
+        let w = wake_bursts(&sh, 50, period, Some((5, Duration::from_millis(5)))).unwrap();
+        let at: Vec<u64> = (1..=w.released as usize).map(|b| sh.released[b].load(Ordering::Acquire)).collect();
+        assert!(at.windows(2).all(|p| p[1] - p[0] >= period), "{at:?}");
+        // The late one came late, and the ones after it were not hurried
+        // to catch up: fewer bursts in the same time, none left out
+        // unnoticed.
+        assert!((10..50).contains(&w.released), "{}", w.released);
+        assert_eq!(w.late.count(), w.released);
+        assert!(w.late.max().unwrap() >= 5_000_000, "{:?}", w.late.max());
+        // All of them inside the window that was planned.
+        assert!(at.last().unwrap() - at[0] < 50 * period);
+    }
+
+    /// A late waker delivers fewer bursts. That is counted and shown;
+    /// under half of them the run is invalid instead of passing for the
+    /// same workload at half the rate.
+    #[test]
+    fn a_waker_that_delivers_too_few_bursts_invalidates_the_run() {
         let w = quick(2);
-        // 300 bursts planned. The waker oversleeps one release by more
-        // than a period: that one is left out, the next comes late.
-        let hooks = Hooks { slow_waker: Some((5, Duration::from_micros(2500))), ..Default::default() };
+        // 300 planned. Late once by 5 ms: a few fewer, and it counts.
+        let hooks = Hooks { slow_waker: Some((5, Duration::from_millis(5))), ..Default::default() };
         let r = run(&w, Duration::from_millis(600), &hooks);
         let c = &r.counters;
         assert_eq!(c["bursts_planned"], 300);
-        assert!((1..=3).contains(&c["bursts_skipped"]), "{c:?}");
-        // What was not released is not due, and is not hidden either.
+        assert!(c["bursts"] < 300 && c["bursts"] >= 150, "{c:?}");
         assert_eq!(c["wakeups_due"], c["bursts"] * 2);
         accounted(&r);
-        assert!(r.metrics["release_late_max"].value >= 400.0, "{:?}", r.metrics["release_late_max"]);
+        assert!(r.metrics["release_late_max"].value >= 5000.0, "{:?}", r.metrics["release_late_max"]);
 
-        // 50 ms: some 25 of 300 releases gone. Not the load asked for.
-        let hooks = Hooks { slow_waker: Some((5, Duration::from_millis(50))), ..Default::default() };
+        // Late once by 400 ms of the 600: a third of the bursts at most.
+        let hooks = Hooks { slow_waker: Some((5, Duration::from_millis(400))), ..Default::default() };
         let r = w.run_with(Duration::from_millis(600), &hooks);
         let why = r.invalid_reason.expect("invalid");
-        assert!(why.contains("of 300 bursts and left them out"), "{why}");
+        assert!(why.contains("of the 300 bursts a punctual one would have"), "{why}");
         assert!(r.metrics.is_empty(), "nothing to compare: {:?}", r.metrics);
         assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);
     }

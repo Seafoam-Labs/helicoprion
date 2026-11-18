@@ -232,10 +232,11 @@ The two workloads above wake one task at a time. `wake-burst` hands the
 scheduler a whole group in the same instant, as a thread pool given a batch
 or a build step fanned out to workers does: one thread calls `FUTEX_WAKE`
 for every waiter of one futex, each woken task works for a fixed amount of
-its own CPU time and sleeps on the futex again. Bursts are released by the
-clock, 2 ms apart, so every scheduler is asked for the same work at the same
-moments. The three sizes follow the machine: half as many tasks as CPUs,
-where the group fits with room to spare, as many, where it fits only if the
+its own CPU time and sleeps on the futex again. Bursts are released at least
+2 ms apart, each one a period after the one before it actually came, so that
+every burst finds the tasks with the same time to finish and go back to
+sleep. The three sizes follow the machine: half as many tasks as CPUs, where
+the group fits with room to spare, as many, where it fits only if the
 scheduler uses every CPU, and twice as many, where half of the group has to
 wait.
 
@@ -278,27 +279,47 @@ exist only for bursts in which every task took part (`bursts_complete`).
 `wakeups_ran`.
 
 The waker runs with a timer slack of 1 ns, set and read back as in
-`periodic-wake`, and gets the slack it had back afterwards. One reading of
-the clock decides whether a release is still due, is the time the tasks
-measure from, and gives how late the release was, recorded as
-`release_late_p50`, `release_late_p99` and `release_late_max`. From that
-reading to the return of the wake call is `wake_call_p50`, `wake_call_p99`
-and `wake_call_max`. The waker can lose its CPU in that interval. If it does
-before the call has woken the tasks, that time is in every `start` of the
-burst without being the tasks' wake-up; if it does after, the tasks ran on
-time and only `wake_call` is long. A large `wake_call` therefore says that
-the waker's side may have added to the start delays observed, and does not
-by itself say which of them. A long gap before the burst is published also
-moves the line between `wakeups_overrun` and `wakeups_not_asleep`, which
-goes by the reading. Both metrics describe the load and are informational. A
-release that is already a whole period past when the waker gets to it is
-left out instead of following the next one at once, and counted in
-`bursts_skipped` out of `bursts_planned`. A release that comes late is
-closer to the next one, so a late waker can make tasks overrun by itself,
-and `release_late` is where to look when `overrun_pct` is not zero. Every
-scheduler is meant to get the same bursts, so a run in which more than 1% of
-them were left out is invalid: a scheduler must not look better for having
-been handed less work.
+`periodic-wake`, and gets the slack it had back afterwards. Each burst is
+due one period after the burst before it was released, not at a fixed
+instant. A waker that comes late to a fixed grid releases its burst close to
+the next one, and then tasks overrun because of the waker. That is what the
+first runs on real hardware showed: on a machine that is idle between
+bursts the waker is the first thing to wake up, and it came half a
+millisecond late at the median and more than a millisecond in one release of
+a hundred, under every scheduler. Spaced from the release, a late burst only
+makes the gap longer.
+
+One reading of the clock is the release. It is the time the tasks measure
+from, it gives how late the release was against when it was due, and the
+next burst is due a period after it. The lateness is recorded as
+`release_late_p50`, `release_late_p99` and `release_late_max`, with its
+distribution in the results. From that reading to the return of the wake
+call is `wake_call_p50`, `wake_call_p99` and `wake_call_max`. The waker can
+lose its CPU in that interval. If it does before the call has woken the
+tasks, that time is in every `start` of the burst without being the tasks'
+wake-up; if it does after, the tasks ran on time and only `wake_call` is
+long. A large `wake_call` therefore says that the waker's side may have
+added to the start delays observed, and does not by itself say which of
+them. A long gap before the burst is published also moves the line between
+`wakeups_overrun` and `wakeups_not_asleep`, which goes by the reading. All
+of these describe the load and are informational.
+
+A late waker releases fewer bursts in the same time: `bursts` of
+`bursts_planned`, which is what a waker that is never late would release.
+The workload regulates itself, and the price is that two schedulers are not
+necessarily asked for the same amount of work. One under which the waker
+runs later gets fewer bursts, with longer rests between them. With bursts on
+a fixed grid the median lateness in `wake-burst/full` was 367 µs under the
+kernel's scheduler and 3.5 to 71 µs under the sched_ext ones in the same
+session, so the difference can be large. Each burst is still the same
+trial, and the latencies per burst stand, but the rate belongs to the
+result and has to be read with it. `bursts_per_s` records it,
+informational, and the report puts the rates of the two sides next to each
+other. How far they may differ before a comparison is no longer one is not
+known yet, and no limit is set until A/A sessions with the new spacing show
+how much the rate varies by itself. Only a run that got fewer than half of
+the planned bursts is invalid outright: at half the rate the machine sleeps
+twice as long between bursts, and that is no longer the workload.
 
 The start and the handling of failures are those of `periodic-wake`: all
 tasks report ready before the first burst, and a run that cannot start or
