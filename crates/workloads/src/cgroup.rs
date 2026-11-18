@@ -622,6 +622,36 @@ mod tests {
     /// time: each compares where the process is before and after.
     static MOVES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The tests marked as ignored move the process they run in from
+    /// one control group to another and back. Writing a process to
+    /// `cgroup.procs` moves all of its threads, so in the test binary
+    /// that would be every other test running at that moment as well.
+    /// They run here instead, in a process of their own that runs
+    /// nothing else, one after the other.
+    #[test]
+    fn tests_that_move_the_process_run_in_one_of_their_own() {
+        const MOVING: [&str; 4] = [
+            "threads_run_in_their_groups_and_nothing_is_left_behind",
+            "scheduler_statistics_cover_every_thread",
+            "a_process_that_is_not_put_back_invalidates_the_run",
+            "a_machine_without_the_cpu_controller_is_told_so",
+        ];
+        let before = own();
+        // The names as the test harness has them: without the crate.
+        let module = module_path!().split_once("::").map_or(module_path!(), |(_, rest)| rest);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "--test-threads=1"])
+            .args(MOVING.map(|name| format!("{module}::{name}")))
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}\n{}", String::from_utf8_lossy(&out.stderr));
+        // All four, and not none because a name no longer matches.
+        assert!(said.contains("test result: ok. 4 passed; 0 failed"), "{said}");
+        // This process, and the tests beside this one, stayed put.
+        assert_eq!(own(), before);
+    }
+
     #[test]
     fn mount_point_and_own_group_are_found() {
         let mountinfo = "36 23 0:28 / /sys/fs/cgroup rw,relatime - tmpfs tmpfs rw,mode=755\n\
@@ -704,6 +734,7 @@ mod tests {
     /// not there for a test, and what is tested is that the threads are
     /// put into their groups, measured, and that nothing is left behind.
     #[test]
+    #[ignore = "moves the test process: run by tests_that_move_the_process_run_in_one_of_their_own"]
     fn threads_run_in_their_groups_and_nothing_is_left_behind() {
         let _one = MOVES.lock().unwrap_or_else(|e| e.into_inner());
         let before = own();
@@ -749,6 +780,7 @@ mod tests {
     /// create groups: busy threads that never sleep, so what they have
     /// is time on a CPU, time waiting for one and preemptions.
     #[test]
+    #[ignore = "moves the test process: run by tests_that_move_the_process_run_in_one_of_their_own"]
     fn scheduler_statistics_cover_every_thread() {
         let _one = MOVES.lock().unwrap_or_else(|e| e.into_inner());
         let w = CgroupFair { sched_diag: true, ..quick() };
@@ -768,6 +800,7 @@ mod tests {
     /// A process that cannot be put back where it came from: the run
     /// says so and does not count, whatever it measured.
     #[test]
+    #[ignore = "moves the test process: run by tests_that_move_the_process_run_in_one_of_their_own"]
     fn a_process_that_is_not_put_back_invalidates_the_run() {
         let _one = MOVES.lock().unwrap_or_else(|e| e.into_inner());
         let before = own();
@@ -848,6 +881,7 @@ mod tests {
 
     /// Without the controller the run says so and measures nothing.
     #[test]
+    #[ignore = "moves the test process: run by tests_that_move_the_process_run_in_one_of_their_own"]
     fn a_machine_without_the_cpu_controller_is_told_so() {
         let _one = MOVES.lock().unwrap_or_else(|e| e.into_inner());
         let before = own();
