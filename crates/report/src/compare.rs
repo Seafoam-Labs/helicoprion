@@ -2435,6 +2435,41 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(crate::simple::what(&c).starts_with("The test wakes a whole group"));
     }
 
+    /// The share of slow wake-ups in wake-pingpong: what a percentile on
+    /// a step cannot say. Zero is the usual value and is said.
+    #[test]
+    fn slow_wakeups_are_a_share_in_plain_words() {
+        let session = |slow: (f64, f64)| {
+            let mut files = drifting_session();
+            for (f, is_cand) in files.iter_mut().zip([false, true]) {
+                f.workloads[0].name = "wake-pingpong/loaded".into();
+                for r in f.workloads[0].runs.iter_mut() {
+                    let pct = if is_cand { slow.1 } else { slow.0 };
+                    r.metrics.insert("rtt_blocked_slow_pct".into(), Metric::lower(pct, "%"));
+                }
+            }
+            crate::simple::text(&Comparison::build(files, 0))
+        };
+        let text = session((0.12, 0.03));
+        assert!(
+            text.contains(
+                "• Round trips of a millisecond or more: 4.0× fewer (0.12% → 0.03% of the round trips that needed a \
+                 wake-up)"
+            ),
+            "{text}"
+        );
+        let none = session((0.0, 0.0));
+        assert!(none.contains("• Round trips of a millisecond or more: none in any run under either\n"), "{none}");
+        let from_zero = session((0.0, 0.5));
+        assert!(
+            from_zero.contains(
+                "• Round trips of a millisecond or more: a median of 0.50% of the round trips that needed a wake-up, \
+                 and a median of 0% under base (no run had any); a change from zero is not scored"
+            ),
+            "{from_zero}"
+        );
+    }
+
     /// A burst with more tasks than CPUs has no median of the start
     /// delay, and the plain view shows its two quartiles as quartiles.
     /// Files from before the change still have their median line.

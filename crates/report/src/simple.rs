@@ -211,6 +211,7 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
 fn share_of(metric: &str) -> &'static str {
     match metric {
         "overrun_pct" => "of wake-ups",
+        "rtt_blocked_slow_pct" => "of the round trips that needed a wake-up",
         "weight_accuracy_pct" => "of the intended ratio",
         "cpu_used_pct" => "of the machine's CPU time",
         _ => "of periods",
@@ -227,6 +228,8 @@ struct Failures {
 }
 
 const DEADLINES: Failures = Failures { metric: "deadline_miss_pct", label: "Deadlines missed", verb: "missed" };
+const SLOW_TRIPS: Failures =
+    Failures { metric: "rtt_blocked_slow_pct", label: "Round trips of a millisecond or more", verb: "had" };
 const OVERRUNS: Failures =
     Failures { metric: "overrun_pct", label: "Wake-ups lost because the task was still busy", verb: "lost" };
 
@@ -413,6 +416,11 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 point(c, w, i, "roundtrips_per_s", "Round trips completed", ("more", "fewer")),
                 point(c, w, i, "rtt_blocked_p50", "Typical wake-up delay", delays),
                 slowest("rtt_blocked", "wake-ups", ""),
+                // What the slowest wake-ups are a matter of: how many
+                // are slow, where their percentile sits on a step. A
+                // share of the round trips that needed a wake-up, not of
+                // all: where most hand-offs need none, that is far fewer.
+                failures(c, w, i, &SLOW_TRIPS),
                 // periodic-wake: the same amount of work for every
                 // scheduler, so only how late it ran.
                 point(c, w, i, "wake_p50", "Typical wake-up delay", delays),
