@@ -2338,11 +2338,11 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                     r.metrics.insert("all_done_p99".into(), Metric::lower(200.0 + 800.0 * k, "us"));
                     let lost = if is_cand { overrun.1 } else { overrun.0 };
                     r.metrics.insert("overrun_pct".into(), Metric::lower(lost * wobble, "%"));
+                    r.metrics.insert("bursts_per_s".into(), Metric::info(if is_cand { 498.0 } else { 393.0 }, "1/s"));
                     let overrun = (lost * 10.0) as u64;
                     for (name, n) in [
                         ("bursts_planned", 252),
                         ("bursts", 250),
-                        ("bursts_skipped", 2),
                         ("bursts_complete", 250 - overrun),
                         ("wakeups_due", 1000),
                         ("wakeups_ran", 999 - overrun),
@@ -2368,6 +2368,14 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // percentage.
         assert!(
             text.contains("• Wake-ups lost because the task was still busy: 4.0× fewer (4.59% → 1.15% of wake-ups)"),
+            "{text}"
+        );
+        // How much work each side was asked for, said and not scored.
+        assert!(
+            text.contains(
+                "• Bursts released: 498 a second, 393 under base (observed, not scored; with fewer bursts a scheduler \
+                 was asked for less work)\n"
+            ),
             "{text}"
         );
         assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_BURST)), "{text}");
@@ -2402,7 +2410,10 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             html.contains(&share("wake-ups that found the task done but not asleep yet", "0.1%", "0.1%")),
             "{html}"
         );
-        assert!(html.contains(&share("bursts the waker left out, of those planned", "0.8%", "0.8%")), "{html}");
+        assert!(
+            html.contains(&share("bursts released, of those a punctual waker would release", "99.2%", "99.2%")),
+            "{html}"
+        );
         assert!(html.contains(&share("bursts in which every task took part", "84.0%", "96.0%")), "{html}");
 
         // All three workloads in one report: one test with three parts.

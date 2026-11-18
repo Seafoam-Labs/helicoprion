@@ -272,6 +272,23 @@ fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<St
     }
 }
 
+/// How many bursts wake-burst released under each side. Each burst is
+/// due a period after the one before, so a scheduler under which the
+/// waker runs later is asked for less work. Not scored, and no limit is
+/// drawn: both rates are said, so that a reader sees whether the two
+/// sides were given the same thing to do.
+fn burst_rate(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == "bursts_per_s")?;
+    let (b, v) = medians(row, c.baseline, i)?;
+    Some(format!(
+        "Bursts released: {} a second, {} under {} (observed, not scored; with fewer bursts a scheduler was asked \
+         for less work)",
+        fmt_value(v),
+        fmt_value(b),
+        c.series[c.baseline].label
+    ))
+}
+
 /// How cgroup-fair's two groups shared the CPU time, next to what their
 /// weights ask for, and under the baseline. Observed, not scored: the
 /// score is in how closely the split follows the weights. Where the
@@ -415,6 +432,7 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 point(c, w, i, "all_done_p50", "Until the whole group is done, typically", delays),
                 slowest("all_done", "bursts", ", until the whole group is done"),
                 failures(c, w, i, &OVERRUNS),
+                burst_rate(c, w, i),
                 // cgroup-fair: who got the CPUs, whether that is what
                 // the weights ask for, and whether any were left idle.
                 split(c, w, i),
