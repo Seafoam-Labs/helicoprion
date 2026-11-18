@@ -589,16 +589,22 @@ power source and how the runs were taken, where both files record them. A
 run warns when the 1-minute load average is above 25% of the CPU count. For stable numbers, fix the governor and EPP, stop background
 jobs, keep the same kernel build and do several runs per scheduler.
 
-The report's Conditions tables show when each scheduler was measured and
-the state of the machine then: per round and scheduler, the start time, the
-CPU temperature from before the runs to after them, the CPU frequency right
+The report's Conditions tables show when each scheduler was measured and the
+state of the machine then: per round and scheduler, the start time, the CPU
+temperature from before the runs to after them, the CPU frequency right
 after the runs and the load average. Every `matrix` session has its own
 table and its own clock, and a file taken with `run` is a session of its
-own: round 1 of one session is never laid next to round 1 of another. These are read right before and after
-every run, outside the measurement. Nothing in the table is scored. It is
-there to judge whether the machine stayed the same throughout: visits of one
-round that differ much were not measured under the same conditions, and a
-round unlike the others is where drift between rounds shows.
+own: round 1 of one session is never laid next to round 1 of another. These
+are read right before and after every run, outside the measurement. The load
+average is the 1-minute one and includes the benchmark's own threads of the
+last minute. After a workload that keeps many threads busy it stays near
+their number well into the workloads that follow: in the first sessions with
+`cgroup-fair` it read 12 to 21 before the first workload of every visit,
+left there by the visit before. In a suite with such a workload it says
+little about what else ran on the machine. Nothing in the table is scored.
+It is there to judge whether the machine stayed the same throughout: visits
+of one round that differ much were not measured under the same conditions,
+and a round unlike the others is where drift between rounds shows.
 
 When a population's share of the round trips differs by a factor of 2 or
 more between the two sides, for example 99.9% blocked round trips against
