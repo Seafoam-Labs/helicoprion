@@ -38,5 +38,6 @@ package() {
   cd "$pkgname-$pkgver"
   install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
-  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  # README.md, and METHODOLOGY.md from 0.5.0 on: whatever the release has.
+  install -Dm644 ./*.md -t "$pkgdir/usr/share/doc/$pkgname/"
 }

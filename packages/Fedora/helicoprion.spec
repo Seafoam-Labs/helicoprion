@@ -31,7 +31,8 @@ install -Dm755 target/release/helicoprion %{buildroot}%{_bindir}/helicoprion
 
 %files
 %license LICENSE-MIT LICENSE-APACHE
-%doc README.md
+# README.md, and METHODOLOGY.md from 0.5.0 on: whatever the release has.
+%doc *.md
 
 # Binaries
 %{_bindir}/helicoprion
