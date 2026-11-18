@@ -116,6 +116,40 @@
 //! `MIN_BURSTS_PCT` of the planned bursts is invalid outright, since at
 //! half the rate the machine sleeps twice as long between bursts.
 //!
+//! # Idle states
+//!
+//! Between two bursts the whole machine has nothing to do, and a
+//! machine with nothing to do goes to sleep. On the machine this was
+//! measured on, the waker then came 0.7 ms late at the median to a
+//! burst due after 2 ms, and a woken task started after 46 µs, of which
+//! 4 µs were left once the deep idle states were ruled out: most of
+//! `start` was the processor waking up. How deep the machine sleeps
+//! depends on what the scheduler did before, so the waker was late by
+//! different amounts under different schedulers, and with bursts spaced
+//! from the release they got 378 to 498 bursts a second.
+//!
+//! Where the process may ask for it (root) and the machine says what
+//! to ask for, the run therefore holds a request for shallow idle
+//! states only (see `idle`). That takes the time to leave a deep idle
+//! state out of the waker's timing and out of the tasks' start delays,
+//! where it was a large source of variation between schedulers, and
+//! makes their comparison more representative. It does not make the
+//! waker punctual or the bursts equal in number by itself: the
+//! scheduler, interrupts and preemption still delay it, and
+//! `bursts_per_s` and `release_late` are there to show by how much.
+//!
+//! Such a run has `idle: shallow` and the bound, `idle_latency_us`, in
+//! its parameters: a property of the run, the same in every one of its
+//! repetitions, and two runs with different bounds are different
+//! experiments. Where the process may not ask, or the idle states
+//! cannot be read, the run is as before and is never compared with one
+//! that did.
+//!
+//! What is given up is waking from deep idle, which is real, and where
+//! a scheduler prefers a CPU that sleeps lightly, also a decision of
+//! its own. That belongs in a workload made for it, not in one about
+//! placing a group of tasks.
+//!
 //! # Start and failure
 //!
 //! As in periodic-wake: every task counts itself in before the first
@@ -133,6 +167,7 @@ use serde_json::json;
 use crate::Workload;
 use crate::clock::{Alive, PreciseTimers, TIMER_SLACK_NS, burn, now_ns, ns, sleep_until};
 use crate::futex::{self, Wait};
+use crate::idle;
 use crate::samples::{min_samples_for, population};
 use crate::schedstat::{self, Collector};
 
@@ -187,6 +222,9 @@ pub struct WakeBurst {
     pub work: Duration,
     /// Read every task's scheduler statistics.
     pub sched_diag: bool,
+    /// Keep the machine out of deep idle states for the run, where this
+    /// process may ask for that.
+    pub shallow_idle: bool,
 }
 
 impl Workload for WakeBurst {
@@ -214,7 +252,14 @@ impl Workload for WakeBurst {
             // no such entry, and are not compared with these.
             "spaced_from": "release",
         });
-        schedstat::mark(params, self.sched_diag)
+        let mut params = schedstat::mark(params, self.sched_diag);
+        // Only when it will be done: a run that may not ask compares
+        // with the results from before there was anything to ask for.
+        if let Some(limit_us) = self.shallow() {
+            params["idle"] = "shallow".into();
+            params["idle_latency_us"] = limit_us.into();
+        }
+        params
     }
 
     fn headline_metrics(&self) -> &'static [&'static str] {
@@ -281,6 +326,11 @@ struct TaskOut {
 }
 
 impl WakeBurst {
+    /// The bound on idle exit latency this run holds, if it holds one.
+    fn shallow(&self) -> Option<i32> {
+        self.shallow_idle.then(idle::bound).flatten()
+    }
+
     /// More tasks than CPUs: part of every burst has to wait for one.
     fn crowded(&self) -> bool {
         self.tasks > std::thread::available_parallelism().map_or(1, usize::from)
@@ -296,6 +346,12 @@ impl WakeBurst {
             released: (0..bursts + 1).map(|_| AtomicU64::new(0)).collect(),
             ready: AtomicUsize::new(0),
         });
+        // Held until every thread is joined. What the parameters say
+        // was done is done, or the run does not count.
+        let _idle = match self.shallow().map(idle::Shallow::hold).transpose() {
+            Ok(held) => held,
+            Err(why) => return invalid(format!("keeping the machine out of deep idle states: {why}")),
+        };
         let stats = Arc::new(Collector::new(self.sched_diag));
         let mut handles = Vec::with_capacity(self.tasks);
         let mut failed: Option<String> = None;
@@ -624,6 +680,7 @@ mod tests {
             period: Duration::from_millis(2),
             work: Duration::from_micros(50),
             sched_diag: false,
+            shallow_idle: false,
         }
     }
 
@@ -713,6 +770,32 @@ mod tests {
         assert_eq!((r.counters["bursts_planned"], r.counters["bursts"]), (1, 1));
     }
 
+    /// Where the process may ask for shallow idle states and the machine
+    /// says which, the run asks and its parameters say so, bound
+    /// included; otherwise it runs as it always did and its parameters
+    /// are the old ones. The bound is a parameter and never a counter:
+    /// it is not something to add up over runs.
+    #[test]
+    fn deep_idle_is_ruled_out_where_the_run_may_ask() {
+        let _one = idle::REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let w = WakeBurst { shallow_idle: true, ..quick(2) };
+        let r = run(&w, Duration::from_millis(100), &Hooks::default());
+        match idle::bound() {
+            Some(limit_us) => {
+                assert!(limit_us >= 1);
+                assert_eq!(w.params()["idle"], "shallow");
+                assert_eq!(w.params()["idle_latency_us"], limit_us);
+            }
+            None => {
+                assert!(w.params().get("idle").is_none() && w.params().get("idle_latency_us").is_none());
+                assert_eq!(w.params(), WakeBurst { shallow_idle: false, ..quick(2) }.params());
+            }
+        }
+        assert!(!r.counters.contains_key("idle_latency_us"), "{:?}", r.counters);
+        // Not asked for: no such parameters, whoever runs it.
+        assert!(quick(2).params().get("idle").is_none() && quick(2).params().get("idle_latency_us").is_none());
+    }
+
     /// With scheduler statistics: the tasks' counters, not the waker's.
     #[test]
     fn scheduler_statistics_cover_every_task() {
@@ -762,6 +845,7 @@ mod tests {
             period: Duration::from_millis(2),
             work: Duration::from_millis(9),
             sched_diag: false,
+            shallow_idle: false,
         };
         let r = run(&w, Duration::from_millis(150), &Hooks::default());
         let c = &r.counters;
@@ -785,6 +869,7 @@ mod tests {
             period: Duration::from_millis(2),
             work: Duration::from_millis(40),
             sched_diag: false,
+            shallow_idle: false,
         };
         let hooks = Hooks::default();
         let r = run(&w, Duration::from_millis(6), &hooks);

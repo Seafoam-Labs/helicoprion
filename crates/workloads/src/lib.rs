@@ -6,6 +6,7 @@ pub mod cgroup;
 mod clock;
 mod futex;
 pub mod hog;
+mod idle;
 pub mod periodic;
 pub mod runner;
 pub mod samples;
@@ -78,6 +79,7 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
             period: std::time::Duration::from_millis(2),
             work: std::time::Duration::from_micros(200),
             sched_diag: opts.sched_diag,
+            shallow_idle: true,
         })
     };
     let bursts = || vec![burst("half", cpus / 2), burst("full", cpus), burst("double", cpus * 2)];

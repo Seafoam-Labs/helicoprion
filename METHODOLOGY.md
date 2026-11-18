@@ -350,6 +350,56 @@ how much the rate varies by itself. Only a run that got fewer than half of
 the planned bursts is invalid outright: at half the rate the machine sleeps
 twice as long between bursts, and that is no longer the workload.
 
+Between two bursts the whole machine has nothing to do, and a machine with
+nothing to do goes to sleep, the deeper the longer it expects to. Coming
+back takes time that has nothing to do with the scheduler. On the machine
+the first sessions ran on, the waker came 0.7 ms late at the median to a
+burst due after 2 ms, and a woken task started after 46 µs. With the deep
+idle states ruled out the waker was 12 µs late and the task started after
+4 µs, so most of `start` had been the processor waking up. How deep the
+machine sleeps depends on what the scheduler did a moment before, so the
+waker was late by different amounts under different schedulers, and they
+got anywhere from 378 to 498 bursts a second.
+
+Where the process may ask for it, which takes root as `matrix` has, and
+the machine says what to ask for, a run of `wake-burst` therefore holds a
+request for shallow idle states for its length. This is the kernel's PM QoS
+interface, `/dev/cpu_dma_latency`: while the file is held open with a bound
+in microseconds written to it, no CPU enters an idle state that takes longer
+to leave, and the request ends when the file is closed, also if the process
+dies. What is in force is read back, and a run in which the bound is not in
+force is invalid.
+
+The bound is the exit latency of the shallowest idle state the machine has
+in use: the smallest one above zero among the states cpuidle lists that are
+not switched off. That keeps a halted CPU and rules out the deeper states.
+It is not zero, which would keep every CPU spinning in the idle loop, and it
+is not guessed: a bound of one microsecond on a machine whose first state
+takes two would leave only the idle loop. Where the states cannot be read,
+the request is not made.
+
+This takes the time to leave a deep idle state out of the waker's timing
+and out of the tasks' start delays, where it was a large source of variation
+between schedulers, and makes their comparison more representative. It does
+not by itself make the waker punctual or the number of bursts equal: the
+scheduler, interrupts and preemption still delay the waker, and
+`bursts_per_s` and `release_late` show by how much.
+
+A run with the request has `idle: shallow` and the bound, `idle_latency_us`,
+among its parameters. The bound is a property of the run, the same in each
+of its repetitions, so it is a parameter and not a counter, and the report
+shows a workload's parameters with its diagnostics. Runs with different
+bounds are different experiments. A run that may not ask, as `run` without
+root, or that cannot read the idle states, sleeps as deeply as the machine
+likes and is never compared with one that asked.
+
+What is given up is waking from deep idle. It is real, and where a
+scheduler prefers a CPU that sleeps lightly it is also a decision of the
+scheduler. It belongs in a workload made for it and not in one about placing
+a group of tasks, where it made the schedulers' loads unequal and hid their
+own share of the delay. The other workloads never let the whole machine fall
+asleep and are left as they are.
+
 The start and the handling of failures are those of `periodic-wake`: all
 tasks report ready before the first burst, and a run that cannot start or
 in which a thread fails ends as invalid after every thread has been joined.
