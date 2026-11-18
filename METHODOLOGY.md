@@ -694,10 +694,12 @@ session are not independent samples of how sessions differ.
   session, and the range of the position effect. The largest change is the
   noise that metric has shown on this machine; a threshold below it has
   already been crossed without any difference between schedulers. The report
-  says how many sessions measured the pair at all, how many had enough
-  rounds to score a change and how many did not balance the order of the
-  arms: a session without data, or too short to score anything, found no
-  false alarm and confirms nothing.
+  says how many sessions measured the pair at all, in how many of them a
+  confidence interval was available and how many did not balance the order
+  of the arms. A session without data, or without an interval for any
+  metric, found no false alarm and confirms nothing. That intervals were
+  available is all that is claimed: an interval is needed for a change to
+  be scored and is not enough for it.
 - **Levels**: the measured values themselves, session by session, with the
   largest session median over the smallest. This is the stability of the
   result apart from any comparison. When a scheduler's own values hardly

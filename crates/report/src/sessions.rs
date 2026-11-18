@@ -498,8 +498,9 @@ pub struct Coverage {
     pub sessions: usize,
     /// Sessions with an estimate for some metric of the pair.
     pub measured: usize,
-    /// Of those: sessions where some change has an interval, so that it
-    /// could have been scored. The others had too few rounds for any.
+    /// Of those: sessions where some change has a confidence interval.
+    /// An interval is needed for a change to be scored and is not
+    /// enough for it; why a session has none is not recorded here.
     /// Taken from the estimates themselves, not from the reason a change
     /// went unscored: a minor population is named as the reason before
     /// the missing interval is.

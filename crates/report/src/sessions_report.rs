@@ -223,18 +223,20 @@ pub fn text(a: &Analysis) -> String {
                     crate::calibration::above(silencing)
                 );
             }
-            // No alarm is a finding only where something could be scored.
+            // No alarm is a finding only where there was an interval to
+            // score with. That an interval exists is all that is said:
+            // other conditions can still keep a metric from being scored.
             None if cover.with_interval > 0 => {
                 let _ = writeln!(
                     out,
-                    "  no false alarm in {} metrics over {} session{} that could score them",
+                    "  no false alarm in {} metrics; confidence intervals available in {} session{}",
                     of.len(),
                     cover.with_interval,
                     if cover.with_interval == 1 { "" } else { "s" }
                 );
             }
             None => {
-                let _ = writeln!(out, "  nothing could be scored, so nothing is known about false alarms");
+                let _ = writeln!(out, "  no session has a confidence interval, so nothing is known about false alarms");
             }
         }
         let largest = of
@@ -277,7 +279,7 @@ fn coverage_words(c: Coverage) -> Vec<String> {
     if c.with_interval < c.measured {
         let without = c.measured - c.with_interval;
         out.push(format!(
-            "{without} measured session{} had too few rounds to score any change: no alarm there is no finding",
+            "{without} measured session{} had no confidence interval for any metric: the absence of an alarm there is inconclusive",
             s(without)
         ));
     }
@@ -837,7 +839,7 @@ scx_cosmos
         let a = analyse(files, Options::default()).unwrap();
         assert!(
             text(&a).contains(
-                "A/A: default #2 is default again\n  no false alarm in 2 metrics over 2 sessions that could score them\n"
+                "A/A: default #2 is default again\n  no false alarm in 2 metrics; confidence intervals available in 2 sessions\n"
             ),
             "{}",
             text(&a)
@@ -872,7 +874,7 @@ scx_cosmos
         assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 2, with_interval: 2, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains(
-            "A/A: default #2 is default again\n  measured in 2 of 5 sessions; 3 sessions without comparable data for this pair say nothing about it\n  no false alarm in 2 metrics over 2 sessions that could score them\n"
+            "A/A: default #2 is default again\n  measured in 2 of 5 sessions; 3 sessions without comparable data for this pair say nothing about it\n  no false alarm in 2 metrics; confidence intervals available in 2 sessions\n"
         ), "{said}");
         assert!(!said.contains("over 5 sessions"), "{said}");
         let page = html(&a);
@@ -887,7 +889,7 @@ scx_cosmos
         assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, with_interval: 0, unbalanced: 0 });
         let said = text(&a);
         assert!(said.contains(
-            "  5 measured sessions had too few rounds to score any change: no alarm there is no finding\n  nothing could be scored, so nothing is known about false alarms\n"
+            "  5 measured sessions had no confidence interval for any metric: the absence of an alarm there is inconclusive\n  no session has a confidence interval, so nothing is known about false alarms\n"
         ), "{said}");
         assert!(!said.contains("no false alarm in"), "{said}");
 
@@ -899,7 +901,7 @@ scx_cosmos
         let a = sessions(6, &[]);
         assert_eq!(a.coverage("default #2"), Coverage { sessions: 5, measured: 5, with_interval: 5, unbalanced: 0 });
         let said = text(&a);
-        assert!(said.contains("A/A: default #2 is default again\n  no false alarm in 2 metrics over 5 sessions that could score them\n"), "{said}");
+        assert!(said.contains("A/A: default #2 is default again\n  no false alarm in 2 metrics; confidence intervals available in 5 sessions\n"), "{said}");
     }
 
     /// A session counts as able to score only when some change there has
@@ -929,7 +931,10 @@ scx_cosmos
         assert!(all.iter().all(|n| n.unclear == Some(UnclearReason::MinorPopulation) && n.delta.ci.is_none()));
         assert_eq!(a.coverage("default #2"), Coverage { sessions: 2, measured: 2, with_interval: 0, unbalanced: 0 });
         let said = text(&a);
-        assert!(said.contains("nothing could be scored, so nothing is known about false alarms"), "{said}");
+        assert!(
+            said.contains("no session has a confidence interval, so nothing is known about false alarms"),
+            "{said}"
+        );
         assert!(!said.contains("no false alarm in"), "{said}");
     }
 
