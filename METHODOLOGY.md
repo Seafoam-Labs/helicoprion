@@ -233,7 +233,12 @@ that missed no deadline has 0%. When that side is the baseline, the change
 is undefined and the report says so instead of scoring it; such a
 difference shows in the tail of `response`. The counters `periods_due`,
 `periods_ran`, `periods_late` and `periods_skipped` give the numbers behind
-both.
+both, and `task0_periods_missed`, `task1_periods_missed` and so on split the
+late and skipped periods by task, in the order in which the tasks wake
+within a period. The tasks differ in nothing but that instant, so misses
+that are one task's and not the others' point at when it wakes. Which task
+that is can change from run to run; the report sums the counters over the
+runs, and the result file has them for each.
 
 Each task sets its timer slack to 1 ns and reads it back. The default of
 50 µs lets the kernel fire a timer that much late on purpose, which would

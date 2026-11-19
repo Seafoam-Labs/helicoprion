@@ -33,6 +33,11 @@
 //! share on time, 99.0% against 99.9% is under one percent, and from
 //! 95.3% on not even a perfect 100% would reach a 5% threshold.
 //!
+//! `task<i>_periods_missed` splits the late and skipped periods by task,
+//! numbered in the order of their phases. The tasks do the same thing at
+//! different instants: misses that are one task's and not the others'
+//! come from when that task wakes, not from what it is.
+//!
 //! # Timing
 //!
 //! Releases are absolute (`clock_nanosleep` with `TIMER_ABSTIME` on
@@ -357,6 +362,12 @@ fn summarize(outs: &[TaskOut], duration: Duration, began: Instant, hog: Option<(
     c.insert("periods_ran".into(), ran);
     c.insert("periods_late".into(), late);
     c.insert("periods_skipped".into(), skipped);
+    // Per task, in the order of their phases: whether the misses are
+    // every task's or one's. Counted from what each task returns, nothing
+    // is added to what it does per period.
+    for (i, o) in outs.iter().enumerate() {
+        c.insert(format!("task{i}_periods_missed"), o.late + o.skipped);
+    }
     for (name, rec, curve) in [(POP_WAKE, &wake, wake_curve), (POP_RESPONSE, &response, response_curve)] {
         r.latency_histograms.insert(name.into(), rec.to_histogram("ns"));
         if !curve.is_empty() {
@@ -425,6 +436,10 @@ mod tests {
         assert_eq!((missed.better, missed.unit.as_str()), (Better::Lower, "%"));
         assert_eq!((on_time.better, on_time.unit.as_str()), (Better::Neither, "%"));
         let expected = (c["periods_late"] + c["periods_skipped"]) as f64 / due as f64 * 100.0;
+        // And split by task: one count each, together all of them.
+        let by_task: Vec<u64> = c.iter().filter(|(k, _)| k.starts_with("task")).map(|(_, v)| *v).collect();
+        assert!(c.contains_key("task0_periods_missed") && c.contains_key("task1_periods_missed"));
+        assert_eq!((by_task.len(), by_task.iter().sum::<u64>()), (2, c["periods_late"] + c["periods_skipped"]));
         assert!((missed.value - expected).abs() < 1e-9 && (0.0..=100.0).contains(&missed.value));
         assert!((missed.value + on_time.value - 100.0).abs() < 1e-9);
         // 600 samples carry a p50 and not a p99.9.
