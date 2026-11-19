@@ -738,6 +738,7 @@ impl Comparison {
         let mut warnings = Vec::new();
         let mut all_mixes = Vec::new();
         let mut diagnostics = Vec::new();
+        warnings.extend(tick_aligned(&series));
 
         for (si, s) in series.iter().enumerate() {
             if !s.file.restart_detectable {
@@ -1040,6 +1041,64 @@ pub fn session_key(f: &ResultFile) -> Option<SessionKey> {
         Some(id) => format!("id:{id}"),
         None => format!("legacy:{}:{}", f.started_at, d.schedulers.join("\u{1f}")),
     }))
+}
+
+/// A warning for every period of periodic-wake that is a whole number of
+/// the nominal timer ticks of the kernel it ran on, naming the results it
+/// is in.
+///
+/// Such a period can keep the releases at one phase against the tick for
+/// a whole run. Where it did, under a scheduler that lets a woken task
+/// wait for the tick, missed deadlines differed tenfold between runs by
+/// nothing but the moment a run started, and hardly at all under other
+/// schedulers (METHODOLOGY.md, "The period and the kernel's tick"). This
+/// is about the nominal grid: where a CPU's ticks really are, offset by
+/// `skew_tick` or stopped while it is idle, is not in a result file.
+/// Files that do not record the tick rate, those of 0.5.0 among them,
+/// cannot be checked and get no warning.
+fn tick_aligned(series: &[Series]) -> Vec<String> {
+    /// Workloads and labels.
+    type Where<'a> = (Vec<&'a str>, Vec<&'a str>);
+    // By period in µs, tick rate and whether a phase was set.
+    let mut found: BTreeMap<(u64, u32, bool), Where> = BTreeMap::new();
+    for s in series {
+        let Some(hz) = s.file.system.tick_hz.filter(|hz| *hz > 0) else { continue };
+        for w in s.file.workloads.iter().filter(|w| w.name.starts_with("periodic-wake")) {
+            let Some(period) = w.params.get("period_us").and_then(|v| v.as_u64()) else { continue };
+            // A whole number of ticks: period × rate is a whole number
+            // of seconds. In 128 bits, where the product cannot overflow:
+            // a saturated one would lose what is being asked of it.
+            if period == 0 || !(u128::from(period) * u128::from(hz)).is_multiple_of(1_000_000) {
+                continue;
+            }
+            let (workloads, labels) = found.entry((period, hz, w.params.get("phase_us").is_some())).or_default();
+            if !workloads.contains(&w.name.as_str()) {
+                workloads.push(&w.name);
+            }
+            if !labels.contains(&s.label.as_str()) {
+                labels.push(&s.label);
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|((period, hz, phase), (workloads, labels))| {
+            let which = if phase {
+                "Here the phase was set, and the results are for that phase"
+            } else {
+                "Here the phase is whatever each run happened to start with, and runs can differ for that reason"
+            };
+            format!(
+                "{}: the period of {period} µs is a whole number of the kernel's nominal timer ticks ({hz} Hz) in \
+                 {}. This can keep the releases at one phase against the tick for a whole run and make missed \
+                 deadlines and the slowest wake-ups follow that phase, under some schedulers far more than under \
+                 others. {which}. A period that is no whole number of ticks, such as 1010 µs, moves through the \
+                 phases within a run, which limits this kind of dependence",
+                workloads.join(", "),
+                labels.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// Human-readable differences that can affect results.
@@ -3365,6 +3424,65 @@ after a visit's hottest run, 4.25 GHz right after the runs, load average at most
     /// What newer files record about the machine and the protocol is
     /// compared too, where both files have it; a file without a field is
     /// not "different".
+    /// A period of periodic-wake that is a whole number of the kernel's
+    /// ticks is warned about, once, with the results it is in; one that
+    /// is not, or a file that cannot tell, is left alone.
+    #[test]
+    fn a_period_of_whole_ticks_is_warned_about() {
+        let periodic = |label: &str, hz: Option<u32>, params: serde_json::Value| {
+            let mut f = file(label, &[1.0], 1);
+            f.system.tick_hz = hz;
+            let mut loaded = f.workloads[0].clone();
+            (f.workloads[0].name, loaded.name) = ("periodic-wake".into(), "periodic-wake/loaded".into());
+            (f.workloads[0].params, loaded.params) = (params.clone(), params);
+            f.workloads.push(loaded);
+            f
+        };
+        let about = |files: Vec<ResultFile>| -> Vec<String> {
+            let c = Comparison::build(files, 0);
+            c.warnings.into_iter().filter(|w| w.contains("timer ticks")).collect()
+        };
+        let at = |us: u64| json!({ "tasks": 4, "period_us": us });
+
+        // 1 ms with a tick of 1 ms, in both files: one warning for both
+        // workloads and both results.
+        let w = about(vec![periodic("a", Some(1000), at(1000)), periodic("b", Some(1000), at(1000))]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("periodic-wake, periodic-wake/loaded: the period of 1000 µs is a whole number"));
+        assert!(w[0].contains("(1000 Hz) in a, b.") && w[0].contains("whatever each run happened to start with"));
+        // What can happen, not what does: the ticks of the CPUs are not
+        // in the file, and schedulers differ in how much they follow it.
+        assert!(w[0].contains("nominal timer ticks") && w[0].contains("This can keep") && !w[0].contains("avoids"));
+        // The suite's period is no multiple of any tick.
+        for hz in [100, 250, 300, 1000] {
+            assert!(about(vec![periodic("a", Some(hz), at(1010))]).is_empty(), "{hz}");
+        }
+        // 4 ms with a tick of 4 ms is, and so is 2 ms with one of 1 ms;
+        // 1 ms with a tick of 4 ms is not.
+        assert_eq!(about(vec![periodic("a", Some(250), at(4000))]).len(), 1);
+        assert_eq!(about(vec![periodic("a", Some(1000), at(2000))]).len(), 1);
+        assert!(about(vec![periodic("a", Some(250), at(1000))]).is_empty());
+        // A tick of a third of 10 ms: 10 ms is three of them.
+        assert_eq!(about(vec![periodic("a", Some(300), at(10_000))]).len(), 1);
+        // No tick rate in the file, as in those of 0.5.0: nothing to say.
+        assert!(about(vec![periodic("a", None, at(1000))]).is_empty());
+        // Only the result that has it is named.
+        let w = about(vec![periodic("a", None, at(1000)), periodic("b", Some(1000), at(1000))]);
+        assert!(w.len() == 1 && w[0].contains("(1000 Hz) in b."), "{w:?}");
+        // With a phase set the result is that phase's, which is said.
+        let w = about(vec![periodic("a", Some(1000), json!({ "period_us": 1000, "phase_us": 150 }))]);
+        assert!(w.len() == 1 && w[0].contains("Here the phase was set"), "{w:?}");
+        // A product that does not fit 64 bits is still divided exactly.
+        let huge = 1_000_000 * (u64::MAX / 1_000_000);
+        assert_eq!(about(vec![periodic("a", Some(1000), at(huge))]).len(), 1);
+        assert!(about(vec![periodic("a", Some(1000), at(huge + 1))]).is_empty());
+        assert!(about(vec![periodic("a", Some(3), at(u64::MAX))]).is_empty());
+        // Other workloads have periods too, and are not this.
+        let mut burst = periodic("a", Some(1000), at(1000));
+        burst.workloads.iter_mut().for_each(|w| w.name = w.name.replace("periodic-wake", "wake-burst"));
+        assert!(about(vec![burst]).is_empty());
+    }
+
     #[test]
     fn recorded_protocol_and_machine_differences_are_noted() {
         use helicoprion_core::{Protocol, Topology};
