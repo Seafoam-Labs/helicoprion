@@ -175,6 +175,9 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // cgroup-fair measures in a second process of this program: if this
+    // is that process, it does that and does not come back.
+    helicoprion_workloads::cgroup::child_main();
     match Cli::parse().cmd {
         Cmd::Info { json } => info(json),
         Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag, sched_diag, periodic } => {

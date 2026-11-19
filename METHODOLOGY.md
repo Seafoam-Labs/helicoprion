@@ -123,9 +123,10 @@ about it.
 The same holds for where the benchmark itself runs. The control groups of
 the process are read when the session starts and after every run, and a run
 after which they differ is invalid, as is every later one: its limits and
-weights are no longer those of the runs before. `cgroup-fair` moves the
-process for its own runs and puts it back, and this is what notices if that
-ever fails.
+weights are no longer those of the runs before. No workload moves the
+benchmark: `cgroup-fair`, which needs threads in control groups of its own,
+has them in a second process. If the benchmark is found elsewhere,
+something outside it moved it.
 
 ## What is measured
 
@@ -542,17 +543,36 @@ missing; nothing is measured without the groups.
 
 The threads of one process can only be in different groups in a threaded
 subtree. For the run the benchmark creates `helicoprion-<pid>` under the
-root of the hierarchy with two threaded children, gives them their weights,
-moves its own process into the new group and each thread into its child.
-Afterwards the process goes back to the group it came from and the three
-groups are removed, however the run ends. Moving the benchmark's own process
-changes where everything after it is measured, so none of this is taken on
-trust. A run is invalid, whatever it measured, when the move changes the
-CPUs the process may use, which happens when the group it came from has a
-cpuset that the new one has not, when the process cannot be moved back, when
-it is not in the group it started in afterwards, or when one of the groups
-cannot be removed. The threads run for half a second before the window
-starts, so that the scheduler has spread them and the split has settled.
+root of the hierarchy with two threaded children and gives them their
+weights, and removes the three groups afterwards, however the run ends.
+
+The threads are not the benchmark's own. Threads can only be put into the
+children of a group their process is in, and moving a process moves all of
+its threads: the benchmark would change control groups for the run, and
+everything after it would rest on it having been put back, into a group
+that may by then refuse it. Up to 0.6.0 it did that and checked it. Now the
+benchmark starts itself a second time, and that process moves into the new
+group, starts the threads, measures them and hands its result back as one
+line of text. It does not move back: it ends, and every thread with it,
+whatever went wrong inside. The benchmark stays where it was started.
+
+A run is invalid, whatever it measured, when that process gives no result
+(it could not be started, was killed, or ended without one; the reason and
+the end of what it wrote are in the result file), when it wrote a result
+and then did not end as it should, when its move changed the CPUs it may
+use, which happens when the group the benchmark was started in has a cpuset
+that the new one has not, or when one of the groups cannot be removed. The
+process ends itself when the benchmark dies and after a time that no run
+takes, so busy threads on every CPU are not left behind; before it moves or
+starts anything it checks that the benchmark is still its parent, because a
+parent that died before the process asked to be told is not reported. A
+benchmark that is killed outright cannot remove the groups, and leaves
+three empty ones under the root (`helicoprion-<pid>` with `a` and `b`)
+until they are removed by hand or the machine restarts. What
+is measured is what it was: the same threads, groups, weights and clocks,
+read by the process the threads belong to. The threads run for half a
+second before the window starts, so that the scheduler has spread them and
+the split has settled.
 
 The number of CPUs the workload is sized for has to be the number the
 threads can run on, or there is nothing to split: four threads sized for two

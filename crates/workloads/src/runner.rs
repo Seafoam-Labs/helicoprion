@@ -6,10 +6,10 @@
 //! change) as well as a scheduler swapped in between runs.
 //!
 //! A run is also invalid when the benchmark is no longer in the control
-//! groups it started in. A workload may move the process for its own
-//! run and has to put it back; if that fails, or something else moves
-//! the process, every run from then on is measured under other limits
-//! and weights than the ones before, and must not pass for the same
+//! groups it started in. No workload moves the process (cgroup-fair
+//! measures in a process of its own for that reason), but something
+//! else can, and every run from then on is measured under other limits
+//! and weights than the ones before: it must not pass for the same
 //! session.
 
 use std::sync::OnceLock;
