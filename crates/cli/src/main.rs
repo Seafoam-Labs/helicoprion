@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use helicoprion_core::{MIN_READABLE_SCHEMA, Probe, Protocol, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
 use helicoprion_report::{Comparison, Options, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
-use helicoprion_workloads::{SUITES, SuiteOpts, suite};
+use helicoprion_workloads::{PERIODIC_PERIOD, PERIODIC_WORK, SUITES, SuiteOpts, suite};
 
 #[derive(Parser)]
 #[command(name = "helicoprion", version, about)]
@@ -59,6 +59,8 @@ enum Cmd {
         /// only compared with other runs with them.
         #[arg(long)]
         sched_diag: bool,
+        #[command(flatten)]
+        periodic: Periodic,
     },
     /// Interleave several schedulers, switched with scxcli (scx.service).
     ///
@@ -132,6 +134,8 @@ enum Cmd {
         /// them is only compared with other sessions with them.
         #[arg(long)]
         sched_diag: bool,
+        #[command(flatten)]
+        periodic: Periodic,
         /// Output directory (default: helicoprion-matrix-<unix time>).
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -173,16 +177,11 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Info { json } => info(json),
-        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag, sched_diag } => run(RunArgs {
-            suite,
-            runs,
-            warmup,
-            duration,
-            cooldown,
-            label,
-            output,
-            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag },
-        }),
+        Cmd::Run { suite, runs, warmup, duration, cooldown, label, output, no_cpu_diag, sched_diag, periodic } => {
+            let suite_opts =
+                periodic.apply(&suite, SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag, ..Default::default() })?;
+            run(RunArgs { suite, runs, warmup, duration, cooldown, label, output, suite_opts })
+        }
         Cmd::Matrix {
             scheds,
             recommended,
@@ -200,13 +199,13 @@ fn main() -> Result<()> {
             systemctl,
             no_cpu_diag,
             sched_diag,
+            periodic,
             output,
             thresholds,
         } => matrix_cmd(MatrixArgs {
             scheds,
             recommended,
             rounds,
-            suite,
             runs_per_visit,
             warmup,
             duration,
@@ -217,7 +216,9 @@ fn main() -> Result<()> {
             allow_ops_mismatch,
             scxcli,
             systemctl,
-            suite_opts: SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag },
+            suite_opts: periodic
+                .apply(&suite, SuiteOpts { cpu_diag: !no_cpu_diag, sched_diag, ..Default::default() })?,
+            suite,
             output,
             opts: thresholds.options()?,
             simple: thresholds.simple,
@@ -295,6 +296,47 @@ fn info(json: bool) -> Result<()> {
         println!("Load (1m):  {l:.2}");
     }
     Ok(())
+}
+
+/// Settings of periodic-wake for looking into a result; a run with either
+/// has other workload parameters and is not compared with one without.
+#[derive(clap::Args, Clone, Copy, Default)]
+struct Periodic {
+    /// Period of periodic-wake in microseconds instead of 1000. A period
+    /// that is no multiple of the kernel's timer tick (1010 with a tick
+    /// of 1 ms) does not keep one place against it for a whole run.
+    #[arg(long, value_name = "US")]
+    periodic_period_us: Option<u64>,
+    /// Place periodic-wake's releases on the clock: those of the first
+    /// task at this many microseconds past a multiple of the period, the
+    /// other tasks evenly after it. Without it, where they fall depends
+    /// on the moment a run starts. This is a place on CLOCK_MONOTONIC,
+    /// not against the timer tick of any CPU.
+    #[arg(long, value_name = "US")]
+    periodic_phase_us: Option<u64>,
+}
+
+impl Periodic {
+    /// `opts` with these settings, checked against the suite they are for.
+    fn apply(self, suite: &str, opts: SuiteOpts) -> Result<SuiteOpts> {
+        let Periodic { periodic_period_us: period, periodic_phase_us: phase } = self;
+        if (period.is_some() || phase.is_some()) && !matches!(suite, "periodic" | "all") {
+            bail!("--periodic-period-us and --periodic-phase-us need a suite with periodic-wake: periodic or all");
+        }
+        let work = PERIODIC_WORK.as_micros() as u64;
+        if period.is_some_and(|us| us <= work) {
+            bail!("--periodic-period-us must be more than the work of a period, {work} µs");
+        }
+        let period_us = period.unwrap_or(PERIODIC_PERIOD.as_micros() as u64);
+        if phase.is_some_and(|us| us >= period_us) {
+            bail!("--periodic-phase-us must be less than the period of {period_us} µs");
+        }
+        Ok(SuiteOpts {
+            periodic_period: period.map(Duration::from_micros),
+            periodic_phase: phase.map(Duration::from_micros),
+            ..opts
+        })
+    }
 }
 
 struct RunArgs {
@@ -779,5 +821,30 @@ mod tests {
         let why = result_files(std::slice::from_ref(&missing)).unwrap_err().to_string();
         fs::remove_dir(&missing).unwrap();
         assert!(why.ends_with("no result files (.json) in this directory"), "{why}");
+    }
+
+    #[test]
+    fn periodic_settings_are_checked_before_anything_runs() {
+        let set = |period, phase| Periodic { periodic_period_us: period, periodic_phase_us: phase };
+        let apply = |p: Periodic, suite: &str| p.apply(suite, SuiteOpts { sched_diag: true, ..Default::default() });
+        let why = |p: Periodic, suite: &str| apply(p, suite).unwrap_err().to_string();
+        // Nothing asked for: nothing changes, in any suite.
+        let o = apply(set(None, None), "quick").unwrap();
+        assert_eq!((o.periodic_period, o.periodic_phase, o.sched_diag), (None, None, true));
+        // Both, and each alone; the other options stay.
+        let o = apply(set(Some(1010), Some(300)), "periodic").unwrap();
+        assert_eq!(o.periodic_period, Some(Duration::from_micros(1010)));
+        assert_eq!((o.periodic_phase, o.sched_diag), (Some(Duration::from_micros(300)), true));
+        assert_eq!(apply(set(None, Some(999)), "all").unwrap().periodic_phase, Some(Duration::from_micros(999)));
+        assert_eq!(apply(set(Some(101), None), "all").unwrap().periodic_phase, None);
+        // A suite without the workload would ignore them: refused.
+        assert!(why(set(Some(1010), None), "quick").contains("need a suite with periodic-wake"));
+        assert!(why(set(None, Some(0)), "bursts").contains("need a suite with periodic-wake"));
+        // The work has to fit the period, and the phase is within one:
+        // of the period asked for, or of the usual one.
+        assert!(why(set(Some(100), None), "periodic").contains("more than the work of a period, 100 µs"));
+        assert!(why(set(None, Some(1000)), "periodic").contains("less than the period of 1000 µs"));
+        assert!(why(set(Some(500), Some(500)), "periodic").contains("less than the period of 500 µs"));
+        assert!(apply(set(Some(2000), Some(1500)), "periodic").is_ok());
     }
 }

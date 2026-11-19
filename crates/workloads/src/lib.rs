@@ -42,11 +42,20 @@ pub struct SuiteOpts {
     pub cpu_diag: bool,
     /// Every worker thread's scheduler statistics, in all workloads.
     pub sched_diag: bool,
+    /// Another period for periodic-wake than `PERIODIC_PERIOD`.
+    pub periodic_period: Option<Duration>,
+    /// Where periodic-wake's releases lie on the clock (see
+    /// `periodic::PeriodicWake::phase`).
+    pub periodic_phase: Option<Duration>,
 }
+
+/// periodic-wake's period unless another is asked for, and its work.
+pub const PERIODIC_PERIOD: Duration = Duration::from_millis(1);
+pub const PERIODIC_WORK: Duration = Duration::from_micros(100);
 
 impl Default for SuiteOpts {
     fn default() -> Self {
-        SuiteOpts { cpu_diag: true, sched_diag: false }
+        SuiteOpts { cpu_diag: true, sched_diag: false, periodic_period: None, periodic_phase: None }
     }
 }
 
@@ -62,10 +71,11 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
     let periodic = |hogs: usize| -> Box<dyn Workload> {
         Box::new(periodic::PeriodicWake {
             tasks: (cpus / 4).clamp(1, 4),
-            period: std::time::Duration::from_millis(1),
-            work: std::time::Duration::from_micros(100),
+            period: opts.periodic_period.unwrap_or(PERIODIC_PERIOD),
+            work: PERIODIC_WORK,
             hogs,
             sched_diag: opts.sched_diag,
+            phase: opts.periodic_phase,
         })
     };
     // A group woken at once, in three sizes relative to the machine: it
@@ -173,5 +183,18 @@ mod tests {
         assert_eq!((w[0].params()["tasks"].clone(), w[0].params()["hogs"].clone()), (4.into(), 0.into()));
         let small = super::suite("periodic", 2, SuiteOpts::default()).unwrap();
         assert_eq!(small[0].params()["tasks"], 1);
+        // Period and phase are what they were unless asked for, and then
+        // only periodic-wake has them.
+        assert_eq!((w[0].params()["period_us"].clone(), w[0].params().get("phase_us")), (1000.into(), None));
+        let opts = SuiteOpts {
+            periodic_period: Some(Duration::from_micros(1010)),
+            periodic_phase: Some(Duration::from_micros(300)),
+            ..SuiteOpts::default()
+        };
+        for w in super::suite("all", 16, opts).unwrap() {
+            let (p, periodic) = (w.params(), w.name().starts_with("periodic-wake"));
+            assert_eq!(p.get("phase_us").and_then(|v| v.as_u64()), periodic.then_some(300), "{}", w.name());
+            assert_eq!(p["period_us"] == 1010, periodic, "{}", w.name());
+        }
     }
 }

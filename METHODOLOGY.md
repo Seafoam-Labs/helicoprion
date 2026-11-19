@@ -248,6 +248,40 @@ whose tasks are not ready within 30 s, or in which a thread cannot be
 created or fails, ends as invalid after every thread that was started has
 been joined.
 
+#### The period and the kernel's tick
+
+The releases are instants on `CLOCK_MONOTONIC`. The kernel's timer tick, at
+which a busy CPU looks whether the running task should give way, is timed by
+the same clock. With a period that is a multiple of the tick, such as the
+1 ms of this workload on a kernel with a tick of 1 ms, the releases of a
+task keep their place against the ticks of a CPU for a whole run, and have
+another one in the next run, because a run starts whenever it starts. Where
+a scheduler lets a woken task wait for the tick, how long it waits can then
+depend on that place, and so can whether its work is done before the
+deadline. Whether a result does depend on it is a question to measure, not
+something the workload knows. The tick rate is recorded with the system
+(`tick_hz`, worked out from the resolution of the coarse clock), and two
+options make the question answerable:
+
+- `--periodic-phase-us N` places the releases of the first task at N µs
+  past every multiple of the period on that clock, the other tasks evenly
+  after it. This sets where the wake-ups fall on the clock, which is all
+  that can be set from here. Where the ticks fall is the kernel's business:
+  `skew_tick` gives every CPU its own offset, a CPU with nothing to run has
+  its tick stopped, and a task can wake on another CPU each time. So the
+  same phase is the same instant on the clock, and the same instant within a
+  tick only as far as the ticks of the CPUs involved are where they were. A
+  series of sessions over several phases shows whether the result follows
+  the phase; it does not show by itself that the tick is why.
+- `--periodic-period-us N` sets another period. One that is no multiple of
+  the tick, such as 1010 µs with a tick of 1 ms, shifts against any grid of
+  1 ms by 10 µs per period and passes through all of it in a tenth of a
+  second, whatever the phase and wherever the ticks are.
+
+Both are parameters of the workload (`period_us`, `phase_us`), so a run
+with either is never compared with one without. They are for looking into
+a result. The suite's own period and the scoring are as they were.
+
 ### Wake-up bursts
 
 The two workloads above wake one task at a time. `wake-burst` hands the

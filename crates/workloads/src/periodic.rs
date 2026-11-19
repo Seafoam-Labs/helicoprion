@@ -43,7 +43,15 @@
 //! Releases are absolute (`clock_nanosleep` with `TIMER_ABSTIME` on
 //! `CLOCK_MONOTONIC`), so a late period does not shift the following
 //! ones. The tasks' phases are spread evenly over a period so that they
-//! do not all wake at the same instant. Each task sets its timer slack to
+//! do not all wake at the same instant. Where on the clock the first
+//! release falls is whenever the run started, unless `phase` places it:
+//! the first task is then released at that much past every multiple of
+//! the period. That is a place on the clock and nothing more. The
+//! kernel's timer tick is timed by the same clock, so with a period that
+//! is a multiple of the tick a task's releases keep their place against a
+//! CPU's ticks for a whole run; where those ticks are is not known here
+//! (`skew_tick` offsets them per CPU, and an idle CPU has none), so the
+//! same phase need not be the same instant within a tick. Each task sets its timer slack to
 //! 1 ns: the default of 50 µs lets the kernel fire a timer that much late
 //! on purpose, which would be measured as wake-up latency. The setting is
 //! read back, and a run whose tasks did not get it is invalid: the
@@ -113,6 +121,10 @@ pub struct PeriodicWake {
     pub hogs: usize,
     /// Read every task's scheduler statistics.
     pub sched_diag: bool,
+    /// Where the releases lie on the clock: those of the first task at
+    /// this much past a multiple of the period. `None` leaves it to the
+    /// moment the run happens to start.
+    pub phase: Option<Duration>,
 }
 
 impl Workload for PeriodicWake {
@@ -131,13 +143,18 @@ impl Workload for PeriodicWake {
     }
 
     fn params(&self) -> serde_json::Value {
-        let params = json!({
+        let mut params = json!({
             "tasks": self.tasks,
             "period_us": self.period.as_micros() as u64,
             "work_us": self.work.as_micros() as u64,
             "hogs": self.hogs,
             "timer_slack_ns": TIMER_SLACK_NS,
         });
+        // Only when set: a run with its releases placed is another
+        // measurement than one that starts whenever it starts.
+        if let Some(phase) = self.phase {
+            params["phase_us"] = (phase.as_micros() as u64).into();
+        }
         schedstat::mark(params, self.sched_diag)
     }
 
@@ -159,6 +176,9 @@ impl PeriodicWake {
         let invalid = |why: String| RunResult { invalid_reason: Some(why), ..Default::default() };
         if self.tasks == 0 || self.period.is_zero() || self.work >= self.period {
             return invalid("periodic-wake needs at least one task and work shorter than the period".into());
+        }
+        if self.phase.is_some_and(|phase| phase >= self.period) {
+            return invalid("periodic-wake needs a phase shorter than the period".into());
         }
         let hogs = if self.hogs > 0 {
             match Hogs::start(self.hogs) {
@@ -240,8 +260,9 @@ impl PeriodicWake {
             // Hog snapshot right before the start is fixed, and again as
             // soon as the window is over.
             let hog_t0 = hogs.as_ref().map(|h| (h.work(), Instant::now()));
-            let t0 = now_ns() + ns(LEAD);
-            began = Instant::now() + LEAD;
+            let now = now_ns();
+            let t0 = first_release(now + ns(LEAD), period, self.phase.map(ns));
+            began = Instant::now() + Duration::from_nanos(t0 - now);
             start.store(t0, Ordering::Release);
             sleep_until(t0 + span);
             hog = hogs.as_ref().zip(hog_t0).map(|(h, (w0, at0))| (h.work() - w0, at0, Instant::now()));
@@ -279,6 +300,16 @@ struct TaskOut {
     late: u64,
     /// Releases that passed while an earlier period was still at work.
     skipped: u64,
+}
+
+/// The first release of the first task: `earliest`, or with a phase the
+/// first instant from there on that is `phase` past a multiple of the
+/// period on the clock the releases are timed by.
+fn first_release(earliest: u64, period: u64, phase: Option<u64>) -> u64 {
+    match phase {
+        None => earliest,
+        Some(phase) => (earliest.saturating_sub(phase)).next_multiple_of(period) + phase,
+    }
 }
 
 /// Where a task goes after finishing period `k` at `done` (nanoseconds
@@ -390,7 +421,41 @@ mod tests {
             work: Duration::from_micros(50),
             hogs,
             sched_diag: false,
+            phase: None,
         }
+    }
+
+    #[test]
+    fn a_phase_places_the_releases_on_the_clock() {
+        // Without one, the run starts when it starts.
+        assert_eq!(first_release(12_345, 1000, None), 12_345);
+        // With one: the first instant not before that with this remainder.
+        assert_eq!(first_release(12_345, 1000, Some(0)), 13_000);
+        assert_eq!(first_release(12_345, 1000, Some(300)), 13_300);
+        assert_eq!(first_release(12_345, 1000, Some(345)), 12_345);
+        assert_eq!(first_release(12_345, 1000, Some(999)), 12_999);
+        assert_eq!(first_release(100, 1000, Some(300)), 300);
+        // Never earlier, and less than a period later.
+        for (earliest, phase) in [(0, 0), (1, 0), (999, 1), (7_000_001, 250), (7_000_250, 250), (7_000_251, 250)] {
+            let at = first_release(earliest, 1000, Some(phase));
+            assert!(at >= earliest && at - earliest < 1000 && at % 1000 == phase, "{earliest} {phase} {at}");
+        }
+
+        // A run with a phase says so in its parameters, one without does
+        // not have the key at all, and the periods are what they were.
+        let w = PeriodicWake { phase: Some(Duration::from_micros(300)), ..quick(0) };
+        assert_eq!(w.params()["phase_us"], 300);
+        assert!(quick(0).params().get("phase_us").is_none());
+        let r = w.run(Duration::from_millis(100));
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        assert!((198..=200).contains(&r.counters["periods_due"]), "{:?}", r.counters);
+        // The hog window still starts before the first release.
+        let r = PeriodicWake { phase: Some(Duration::from_micros(999)), ..quick(1) }.run(Duration::from_millis(100));
+        let window = r.windows["hog"];
+        assert!(window.start_s <= 0.0 && window.end_s >= 0.1, "{window:?}");
+        // A phase of a whole period or more is another phase's name.
+        let bad = PeriodicWake { phase: Some(Duration::from_millis(1)), ..quick(0) };
+        assert!(bad.run(Duration::from_millis(10)).invalid_reason.unwrap().contains("phase shorter than the period"));
     }
 
     #[test]
