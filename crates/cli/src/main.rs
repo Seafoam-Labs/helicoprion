@@ -266,6 +266,9 @@ fn info(json: bool) -> Result<()> {
     if let Some(preempt) = &sys.preempt {
         println!("Preemption: {preempt}");
     }
+    if let Some(hz) = sys.tick_hz {
+        println!("Tick:       {hz} Hz");
+    }
     if !sys.cmdline.is_empty() {
         println!("Cmdline:    {}", sys.cmdline.join(" "));
     }

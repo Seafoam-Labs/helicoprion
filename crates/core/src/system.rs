@@ -46,6 +46,13 @@ pub struct SystemInfo {
     /// `lazy`), from debugfs: readable by root only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preempt: Option<String>,
+    /// The kernel's timer tick in Hz: how often a busy CPU looks whether
+    /// the running task should give way. Worked out from the resolution
+    /// of the coarse clock, not read from the kernel's configuration: it
+    /// is `CONFIG_HZ` as far as that clock tells, and absent where the
+    /// resolution is no plausible tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_hz: Option<u32>,
     /// Kernel command line parameters that change scheduling, timing or
     /// CPU power management, as given. Only those: the rest of a command
     /// line (root device, UUIDs) says nothing about a result and does not
@@ -107,6 +114,7 @@ impl SystemInfo {
             temp_sensor: Probe::find().sensor().map(str::to_string),
             kernel_build: read_trimmed("/proc/sys/kernel/version"),
             preempt: read_trimmed("/sys/kernel/debug/sched/preempt").map(|s| selected_option(&s)),
+            tick_hz: coarse_clock_resolution_ns().and_then(tick_hz),
             cmdline: read_trimmed("/proc/cmdline").map(|s| relevant_cmdline(&s)).unwrap_or_default(),
             topology: topology(Path::new("/sys/devices/system")),
             isolated_cpus: read_trimmed("/sys/devices/system/cpu/isolated"),
@@ -118,6 +126,31 @@ impl SystemInfo {
                 .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok())),
         }
     }
+}
+
+/// Resolution of `CLOCK_MONOTONIC_COARSE` in nanoseconds. That clock
+/// advances once per timer tick, so this is the tick's length: the
+/// configured rate is in no file that every distribution ships
+/// (`/proc/config.gz` is optional and compressed).
+fn coarse_clock_resolution_ns() -> Option<u64> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid timespec to write to.
+    let r = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
+    (r == 0).then(|| ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+/// The tick rate for a tick of `tick_ns`: the nearest whole rate. This
+/// is what the clock says, not a check against the rates a kernel can be
+/// configured with, which differ between architectures and patched
+/// kernels (100, 250, 300 and 1000 on x86, others elsewhere and in some
+/// distribution kernels). Only a resolution that cannot be a tick at all
+/// gives nothing: under 100 µs, where the clock is not coarse, or over
+/// 50 ms.
+fn tick_hz(tick_ns: u64) -> Option<u32> {
+    const TICKS_NS: std::ops::RangeInclusive<u64> = 100_000..=50_000_000;
+    // The range also keeps the division from a zero: of the tick, and of
+    // a rate that a tick of two seconds or more would round to.
+    TICKS_NS.contains(&tick_ns).then(|| ((1_000_000_000 + tick_ns / 2) / tick_ns) as u32)
 }
 
 /// `Cpus_allowed_list` of a `/proc/<pid>/status`.
@@ -510,6 +543,33 @@ mod tests {
         assert_eq!(super::allowed_cpus("Name:\tx\nCpus_allowed:\tff\n"), None);
         // This process has some.
         assert!(super::SystemInfo::collect().allowed_cpus.is_some());
+    }
+
+    #[test]
+    fn the_tick_rate_comes_from_the_tick_length() {
+        assert_eq!(super::tick_hz(1_000_000), Some(1000));
+        assert_eq!(super::tick_hz(4_000_000), Some(250));
+        assert_eq!(super::tick_hz(3_333_333), Some(300));
+        assert_eq!(super::tick_hz(10_000_000), Some(100));
+        // The nearest whole rate, whatever it is: this is what the clock
+        // says, not a list of what kernels are built with.
+        assert_eq!(super::tick_hz(2_000_000), Some(500));
+        assert_eq!(super::tick_hz(1_287_001), Some(777));
+        assert_eq!(super::tick_hz(999_848), Some(1000));
+        // Not a tick: a high-resolution clock, nothing at all, or longer
+        // than any tick, up to values a rate could not be worked out for.
+        assert_eq!(super::tick_hz(1), None);
+        assert_eq!(super::tick_hz(0), None);
+        assert_eq!(super::tick_hz(99_999), None);
+        assert_eq!(super::tick_hz(50_000_001), None);
+        assert_eq!(super::tick_hz(1_000_000_000), None);
+        assert_eq!(super::tick_hz(3_000_000_000), None);
+        assert_eq!(super::tick_hz(u64::MAX), None);
+        // The ends of what is taken.
+        assert_eq!((super::tick_hz(100_000), super::tick_hz(50_000_000)), (Some(10_000), Some(20)));
+        // Whatever this machine has, it is within them.
+        let here = super::coarse_clock_resolution_ns().and_then(super::tick_hz);
+        assert!(here.is_none_or(|hz| (20..=10_000).contains(&hz)), "{here:?}");
     }
 
     #[test]

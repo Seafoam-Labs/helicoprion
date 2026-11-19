@@ -1073,6 +1073,7 @@ pub fn env_diff(base: &ResultFile, other: &ResultFile) -> Vec<String> {
     let switch = |on: bool| if on { "on" } else { "off" }.to_string();
     known("kernel build", a.kernel_build.clone(), b.kernel_build.clone());
     known("preemption model", a.preempt.clone(), b.preempt.clone());
+    known("timer tick", a.tick_hz.map(|hz| format!("{hz} Hz")), b.tick_hz.map(|hz| format!("{hz} Hz")));
     // The parameters are read wherever the build is.
     known(
         "kernel parameters",
@@ -3371,6 +3372,7 @@ after a visit's hottest run, 4.25 GHz right after the runs, load average at most
             let mut f = file(label, &[1.0], 1);
             f.system.kernel_build = Some("#1 SMP PREEMPT_DYNAMIC Mon, 16 Nov 2026".into());
             f.system.preempt = Some("full".into());
+            f.system.tick_hz = Some(1000);
             f.system.cmdline = vec!["mitigations=auto".into()];
             f.system.topology = Some(Topology { packages: 1, cores: 8, l3_domains: Some(1), numa_nodes: Some(1) });
             f.system.cpufreq_driver = Some("amd-pstate-epp".into());
@@ -3389,6 +3391,7 @@ after a visit's hottest run, 4.25 GHz right after the runs, load average at most
         let mut other = described("b");
         other.system.kernel_build = Some("#2 SMP PREEMPT_DYNAMIC Tue, 17 Nov 2026".into());
         other.system.preempt = Some("lazy".into());
+        other.system.tick_hz = Some(250);
         other.system.cmdline = vec![];
         other.system.isolated_cpus = Some("2-3".into());
         // Eight CPUs as well, but other ones.
@@ -3400,6 +3403,7 @@ after a visit's hottest run, 4.25 GHz right after the runs, load average at most
         for expected in [
             "kernel build differs",
             "preemption model differs (lazy vs baseline full)",
+            "timer tick differs (250 Hz vs baseline 1000 Hz)",
             "kernel parameters differs (none vs baseline mitigations=auto)",
             "isolated CPUs differs (2-3 vs baseline ?)",
             "CPUs the benchmark may use differs (8-15 vs baseline 0-7)",

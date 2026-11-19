@@ -230,9 +230,10 @@ fn in_short_section(h: &mut String, c: &Comparison, simple: bool) {
 /// properties some file has.
 fn system_details(h: &mut String, c: &Comparison) {
     type Get = fn(&helicoprion_core::ResultFile) -> Option<String>;
-    let rows: [(&str, Get); 13] = [
+    let rows: [(&str, Get); 14] = [
         ("Kernel build", |f| f.system.kernel_build.clone()),
         ("Preemption", |f| f.system.preempt.clone()),
+        ("Timer tick", |f| f.system.tick_hz.map(|hz| format!("{hz} Hz"))),
         ("Kernel parameters", |f| (!f.system.cmdline.is_empty()).then(|| f.system.cmdline.join(" "))),
         ("Topology", |f| {
             let t = f.system.topology.as_ref()?;

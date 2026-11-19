@@ -208,6 +208,10 @@ pub fn check(reference: &Session, other: &Session) -> Check {
         let switch = |o: Option<bool>, on: &str, off: &str| o.map_or("none", |v| if v { on } else { off }).to_string();
         differ("kernel build", show(&sa.kernel_build), show(&sb.kernel_build));
         differ("preemption model", show(&sa.preempt), show(&sb.preempt));
+        // Recorded since later still: said only where both sides have it.
+        if let (Some(x), Some(y)) = (sa.tick_hz, sb.tick_hz) {
+            differ("timer tick", format!("{x} Hz"), format!("{y} Hz"));
+        }
         differ("kernel parameters", list(&sa.cmdline), list(&sb.cmdline));
         differ("CPU topology", format!("{:?}", sa.topology), format!("{:?}", sb.topology));
         differ("CPUs the benchmark may use", show(&sa.allowed_cpus), show(&sb.allowed_cpus));
@@ -726,6 +730,7 @@ pub(crate) mod tests {
                         epp: Some("performance".into()),
                         kernel_build: Some("#1 SMP PREEMPT_DYNAMIC Mon, 16 Nov 2026".into()),
                         preempt: Some("full".into()),
+                        tick_hz: Some(1000),
                         cmdline: vec!["mitigations=auto".into()],
                         topology: Some(Topology { packages: 1, cores: 8, l3_domains: Some(1), numa_nodes: Some(1) }),
                         cpufreq_driver: Some("amd-pstate-epp".into()),
@@ -835,7 +840,7 @@ pub(crate) mod tests {
     #[test]
     fn what_differs_stops_and_is_named() {
         type Change = fn(&mut Vec<(String, ResultFile)>);
-        let cases: [(Change, &str); 16] = [
+        let cases: [(Change, &str); 17] = [
             (
                 |o| o.iter_mut().for_each(|(_, f)| f.system.kernel = "7.3.5-1".into()),
                 "kernel: 7.3.5-1 here, 7.3.4-1 in",
@@ -861,6 +866,7 @@ pub(crate) mod tests {
             ),
             (|o| o.iter_mut().for_each(|(_, f)| f.system.on_ac = Some(false)), "power source: battery here, mains in"),
             (|o| o.iter_mut().for_each(|(_, f)| f.system.preempt = Some("lazy".into())), "preemption model: lazy here"),
+            (|o| o.iter_mut().for_each(|(_, f)| f.system.tick_hz = Some(250)), "timer tick: 250 Hz here, 1000 Hz in"),
             (|o| o.iter_mut().for_each(|(_, f)| f.tool_version = "0.6.0".into()), "tool version: 0.6.0 here, 0.5.0 in"),
             (
                 |o| o.iter_mut().for_each(|(_, f)| f.protocol.as_mut().unwrap().cooldown_s = 0.0),
@@ -1059,6 +1065,14 @@ pub(crate) mod tests {
         let mut other = session("tue", 2000, &SCHEDS, 3, flat);
         bare(&mut other);
         reference.extend(other);
+        let s = group(reference).unwrap();
+        assert_eq!(check(&s[0], &s[1]), Check::default());
+
+        // The tick rate is not in files written by 0.5.0: such a session
+        // next to one that has it is not a difference.
+        let mut reference = session("mon", 1000, &SCHEDS, 3, flat);
+        reference.iter_mut().for_each(|(_, f)| f.system.tick_hz = None);
+        reference.extend(session("tue", 2000, &SCHEDS, 3, flat));
         let s = group(reference).unwrap();
         assert_eq!(check(&s[0], &s[1]), Check::default());
         // But against a machine that does say: a difference.

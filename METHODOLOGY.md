@@ -633,8 +633,8 @@ latency charts, when the workload parameters such as `pairs` or `hogs`
 differ from the baseline's, or when the unit or direction of a metric does.
 Differences in CPU, CPU count, SMT, governor, EPP, platform profile, kernel
 and tool version are listed as notes, and a different kernel never blocks a
-comparison. So are the kernel build, the preemption model, the kernel
-parameters, the CPU topology, the CPUs the benchmark may run on, isolated CPUs, the cpufreq driver, boost, the
+comparison. So are the kernel build, the preemption model, the timer tick
+rate, the kernel parameters, the CPU topology, the CPUs the benchmark may run on, isolated CPUs, the cpufreq driver, boost, the
 power source and how the runs were taken, where both files record them. A
 run warns when the 1-minute load average is above 25% of the CPU count. For stable numbers, fix the governor and EPP, stop background
 jobs, keep the same kernel build and do several runs per scheduler.
@@ -714,7 +714,8 @@ order, a scheduler without results, each scheduler's build (the kernel's ops
 string) and options, the workloads and their parameters, the protocol
 (suite, runs per visit, warm-up, run length, pause, settle time, order of
 visits), the tool version, and the machine (kernel release and build,
-preemption model, kernel parameters, CPU model, topology, usable and allowed
+preemption model, timer tick rate where both record it, kernel parameters,
+CPU model, topology, usable and allowed
 CPUs, SMT, governor, EPP, cpufreq driver, boost, power source, platform
 profile, THP). There is no option to override this.
 

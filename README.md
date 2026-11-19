@@ -155,7 +155,7 @@ were taken (suite, measured and warm-up runs, run length, pause), and the
 design of a `matrix` session its settle time, the order of visits and the
 options the scheduler ran with: what another session has to repeat to be a
 repetition of this one. `system` describes the machine: kernel release and
-build, preemption model, the kernel parameters that affect scheduling,
+build, preemption model, timer tick rate, the kernel parameters that affect scheduling,
 timing or CPU power management (only those; a command line also holds disk
 identifiers, which do not belong in a file that gets shared), CPU model and
 topology, SMT, the CPUs the benchmark may run on, isolated CPUs, cpufreq driver, governor, EPP, boost, power
