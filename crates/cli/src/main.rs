@@ -302,9 +302,11 @@ fn info(json: bool) -> Result<()> {
 /// has other workload parameters and is not compared with one without.
 #[derive(clap::Args, Clone, Copy, Default)]
 struct Periodic {
-    /// Period of periodic-wake in microseconds instead of 1000. A period
-    /// that is no multiple of the kernel's timer tick (1010 with a tick
-    /// of 1 ms) does not keep one place against it for a whole run.
+    /// Period of periodic-wake in microseconds instead of 1010. A period
+    /// that is a multiple of the kernel's nominal timer tick (1000 with
+    /// a tick of 1 ms, which is what 0.5.0 measured) can keep one phase
+    /// against it for a whole run, and the result can depend on that
+    /// phase.
     #[arg(long, value_name = "US")]
     periodic_period_us: Option<u64>,
     /// Place periodic-wake's releases on the clock: those of the first
@@ -843,7 +845,8 @@ mod tests {
         // The work has to fit the period, and the phase is within one:
         // of the period asked for, or of the usual one.
         assert!(why(set(Some(100), None), "periodic").contains("more than the work of a period, 100 µs"));
-        assert!(why(set(None, Some(1000)), "periodic").contains("less than the period of 1000 µs"));
+        assert!(why(set(None, Some(1010)), "periodic").contains("less than the period of 1010 µs"));
+        assert!(apply(set(None, Some(1000)), "periodic").is_ok());
         assert!(why(set(Some(500), Some(500)), "periodic").contains("less than the period of 500 µs"));
         assert!(apply(set(Some(2000), Some(1500)), "periodic").is_ok());
     }

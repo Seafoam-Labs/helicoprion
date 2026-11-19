@@ -250,19 +250,75 @@ been joined.
 
 #### The period and the kernel's tick
 
+The period is 1010 µs, not 1 ms, for a reason that was measured.
+
 The releases are instants on `CLOCK_MONOTONIC`. The kernel's timer tick, at
 which a busy CPU looks whether the running task should give way, is timed by
-the same clock. With a period that is a multiple of the tick, such as the
-1 ms of this workload on a kernel with a tick of 1 ms, the releases of a
-task keep their place against the ticks of a CPU for a whole run, and have
-another one in the next run, because a run starts whenever it starts. Where
-a scheduler lets a woken task wait for the tick, how long it waits can then
-depend on that place, and so can whether its work is done before the
-deadline. Whether a result does depend on it is a question to measure, not
-something the workload knows. The tick rate is recorded with the system
-(`tick_hz`, worked out from the resolution of the coarse clock), and two
-options make the question answerable:
+the same clock. With a period that is a whole number of nominal ticks, such
+as 1 ms on a kernel with a tick of 1 ms, the releases of a task can keep
+their place against the ticks for a whole run, and have another one in the
+next run, because a run starts whenever it starts. Where a scheduler lets a
+woken task wait for the tick, how long it waits can then depend on that
+place, and so can whether its work is done before the deadline. "Can": the
+ticks are per CPU, may be offset against each other and are stopped on a CPU
+with nothing to run, and schedulers differ in whether a wake-up waits for
+one at all.
 
+Version 0.5.0 used 1 ms, and under the kernel's own scheduler the missed
+deadlines of `periodic-wake/loaded` came in two kinds of run, about 0.1-0.5%
+and 2.6-4.6%, with nothing in between. With the releases of the first task
+placed on the clock (16 CPUs, tick of 1 ms, four tasks 250 µs apart, medians
+of `deadline_miss_pct`):
+
+| | at a multiple of 1 ms | 150 µs after | period 1010 µs |
+|---|---|---|---|
+| kernel scheduler (EEVDF) | 5.15% | 0.38% | 1.83% |
+| scx_cake | 0.05% | 0.07% | 0.17% |
+| scx_cosmos | 0.24% | 0.17% | 0.18% |
+| scx_eevdf | 18.4% | 18.0% | 16.9% |
+| scx_lavd | 30.0% | 34.2% | 32.1% |
+
+Runs with the same placement agreed with each other; the two kinds were one
+scheduler at different placements. In the runs with many misses nearly all
+of them were one task's, the one released at the multiple of 1 ms, and its
+delayed wake-ups took 1 ms less the distance of its release from the
+multiple: the time to the next one. The other schedulers hardly follow the
+placement, so the difference to the baseline, the thing a comparison
+reports, was between 2 and 20 times for one scheduler and 5 and 100 times
+for another, by the moment the baseline's runs happened to start. Without
+load the placement shows as well, for every scheduler: the slowest wake-ups
+(`wake_p99`) were 35-86 µs with a release at the multiple and 21-29 µs
+otherwise.
+
+This is one machine and one kernel, and what was set is the place of the
+releases on the clock: that the tick is what sits at the multiples is
+inferred from the tick's length and from the delays, not observed. The
+conclusion does not need more than that. A period that is no whole number of
+ticks shifts against any grid of the tick's length and moves through the
+phases within a run, which limits this kind of dependence. 1010 µs is a
+multiple of none of the usual ticks, and returns to the same phase against
+their nominal grid after:
+
+| tick rate | periods | time |
+|---|---|---|
+| 1000 Hz | 100 | 0.101 s |
+| 250 Hz | 400 | 0.404 s |
+| 300 Hz | 1000 | 1.010 s |
+| 100 Hz | 1000 | 1.010 s |
+
+A run of five seconds goes through the phases about five times or more, so
+it no longer hangs on the one it started with, and runs repeat. This does
+not take the tick out of the measurement. What a scheduler loses to waiting
+for it is still in the result: sampled over many phases instead of at one.
+Of the four rates only 1000 Hz was measured; the others are arithmetic.
+
+The tick rate is recorded with the system (`tick_hz`, worked out from the
+resolution of the coarse clock), and two options are there to look into a
+result:
+
+- `--periodic-period-us N` sets another period; 1000 is what 0.5.0
+  measured. A report says so when a period is a whole number of the ticks
+  of the kernel it ran on.
 - `--periodic-phase-us N` places the releases of the first task at N µs
   past every multiple of the period on that clock, the other tasks evenly
   after it. This sets where the wake-ups fall on the clock, which is all
@@ -270,17 +326,12 @@ options make the question answerable:
   `skew_tick` gives every CPU its own offset, a CPU with nothing to run has
   its tick stopped, and a task can wake on another CPU each time. So the
   same phase is the same instant on the clock, and the same instant within a
-  tick only as far as the ticks of the CPUs involved are where they were. A
-  series of sessions over several phases shows whether the result follows
-  the phase; it does not show by itself that the tick is why.
-- `--periodic-period-us N` sets another period. One that is no multiple of
-  the tick, such as 1010 µs with a tick of 1 ms, shifts against any grid of
-  1 ms by 10 µs per period and passes through all of it in a tenth of a
-  second, whatever the phase and wherever the ticks are.
+  tick only as far as the ticks of the CPUs involved are where they were.
 
-Both are parameters of the workload (`period_us`, `phase_us`), so a run
-with either is never compared with one without. They are for looking into
-a result. The suite's own period and the scoring are as they were.
+Both are parameters of the workload (`period_us`, `phase_us`): runs with
+different periods, or with and without a phase, are never compared, and so
+results of `periodic-wake` from 0.5.0 are not compared with later ones. The
+scoring and the definition of `deadline_miss_pct` are as they were.
 
 ### Wake-up bursts
 

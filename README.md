@@ -94,8 +94,9 @@ groups once with unequal thread counts and once with unequal weights.
 
 `--periodic-period-us` and `--periodic-phase-us` change the period of the
 timer-driven workload and place its wake-ups on the clock, to see whether a
-result depends on where they fall, as it can where a wake-up waits for the
-kernel's timer tick (see METHODOLOGY.md). Runs with
+result depends on where they fall, as it does where a wake-up waits for the
+kernel's timer tick. The period is 1010 µs for that reason, and no longer
+the 1 ms of 0.5.0 (see METHODOLOGY.md). Runs with
 either are only compared with runs with the same.
 
 `--sched-diag` also records what the kernel counted for the worker threads:

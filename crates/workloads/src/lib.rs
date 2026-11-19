@@ -50,7 +50,18 @@ pub struct SuiteOpts {
 }
 
 /// periodic-wake's period unless another is asked for, and its work.
-pub const PERIODIC_PERIOD: Duration = Duration::from_millis(1);
+///
+/// 1010 µs and not 1 ms: a period that is a whole number of the kernel's
+/// nominal timer ticks can keep its releases at one phase against the
+/// tick for a whole run, and where that was measured the phase moved one
+/// scheduler's missed deadlines more than tenfold and others' hardly
+/// (METHODOLOGY.md, "The period and the kernel's tick"). 1010 µs is a
+/// multiple of none of the usual ticks and returns to the same phase
+/// against their nominal grid after about 0.1 to 1.01 s: 100 periods at
+/// 1000 Hz, 400 at 250 Hz, 1000 at 300 and at 100 Hz. A run of five
+/// seconds samples the phases about five times over or more; the tick is
+/// still in the result, as many phases instead of one.
+pub const PERIODIC_PERIOD: Duration = Duration::from_micros(1010);
 pub const PERIODIC_WORK: Duration = Duration::from_micros(100);
 
 impl Default for SuiteOpts {
@@ -65,9 +76,9 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
         Box::new(wake_pingpong::WakePingPong { pairs, hogs, cpu_diag: opts.cpu_diag, sched_diag: opts.sched_diag })
     };
     // A few periodic tasks whatever the machine: the question is how late
-    // each wakes, not how many fit. 1 ms and 100 µs: a tenth of a CPU per
-    // task, and 20000 periods in a five-second run of four tasks, enough
-    // for a p99.9.
+    // each wakes, not how many fit. About 1 ms and 100 µs: a tenth of a
+    // CPU per task, and 19800 periods in a five-second run of four tasks,
+    // enough for a p99.9.
     let periodic = |hogs: usize| -> Box<dyn Workload> {
         Box::new(periodic::PeriodicWake {
             tasks: (cpus / 4).clamp(1, 4),
@@ -185,16 +196,16 @@ mod tests {
         assert_eq!(small[0].params()["tasks"], 1);
         // Period and phase are what they were unless asked for, and then
         // only periodic-wake has them.
-        assert_eq!((w[0].params()["period_us"].clone(), w[0].params().get("phase_us")), (1000.into(), None));
+        assert_eq!((w[0].params()["period_us"].clone(), w[0].params().get("phase_us")), (1010.into(), None));
         let opts = SuiteOpts {
-            periodic_period: Some(Duration::from_micros(1010)),
+            periodic_period: Some(Duration::from_micros(1000)),
             periodic_phase: Some(Duration::from_micros(300)),
             ..SuiteOpts::default()
         };
         for w in super::suite("all", 16, opts).unwrap() {
             let (p, periodic) = (w.params(), w.name().starts_with("periodic-wake"));
             assert_eq!(p.get("phase_us").and_then(|v| v.as_u64()), periodic.then_some(300), "{}", w.name());
-            assert_eq!(p["period_us"] == 1010, periodic, "{}", w.name());
+            assert_eq!(p["period_us"] == 1000, periodic, "{}", w.name());
         }
     }
 }
