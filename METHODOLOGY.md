@@ -946,10 +946,13 @@ session have no rounds in common, and every valid run is an observation.
 3613, 4569, 3394, 5844 and 5756 slow round trips in five runs of
 `wake-pingpong/loaded`: about 700 times the variation independent events at
 that share would have. `scx_cosmos` on the same workload had 62, 68, 74, 67
-and 47: 1.6 times. Missed deadlines come in pairs by construction, a period
-that ends late and the next one skipped for it. An interval that takes
-every event for evidence of its own is too narrow by a large factor, and
-by a different one for every scheduler.
+and 47: 1.6 times. Missed deadlines come in groups by construction: a
+period that ends late, and the periods skipped for it. How many are
+skipped depends on the scheduler: one after each late period under the
+kernel's scheduler in the sessions seen (798 late, 818 skipped), three to
+four under `scx_lavd` on an idle machine (24 late, 85 skipped). An interval
+that takes every event for evidence of its own is too narrow by a large
+factor, and by a different one for every scheduler.
 
 **The interval** is the *effective-count approximate interval*. For each
 side, the dispersion is how much the counts of its observations vary against
@@ -1011,17 +1014,42 @@ samples in every case that has enough such pairs to judge it by (at least
 5% of its samples), and did: in each of about 170 cases, the worst at
 96.7% to 96.9% in the runs made. Which cases reach those 5%, and the last
 digit of every number here, depend on the samples drawn, which differ with
-the version of NumPy even at one seed; what is fixed is the criterion. For large shares (1.6% and 26%, beta-binomial,
-dispersion up to 30 and different on the two sides) the worst of 84 cases
-was 98.6%, with at most 0.9% of equal pairs called different. The scripts
-are in `calibration/` and print these numbers; `calibration/README.md` says
-which script gives which, and with which versions they were run.
+the version of NumPy even at one seed; what is fixed is the criterion.
+
+For large shares (1.6% and 26%, beta-binomial, dispersion up to 30 and
+different on the two sides) the worst of 84 cases was 98.6%, with at most
+0.9% of equal pairs called different. The scripts are in `calibration/` and
+print these numbers; `calibration/README.md` says which script gives which,
+and with which versions they were run.
 
 What that does not show: other shapes of clumps or of drift, dispersion
 above 300, and real hardware, where a comparison of a
 scheduler with itself (below) is the check. Twenty events are not twenty
 independent events, and the coverage is conditional on the pair having been
 admitted.
+
+**On hardware.** Two sessions of a scheduler against itself, six rounds of
+all workloads on a Ryzen 7 8845HS, one of the kernel's scheduler and one of
+`scx_lavd`:
+
+| Scheduler | Workload · share | Events, arm → twin | Change |
+|---|---|---|---|
+| EEVDF | `wake-pingpong/loaded` · slow round trips | 29 056 → 27 398 | +6.4% [2.5× worse … 2.8× better] |
+| EEVDF | `wake-pingpong` · slow round trips | 68 → 34 | +49.9% [4.3× worse … 31× better] |
+| EEVDF | `periodic-wake/loaded` · missed deadlines | 1866 → 2050 | −9.9% [−30.8% … +7.7%] |
+| `scx_lavd` | `wake-pingpong` · slow round trips | 1332 → 1243 | +7.6% [−9.1% … +21.8%] |
+| `scx_lavd` | `wake-pingpong/loaded` · slow round trips | 34 → 26 | +23.6% [−71.8% … 3.0× better] |
+| `scx_lavd` | `periodic-wake/loaded` · missed deadlines | 29 584 → 31 187 | −5.4% [−29.4% … +14.1%] |
+| `scx_lavd` | `wake-burst/double` · overruns | 43 → 64 | −48.8% [21× worse … 6.6× better] |
+
+None of the seven is clear, with estimates of up to a half. Seven more
+pairs had under 20 events on a side and were not compared: none against
+none twice, 0 → 1, 14 → 9, 3 → 13, 19 → 7, and 67 → 42 missed
+deadlines of which 14 and 10 were late periods. The method this replaced
+called the 1866 → 2050 of the first session clear, at −11.2%. With three
+older sessions of the kind that makes 19 pairs compared and none called
+different. That agrees with the 2% at most of the simulation and is far too
+few to measure it.
 
 **Old results.** A result file without the counters, or with a run that
 lacks them, is not compared for these metrics: the report says "no event

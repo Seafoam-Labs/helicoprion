@@ -82,7 +82,7 @@ pub struct EventRun {
     pub round: Option<u32>,
     pub events: u64,
     /// The events that count towards `MIN_EVENTS`: all of them, or for a
-    /// share whose events come in pairs the first of each pair.
+    /// share whose events come in groups the first of each group.
     pub qualifying: u64,
     /// Out of how many.
     pub of: u64,
@@ -106,11 +106,12 @@ pub struct EventCounters {
 /// and nothing. These metrics are compared from their counters and in no
 /// other way (`MetricRow::share`).
 ///
-/// A missed deadline is two events as a rule: a period that ends late,
-/// and the next one, which is skipped for it. The share is of both, and
-/// what is counted towards `MIN_EVENTS` is the late ones alone, as the
-/// nearer count of how many times something went wrong; it is not a
-/// count of independent episodes either.
+/// A missed deadline is more than one event as a rule: a period that
+/// ends late, and the periods skipped for it, one under some schedulers
+/// and several under others. The share is of all of them, and what is
+/// counted towards `MIN_EVENTS` is the late ones alone, as the nearer
+/// count of how many times something went wrong; it is not a count of
+/// independent episodes either.
 pub fn event_counters(metric: &str) -> Option<EventCounters> {
     let one = |events: &'static [&'static str], of| Some(EventCounters { events, qualifying: events[0], of });
     match metric {
@@ -3206,8 +3207,8 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         }
     }
 
-    /// Missed deadlines come in pairs, a late period and the one skipped
-    /// for it. The share is of both; what admits it to a comparison is
+    /// Missed deadlines come in groups, a late period and those skipped
+    /// for it. The share is of all; what admits it to a comparison is
     /// twenty late ones a side. And how much a share's runs differ is in
     /// its interval, so a side whose runs differ a lot is not "unstable".
     #[test]
