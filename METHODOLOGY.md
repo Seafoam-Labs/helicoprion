@@ -1109,7 +1109,11 @@ writes it as `card.png` next to its report: a row per scheduler, a column
 per workload, and in every cell the verdict of the plain view for that
 pair, as a word, a mark and a colour. The verdicts are taken from the plain
 view, not worked out again, so the card cannot say something the report
-does not. A cell is empty where the two were not compared, which is not the
+does not. Its head says what everything is measured against: the baseline
+by the name the session gave it and by the scheduler its result records, as
+in "The baseline, default, is EEVDF: the scheduler built into the kernel",
+since a card is seen without the session around it and "default" alone says
+nothing. A cell is empty where the two were not compared, which is not the
 same as "unclear", the word for no clear difference.
 
 The card is for places that show a picture and not a page. It holds no

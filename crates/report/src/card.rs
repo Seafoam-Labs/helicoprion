@@ -37,8 +37,11 @@ const FONT: &str = "sans-serif";
 const MARGIN: f64 = 48.0;
 /// Width of the column with the schedulers' names.
 const NAMES: f64 = 210.0;
+/// Baselines of the two lines between the head and the grid.
+pub(crate) const READING: f64 = 151.0;
+pub(crate) const CAVEAT: f64 = 174.0;
 /// Top of the grid's first row.
-const GRID_TOP: f64 = 216.0;
+const GRID_TOP: f64 = 238.0;
 /// Bottom of the last row at most: the legend goes below.
 const GRID_BOTTOM: f64 = 548.0;
 /// More rows or columns than fit are not drawn small: the card says how
@@ -134,6 +137,20 @@ fn cell(out: &mut String, x: f64, y: f64, w: f64, h: f64, v: Verdict) {
     text(out, cx, baseline, 14, ink, r#" text-anchor="middle""#, word(v));
 }
 
+/// The baseline in a sentence: which scheduler every cell is measured
+/// against. A session calls the kernel's own scheduler "default", which
+/// says nothing to someone who sees the card alone, and a label can be
+/// anything; the scheduler recorded in the result says what ran.
+fn baseline(label: &str, scheduler: &helicoprion_core::Scheduler) -> String {
+    let what = scheduler.label();
+    let kind = if scheduler.is_ext() { "a sched_ext scheduler" } else { "the scheduler built into the kernel" };
+    if what.eq_ignore_ascii_case(label) {
+        format!("The baseline is {}, {kind}.", fit(&what, 40))
+    } else {
+        format!("The baseline, {}, is {}: {kind}.", fit(label, 28), fit(&what, 28))
+    }
+}
+
 /// What the card does not hold, in a line: what did not fit, and what
 /// is in the report only. Both, where both apply: that rows are missing
 /// is no reason to stop saying that there are warnings.
@@ -172,27 +189,31 @@ pub fn svg(c: &Comparison) -> Option<String> {
     let _ = write!(
         out,
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH} {HEIGHT}" width="{WIDTH}" height="{HEIGHT}" role="img" aria-label="{}"><rect width="{WIDTH}" height="{HEIGHT}" fill="{PAGE}"/>"#,
-        esc(&format!("Schedulers compared with {}", base.label))
+        esc(&format!("Schedulers compared with {}: {}", base.label, baseline(&base.label, &base.file.scheduler)))
     );
 
-    // Head: what this is, against what, on what.
+    // Head: what this is, against what, on what. The baseline is named
+    // as the session named it and said for what it is: "default" alone
+    // does not tell a reader which scheduler every cell is against.
     text(
         &mut out,
         MARGIN,
-        76.0,
-        38,
+        70.0,
+        36,
         INK,
         r#" font-weight="bold""#,
-        &format!("Schedulers against {}", fit(&base.label, 30)),
+        // Short enough to end before the name at the right, in bold.
+        &format!("Schedulers compared with {}", fit(&base.label, 22)),
     );
-    text(&mut out, w - MARGIN, 76.0, 20, MUTED, r#" text-anchor="end""#, "helicoprion");
+    text(&mut out, w - MARGIN, 70.0, 20, MUTED, r#" text-anchor="end""#, "helicoprion");
+    text(&mut out, MARGIN, 102.0, 20, INK_2, "", &baseline(&base.label, &base.file.scheduler));
     let sys = &base.file.system;
     let machine = [
         sys.cpu_model.as_deref().map(|m| fit(m, 44)),
         Some(format!("{} CPUs", sys.usable_cpus)),
         Some(format!("kernel {}", fit(&sys.kernel, 26))),
     ];
-    text(&mut out, MARGIN, 112.0, 20, INK_2, "", &machine.into_iter().flatten().collect::<Vec<_>>().join("  ·  "));
+    text(&mut out, MARGIN, 128.0, 16, MUTED, "", &machine.into_iter().flatten().collect::<Vec<_>>().join("  ·  "));
 
     // The grid: a column per workload, a row per scheduler.
     let column_w = ((w - 2.0 * MARGIN - NAMES) / workloads.len() as f64).min(120.0);
@@ -235,9 +256,19 @@ pub fn svg(c: &Comparison) -> Option<String> {
     if more_columns > 0 {
         left_out.push(format!("{more_columns} more workload{}", if more_columns == 1 { "" } else { "s" }));
     }
-    let caveat = caveat(&left_out, c.warnings.len());
-    text(&mut out, w - MARGIN, 144.0, 15, MUTED, r#" text-anchor="end""#, &caveat);
-    text(&mut out, MARGIN, 144.0, 15, MUTED, "", "Each cell: one scheduler in one workload, against the baseline.");
+    // How to read the grid, and what is not on the card: a line each,
+    // both from the left. Side by side they ran into each other once
+    // the second had rows or columns to name as missing.
+    text(
+        &mut out,
+        MARGIN,
+        READING,
+        15,
+        MUTED,
+        "",
+        "Rows: schedulers  ·  Columns: workloads  ·  Compared with the baseline",
+    );
+    text(&mut out, MARGIN, CAVEAT, 15, MUTED, "", &caveat(&left_out, c.warnings.len()));
     out.push_str("</svg>");
     Some(out)
 }
@@ -307,6 +338,30 @@ mod tests {
         // One the card has no short name for keeps its own, cut to fit.
         assert_eq!(head("something-else"), "something-…|");
         assert_eq!(head("new/case"), "new|case");
+    }
+
+    #[test]
+    fn the_baseline_is_said_for_what_it_is() {
+        use helicoprion_core::Scheduler;
+        let kernel = |bore| Scheduler::Fair { class: "EEVDF".into(), scx_capable: true, bore };
+        let ext = Scheduler::Ext { name: "lavd".into(), ops: "lavd_1.1.4".into(), enable_seq: Some(3) };
+        // What a matrix session calls it, and what it is.
+        assert_eq!(
+            baseline("default", &kernel(None)),
+            "The baseline, default, is EEVDF: the scheduler built into the kernel."
+        );
+        assert_eq!(
+            baseline("default", &kernel(Some(true))),
+            "The baseline, default, is EEVDF+BORE: the scheduler built into the kernel."
+        );
+        // A label that is the scheduler's name is not said twice.
+        assert_eq!(baseline("scx_lavd", &ext), "The baseline is scx_lavd, a sched_ext scheduler.");
+        assert_eq!(baseline("eevdf", &kernel(None)), "The baseline is EEVDF, the scheduler built into the kernel.");
+        // One that is something else is kept, next to what ran.
+        assert_eq!(
+            baseline("before the patch", &ext),
+            "The baseline, before the patch, is scx_lavd: a sched_ext scheduler."
+        );
     }
 
     #[test]

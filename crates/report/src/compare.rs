@@ -2627,7 +2627,11 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let card = crate::card::svg(&c).expect("a card");
         assert!(card.starts_with("<svg ") && card.ends_with("</svg>"));
         assert!(card.contains(r#"viewBox="0 0 1200 630""#) && !card.contains("<style") && !card.contains("<script"));
-        assert!(card.contains(">Schedulers against base<"));
+        assert!(card.contains(">Schedulers compared with base<"));
+        // And what the baseline is, from the scheduler its file records.
+        let what = crate::card::svg(&c).unwrap();
+        let said = format!("The baseline, base, is {}: ", c.series[c.baseline].file.scheduler.label());
+        assert!(what.contains(&said), "{said}");
         // Escaped and cut, not broken markup.
         assert!(card.contains(">a &lt;scheduler&gt; wi…<"));
         assert!(card.contains(">burst<") && card.contains(">double<"));
@@ -2644,6 +2648,16 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             // In a cell, and once more in the legend.
             assert!(card.matches(&format!(">{word}<")).count() >= 2, "{word}");
         }
+        // The line on how to read it and the one on what it leaves out
+        // do not share a height, however long the second gets.
+        for (line, y) in [("Rows: schedulers", crate::card::READING), ("Sizes, certainty", crate::card::CAVEAT)] {
+            assert!(
+                card.contains(&format!(r#"x="48.0" y="{y:.1}" font-family="sans-serif" font-size="15""#)),
+                "{line}"
+            );
+            assert_eq!(card.matches(&format!(r#" y="{y:.1}""#)).count(), 1, "{line}");
+        }
+        assert!(card.contains(">Rows: schedulers  ·  Columns: workloads  ·  Compared with the baseline<"));
         // What it leaves out is said on it.
         assert!(card.contains("are in the report.<"));
         // A single result has nothing to compare, and no card.
