@@ -607,7 +607,7 @@ pub fn analyse(files: Vec<(String, ResultFile)>, opts: Options) -> Result<Analys
                     .iter()
                     .map(|c| {
                         let cell = c.rows[row(c, key)?].cells.get(scheduler)?.as_ref()?;
-                        (!cell.values.is_empty()).then_some(cell.spread.median)
+                        (!cell.values.is_empty()).then_some(cell.shown())
                     })
                     .collect(),
             });

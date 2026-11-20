@@ -138,7 +138,7 @@ fn summary_section(h: &mut String, c: &Comparison) {
     let base = esc(&c.series[c.baseline].label);
     let _ = write!(
         h,
-        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable, a minor population or a share of too few events. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. <em>Unclear</em> counts the rest; those marked <em>uneven</em> would be clear, but the change differs too much from round to round (tagged in the table below). Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse. <code>woken_per_s</code>, the threads actually woken per second, is informational too: it follows the mix of round trips (fewer wake-ups where fewer round trips need a sleep), so it is listed and not counted.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
+        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable or a minor population. A share of counted events with under 20 events on either side is not compared at all, and is not among the metrics counted. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. <em>Unclear</em> counts the rest; those marked <em>uneven</em> would be clear, but the change differs too much from round to round (tagged in the table below). Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse. <code>woken_per_s</code>, the threads actually woken per second, is informational too: it follows the mix of round trips (fewer wake-ups where fewer round trips need a sleep), so it is listed and not counted.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
         me = c.opts.min_effect_pct
     );
     for s in &summary {
@@ -555,7 +555,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
         };
         let _ = write!(
             h,
-            "<h2>Change vs baseline</h2><p class=cap>Each scored metric against the baseline: bars to the right are better, whiskers are 95% intervals, the shaded band is ±{me}% noise.</p><details class=help><summary>How to read this</summary><p>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. Whiskers: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, cells whose run-to-run spread exceeds ±{us}% (marked unstable), and minor populations, i.e. metrics of a population holding under {ms}% of the run's round trips on either side (marked minor).{paired_note}</p></details><figure>{svg}</figure>",
+            "<h2>Change vs baseline</h2><p class=cap>Each scored metric against the baseline: bars to the right are better, whiskers are 95% intervals, the shaded band is ±{me}% noise.</p><details class=help><summary>How to read this</summary><p>Bars: change between the medians of valid runs, positive = better for every metric; changes of 2× or more are labelled as multiples. For a share of counted events (<code>rtt_blocked_slow_pct</code>, <code>deadline_miss_pct</code>, <code>overrun_pct</code>) the bar is the change between the shares over all runs compared, and its whisker an approximate interval worked out from the counts (the effective-count interval, described under the table of all metrics); such a share is on the chart only where both sides have at least 20 events. Whiskers otherwise: 95% percentile-bootstrap interval, resampling the runs of both the baseline and the candidate (shown only with ≥{MIN_RUNS_FOR_CI} runs on each side). The shaded band is ±{me}%: the within-session bootstrap cannot see drift between sessions, so smaller changes are not highlighted (calibrate with an A/A run of one scheduler). Left off the chart, but listed in the table: single-sample extremes (max), informational metrics, cells whose run-to-run spread exceeds ±{us}% (marked unstable), and minor populations, i.e. metrics of a population holding under {ms}% of the run's round trips on either side (marked minor).{paired_note}</p></details><figure>{svg}</figure>",
             me = c.opts.min_effect_pct,
             us = c.opts.unstable_spread_pct,
             ms = c.opts.min_share_pct
@@ -576,7 +576,7 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
     // Table view: every number behind the charts.
     let _ = write!(
         h,
-        "<h2>All metrics</h2><p class=cap>Every number behind the charts: median of valid runs ± spread, then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>Median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval; a change of 2× or more and its interval are given as multiples, and so is any end of an interval that is 2× or more away from no change, with its direction: <em>29× worse … 36× better</em> is an interval that includes no change. Of an interval that excludes no change, the end nearer to it is cut off at the digits shown, not rounded, so the least the change is estimated to be never reads larger than it is. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. A change tagged <em>n of m rounds undefined</em> comes from a session where the baseline measured zero in some rounds: a percentage change does not exist there, the estimate covers the other rounds only, and it is not scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has no usable ratio, typically a zero value, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>) and by more than the effect itself, and the change is not coloured or charted even when its interval excludes zero. More than the effect itself means more than the cautious end of the interval is away from no change: <em>2.2× worse</em> with an interval of 1.9× to 2.5× and rounds ±14% apart is scored, <em>16× better</em> with an interval of 1.2× to 60× and rounds ±530% apart is not.</p></details><table><tr><th>Workload · metric</th>",
+        "<h2>All metrics</h2><p class=cap>Every number behind the charts: for most metrics the median of valid runs ± spread, for shares of counted events the share over all runs with its counts; then the change vs baseline with its 95% interval. Only clear changes are coloured.</p><details class=help><summary>How to read this</summary><p>For most metrics: median of valid runs, ± half the relative IQR, then the change vs baseline with its 95% bootstrap interval. Shares of counted events are worked out from their counts instead, with an approximate interval of another kind, as said below. For either, a change of 2× or more and its interval are given as multiples, and so is any end of an interval that is 2× or more away from no change, with its direction: <em>29× worse … 36× better</em> is an interval that includes no change. Of an interval that excludes no change, the end nearer to it is cut off at the digits shown, not rounded, so the least the change is estimated to be never reads larger than it is. Coloured only when the interval excludes zero, the change is at least {me}%, the metric is not a single sample and neither side is unstable (spread above ±{us}%) or a minor population (under {ms}% of round trips: a large change there means the populations differ, not that the same events got faster or slower). <em>info</em> metrics have no better direction and are never scored. A share of counted events (<code>rtt_blocked_slow_pct</code>, <code>deadline_miss_pct</code>, <code>overrun_pct</code>) is shown as the share over all valid runs, with its events and what they are out of in place of a spread; its change and interval are worked out from those counts and from how much they differ from run to run (an approximate interval, not an exact one), and the rules on unstable sides and uneven rounds do not apply to it. It is compared only where both sides have at least 20 events: a change to none, from none or to a handful is shown as counts with <em>too few events to score</em>, which is not the same as no clear difference. A change tagged <em>n of m rounds undefined</em> comes from a session where the baseline measured zero in some rounds: a percentage change does not exist there, the estimate covers the other rounds only, and it is not scored. In a paired comparison stability is judged on the per-round changes instead of the raw spread: a change tagged <em>uneven ±x%</em> is one where the ratio between the two schedulers differs from round to round by more than ±{us}% (half the interquartile range of the per-round ratios, on a relative scale, so a steady 26× counts as even; where a round has no usable ratio, typically a zero value, the per-round changes are compared in percentage points instead, <em>uneven ±x pp</em>) and by more than the effect itself, and the change is not coloured or charted even when its interval excludes zero. More than the effect itself means more than the cautious end of the interval is away from no change: <em>2.2× worse</em> with an interval of 1.9× to 2.5× and rounds ±14% apart is scored, <em>16× better</em> with an interval of 1.2× to 60× and rounds ±530% apart is not.</p></details><table><tr><th>Workload · metric</th>",
         me = c.opts.min_effect_pct,
         us = c.opts.unstable_spread_pct,
         ms = c.opts.min_share_pct
@@ -599,12 +599,22 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
                 h.push_str("<td class=m>—</td>");
                 continue;
             };
-            let mut td = format!(
-                "{} <span class=m>±{}</span>",
-                fmt_value(cell.spread.median),
-                half_spread(cell.spread.rel_iqr_pct())
-            );
-            if cell.unstable {
+            // A share of counted events: the share over all runs, and
+            // the counts it is made of. How its runs differ is in the
+            // interval of its change, not next to its value.
+            let mut td = match cell.counted() {
+                Some((events, of)) => format!(
+                    "{} <span class=m title=\"events out of opportunities, over all valid runs: the value is their share\">{events} / {}</span>",
+                    fmt_value(cell.shown()),
+                    fmt_value(of as f64)
+                ),
+                None => format!(
+                    "{} <span class=m>±{}</span>",
+                    fmt_value(cell.spread.median),
+                    half_spread(cell.spread.rel_iqr_pct())
+                ),
+            };
+            if cell.unstable && cell.pooled.is_none() {
                 let _ = write!(
                     td,
                     " <span class=bad title=\"run-to-run spread above ±{}%\">unstable</span>",
@@ -625,12 +635,12 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
                 // interval is shown that could be read as one. Asked
                 // before the change is, since from a baseline of zero
                 // there is no change and the counts are still due.
-                if let Some(counts) = c.few_events(r, i) {
+                if let Some(note) = c.share_note(r, i) {
                     let _ = write!(
                         td,
-                        "<br><span class=m title=\"events and what they are out of, baseline → here, over the runs compared: under {} on both sides, so no change is given for this share\">{}</span>",
+                        "<br><span class=m title=\"a share of counted events is compared from its counters, over the runs compared, and only where both sides have at least {} events: no change is given for this one\">{}</span>",
                         crate::compare::MIN_EVENTS,
-                        esc(&counts)
+                        esc(&note)
                     );
                 } else {
                     match r.improvement(c.baseline, i) {
@@ -775,8 +785,8 @@ pub fn text_table(c: &Comparison) -> String {
             row.push(match cell {
                 None => "—".into(),
                 Some(cell) => {
-                    let mut s = fmt_value(cell.spread.median);
-                    if cell.unstable {
+                    let mut s = fmt_value(cell.shown());
+                    if cell.unstable && cell.pooled.is_none() {
                         s.push('~');
                     }
                     if r.minor(i) {
@@ -785,7 +795,7 @@ pub fn text_table(c: &Comparison) -> String {
                     // The counts in place of a change, as in the HTML
                     // table and in the same words, whether or not there
                     // is a change to take their place.
-                    if let Some(counts) = c.few_events(r, i) {
+                    if let Some(counts) = c.share_note(r, i) {
                         s.push_str(&format!(" ({counts})"));
                     } else if i != c.baseline {
                         match r.improvement(c.baseline, i) {

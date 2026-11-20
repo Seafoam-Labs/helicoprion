@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 
-use crate::compare::{Comparison, Delta, MetricRow, UnclearReason, Verdict};
+use crate::compare::{Comparison, Delta, MetricRow, Share, UnclearReason, Verdict};
 use crate::svg::{fmt_value, times};
 
 /// One candidate against the baseline on one workload.
@@ -164,7 +164,9 @@ fn unit(u: &str) -> &str {
 }
 
 fn medians(row: &MetricRow, baseline: usize, i: usize) -> Option<(f64, f64)> {
-    let m = |k: usize| row.cells.get(k).and_then(Option::as_ref).map(|c| c.spread.median);
+    // What the cells show: for a share of counted events the share over
+    // all runs, which is what its change is taken from.
+    let m = |k: usize| row.cells.get(k).and_then(Option::as_ref).map(|c| c.shown());
     Some((m(baseline)?, m(i)?))
 }
 
@@ -227,6 +229,8 @@ fn share_of(metric: &str) -> &'static str {
 fn events_of(metric: &str) -> &'static str {
     match metric {
         "rtt_blocked_slow_pct" => "blocked round trips",
+        "deadline_miss_pct" => "periods",
+        "overrun_pct" => "wake-ups",
         _ => "events",
     }
 }
@@ -236,68 +240,36 @@ fn events_of(metric: &str) -> &'static str {
 struct Failures {
     metric: &'static str,
     label: &'static str,
-    /// "missed" in "no run missed any" and "single runs missed up to".
-    verb: &'static str,
 }
 
-const DEADLINES: Failures = Failures { metric: "deadline_miss_pct", label: "Deadlines missed", verb: "missed" };
-const SLOW_TRIPS: Failures =
-    Failures { metric: "rtt_blocked_slow_pct", label: "Round trips of a millisecond or more", verb: "had" };
-const OVERRUNS: Failures =
-    Failures { metric: "overrun_pct", label: "Wake-ups lost because the task was still busy", verb: "lost" };
+const DEADLINES: Failures = Failures { metric: "deadline_miss_pct", label: "Deadlines missed" };
+const SLOW_TRIPS: Failures = Failures { metric: "rtt_blocked_slow_pct", label: "Round trips of a millisecond or more" };
+const OVERRUNS: Failures = Failures { metric: "overrun_pct", label: "Wake-ups lost because the task was still busy" };
 
-/// How often a workload's tasks failed in the way `f` names. Zero is
-/// common here, and a baseline of zero leaves no change to take, so the
-/// line is worded for those cases instead of being left out.
+/// How often a workload's tasks failed in the way `f` names: a share of
+/// counted events, compared from its counters (`MetricRow::share`).
 ///
-/// What is compared are medians over the runs. A median of zero is not
-/// "no deadline missed": three clean runs and two with misses have a
-/// median of zero, and a benchmark for rare lateness must not call that
-/// none. "None" is said only when every run of a side has none; otherwise
-/// the line says "median" and how much single runs missed.
+/// Where it is compared, the line gives the change and the two shares,
+/// each over all its runs together. Where it is not, it gives the
+/// counts, which say what there is, and why there is no verdict: a
+/// handful of events on a side, or none, is not a share to compare.
+/// "None" is said only when neither side has a single event.
 fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<String> {
     let row = c.rows.iter().find(|r| r.workload == workload && r.metric == f.metric)?;
-    let (b, v) = medians(row, c.baseline, i)?;
-    let base = &c.series[c.baseline].label;
-    let (label, verb, of) = (f.label, f.verb, share_of(f.metric));
-    // The most any single run of a side missed.
-    let worst = |k: usize| {
-        row.cells.get(k).and_then(Option::as_ref).map_or(0.0, |cell| cell.values.iter().copied().fold(0.0, f64::max))
-    };
-    let (worst_b, worst_v) = (worst(c.baseline), worst(i));
-    // A handful of events on both sides: the counts say what there is,
-    // where two shares that both round to nothing would say "0.00% →
-    // 0.00%", and the reason says why there is no verdict.
-    if let Some([(b_events, _), (events, _)]) = row.events(c.baseline, i).filter(|_| row.too_few_events(c.baseline, i))
-    {
-        return Some(if b_events == 0 && events == 0 {
-            format!("{label}: none in any run under either")
-        } else {
-            // The counts as the table and the terminal give them.
-            let counts = row.event_counts(c.baseline, i)?;
-            format!("{label}: {counts} {}; too few events to score", events_of(f.metric))
-        });
-    }
-    let runs = |worst: f64| {
-        if worst == 0.0 {
-            format!("no run {verb} any")
-        } else {
-            format!("single runs {verb} up to {}%", fmt_value(worst))
+    let label = f.label;
+    match row.share(c.baseline, i)? {
+        Share::Scored(_) => point(c, workload, i, f.metric, label, ("fewer", "more")),
+        Share::TooFewEvents => {
+            let [(b_events, _), (events, _)] = row.events(c.baseline, i)?;
+            Some(if b_events == 0 && events == 0 {
+                format!("{label}: none in any run under either")
+            } else {
+                // The counts as the table and the terminal give them.
+                let counts = row.event_counts(c.baseline, i)?;
+                format!("{label}: {counts} {}; too few events to score", events_of(f.metric))
+            })
         }
-    };
-    match (b == 0.0, v == 0.0) {
-        (true, true) if worst_b == 0.0 && worst_v == 0.0 => Some(format!("{label}: none in any run under either")),
-        (true, true) => Some(format!(
-            "{label}: a median of 0% {of} under both ({base}: {}; here: {})",
-            runs(worst_b),
-            runs(worst_v)
-        )),
-        (true, false) => Some(format!(
-            "{label}: a median of {}% {of}, and a median of 0% under {base} ({}); a change from zero is not scored",
-            fmt_value(v),
-            runs(worst_b)
-        )),
-        _ => point(c, workload, i, f.metric, label, ("fewer", "more")),
+        Share::NoCounters | Share::NoSharedRounds => Some(format!("{label}: {}", c.share_note(row, i)?)),
     }
 }
 
@@ -444,7 +416,6 @@ fn why(c: &Comparison, d: &Delta, reason: UnclearReason) -> String {
     match reason {
         UnclearReason::SingleSample => "a single extreme value is never scored".into(),
         UnclearReason::MinorPopulation => "too few relevant wake-ups".into(),
-        UnclearReason::TooFewEvents => "too few events to score".into(),
         UnclearReason::UndefinedRounds => "the baseline measured zero in some rounds".into(),
         UnclearReason::TooFewRounds if d.paired_rounds.is_some() || d.unmatched_rounds => {
             "too few paired rounds".into()

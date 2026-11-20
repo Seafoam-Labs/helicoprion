@@ -382,14 +382,16 @@ pub fn delta_chart(c: &Comparison) -> Option<String> {
             let base_cell = r.cells[c.baseline].as_ref().expect("improvement implies baseline");
             let clipped = m.abs() > extent;
             let interval = interval_text(&d);
+            // A share of counted events is the share over all runs.
+            let what = if cell.pooled.is_some() { "share over all runs" } else { "median" };
             let tip = format!(
-                "{}: {} {} — {} (median {} vs {} {}; {interval}; {} vs {} valid runs)",
+                "{}: {} {} — {} ({what} {} vs {} {}; {interval}; {} vs {} valid runs)",
                 ser.label,
                 r.workload,
                 r.metric,
                 fmt_delta(&d),
-                fmt_value(cell.spread.median),
-                fmt_value(base_cell.spread.median),
+                fmt_value(cell.shown()),
+                fmt_value(base_cell.shown()),
                 r.unit,
                 cell.spread.n,
                 base_cell.spread.n

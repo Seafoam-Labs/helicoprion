@@ -8,6 +8,7 @@ pub mod conditions;
 pub mod html;
 pub mod sessions;
 pub mod sessions_report;
+pub mod shares;
 pub mod simple;
 pub mod stats;
 pub mod svg;

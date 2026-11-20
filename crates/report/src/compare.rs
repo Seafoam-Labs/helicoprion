@@ -46,11 +46,33 @@ pub struct Cell {
     /// metric's population holds (`Metric::share`); `None` for metrics over
     /// everything.
     pub share: Option<f64>,
-    /// For a metric that is a share of rare events (`event_counters`):
+    /// For a metric that is a share of counted events (`event_counters`):
     /// the events of every valid run and what they are a share of, from
     /// the run's own counters. Empty for any other metric, and for a run
     /// that does not have the counters.
     pub events: Vec<EventRun>,
+    /// For such a metric, the share over all valid runs together, in
+    /// percent: their events out of their opportunities. It is what the
+    /// cell shows, and what a change is worked out from, in place of the
+    /// median of the runs' own shares, which is zero for three runs of
+    /// five with events and hides them. `None` for any other metric, and
+    /// where a run does not have the counters.
+    pub pooled: Option<f64>,
+}
+
+impl Cell {
+    /// The value the cell shows: for a share of counted events the share
+    /// over all runs together, for anything else the median of the runs.
+    pub fn shown(&self) -> f64 {
+        self.pooled.unwrap_or(self.spread.median)
+    }
+
+    /// For a share of counted events, what `pooled` is made of: the
+    /// events of all valid runs and what they are out of.
+    pub fn counted(&self) -> Option<(u64, u64)> {
+        self.pooled?;
+        Some(self.events.iter().fold((0, 0), |(events, of), r| (events + r.events, of + r.of)))
+    }
 }
 
 /// The events behind a share in one run.
@@ -59,30 +81,81 @@ pub struct EventRun {
     /// The round of an interleaved session the run belongs to.
     pub round: Option<u32>,
     pub events: u64,
+    /// The events that count towards `MIN_EVENTS`: all of them, or for a
+    /// share whose events come in pairs the first of each pair.
+    pub qualifying: u64,
     /// Out of how many.
     pub of: u64,
 }
 
-/// The counters behind a metric that is a share of rare events and is
-/// scored: the events, and what they are a share of. Such a share is
-/// only as good as the number of events it rests on, which the share
-/// itself does not show: 9 slow round trips in 33.6 million against none
-/// is "100% fewer" with an interval of no width, and nothing.
-pub fn event_counters(metric: &str) -> Option<(&'static str, &'static str)> {
+/// The counters behind a metric that is a share of counted events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventCounters {
+    /// The events: the share is their sum out of `of`.
+    pub events: &'static [&'static str],
+    /// The events counted towards `MIN_EVENTS`.
+    pub qualifying: &'static str,
+    /// What the events are a share of.
+    pub of: &'static str,
+}
+
+/// The counters behind a metric that is a share of counted events and is
+/// scored. Such a share is only as good as the number of events it rests
+/// on, which the share itself does not show: 9 slow round trips in 33.6
+/// million against none is "100% fewer" with an interval of no width,
+/// and nothing. These metrics are compared from their counters and in no
+/// other way (`MetricRow::share`).
+///
+/// A missed deadline is two events as a rule: a period that ends late,
+/// and the next one, which is skipped for it. The share is of both, and
+/// what is counted towards `MIN_EVENTS` is the late ones alone, as the
+/// nearer count of how many times something went wrong; it is not a
+/// count of independent episodes either.
+pub fn event_counters(metric: &str) -> Option<EventCounters> {
+    let one = |events: &'static [&'static str], of| Some(EventCounters { events, qualifying: events[0], of });
     match metric {
-        "rtt_blocked_slow_pct" => Some(("roundtrips_slow", "roundtrips_blocked")),
+        "rtt_blocked_slow_pct" => one(&["roundtrips_slow"], "roundtrips_blocked"),
+        "deadline_miss_pct" => one(&["periods_late", "periods_skipped"], "periods_due"),
+        "overrun_pct" => one(&["wakeups_overrun"], "wakeups_due"),
         _ => None,
     }
 }
 
-/// A share of rare events is scored only when one side at least has this
-/// many of them, over the runs the comparison rests on. One side is
-/// enough: none where the other has many is what an improvement looks
-/// like. This admits a change to scoring and is no test of it: the
-/// interval, the minimum effect and the evenness of the rounds still
-/// have to hold. Twenty is where a quantile starts to be given too
-/// (`min_samples_for(0.5)`).
+/// A share of counted events is scored only when both sides have this
+/// many of them, over the runs the comparison rests on.
+///
+/// Both, and not one: a side with a handful of events, or none, cannot
+/// show how its events vary from run to run, and its zeros are then
+/// taken for the zeros of independent events. Where its events come
+/// rarely and many at a time, "none against thousands" is found in most
+/// comparisons of two sides with the same share. In simulation a rule of
+/// one side called 55 to 70% of such equal pairs different, and this
+/// rule 2% at most (METHODOLOGY, "Shares of counted events"). So a
+/// change to none, from none or to a few is shown as counts and is not
+/// scored: no events seen is worth saying and is no proof of a share of
+/// zero.
+///
+/// It admits a change to scoring and is no test of it: the interval and
+/// the minimum effect still have to hold. Twenty is where a quantile
+/// starts to be given too (`min_samples_for(0.5)`), and it does not
+/// mean twenty independent events.
 pub const MIN_EVENTS: u64 = 20;
+
+/// What became of the comparison of a share of counted events.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Share {
+    /// Compared, from the counters.
+    Scored(Delta),
+    /// A side has under `MIN_EVENTS` events: counts, and no change.
+    TooFewEvents,
+    /// A run of a side has the metric and not its counters, as results
+    /// of older versions do. Not compared: the change is not taken from
+    /// the runs' shares in their place, which would make two reports
+    /// that say the same of their method use two.
+    NoCounters,
+    /// One session, and no round that both sides have.
+    NoSharedRounds,
+}
 
 /// Identifies one interleaved session: files with equal keys were measured
 /// in the same rounds, so their rounds can be paired.
@@ -296,6 +369,14 @@ impl MetricRow {
         if !s.comparable {
             return None;
         }
+        // A share of counted events is compared from its counters, or
+        // not at all.
+        if event_counters(&self.metric).is_some() {
+            return match self.share(baseline, i)? {
+                Share::Scored(d) => Some(d),
+                _ => None,
+            };
+        }
         if let Some(d) = self.paired(b, s) {
             return Some(d);
         }
@@ -378,6 +459,11 @@ impl MetricRow {
     /// changes disagree by more than the threshold (raw run-to-run spread
     /// there is mostly drift between rounds, which pairing removes).
     pub fn unstable_pair(&self, baseline: usize, i: usize) -> bool {
+        // How much a share's runs differ is in its interval already, as
+        // the dispersion its counts are divided by.
+        if event_counters(&self.metric).is_some() {
+            return false;
+        }
         let d = self.improvement(baseline, i);
         if d.as_ref().is_some_and(|d| d.undefined_rounds > 0) {
             return true;
@@ -407,21 +493,93 @@ impl MetricRow {
     /// `None` also for any other metric, and where a side has no run
     /// with both the metric and its counters.
     pub fn events(&self, baseline: usize, i: usize) -> Option<[(u64, u64); 2]> {
+        let sum = |runs: &Vec<EventRun>| runs.iter().fold((0, 0), |(events, of), e| (events + e.events, of + e.of));
+        self.event_runs(baseline, i).map(|[b, s]| [sum(&b), sum(&s)])
+    }
+
+    /// The observations behind `events`, the baseline's and those of
+    /// series `i`: what counts as one sample of a side.
+    ///
+    /// In a session that is a round, with the counters of its runs
+    /// summed, and not a run: the rounds are what a session repeats, and
+    /// two runs of one round are not two of them. Two rounds of two runs
+    /// are two observations, too few for an interval, as two rounds are
+    /// for any other metric. Outside a session every valid run is one.
+    fn event_runs(&self, baseline: usize, i: usize) -> Option<[Vec<EventRun>; 2]> {
         let cell = |k: usize| self.cells.get(k).and_then(Option::as_ref).filter(|c| !c.events.is_empty());
         let (b, s) = (cell(baseline)?, cell(i)?);
-        let sum = |runs: &mut dyn Iterator<Item = &EventRun>| {
-            runs.fold((0, 0), |(events, of), e| (events + e.events, of + e.of))
-        };
         if b.session.is_none() || b.session != s.session {
-            return Some([sum(&mut b.events.iter()), sum(&mut s.events.iter())]);
+            return Some([b.events.clone(), s.events.clone()]);
         }
         let rounds = |c: &Cell| c.events.iter().filter_map(|e| e.round).collect::<std::collections::BTreeSet<u32>>();
         let shared: Vec<u32> = rounds(b).intersection(&rounds(s)).copied().collect();
         if shared.is_empty() {
             return None;
         }
-        let total = |c: &Cell| sum(&mut c.events.iter().filter(|e| e.round.is_some_and(|r| shared.contains(&r))));
-        Some([total(b), total(s)])
+        let of = |c: &Cell| -> Vec<EventRun> {
+            let mut rounds: BTreeMap<u32, EventRun> = BTreeMap::new();
+            for e in &c.events {
+                let Some(round) = e.round.filter(|r| shared.contains(r)) else { continue };
+                let sum = rounds.entry(round).or_insert(EventRun { round: e.round, events: 0, qualifying: 0, of: 0 });
+                sum.events += e.events;
+                sum.qualifying += e.qualifying;
+                sum.of += e.of;
+            }
+            rounds.into_values().collect()
+        };
+        Some([of(b), of(s)])
+    }
+
+    /// What became of the comparison of series `i` with the baseline for
+    /// a share of counted events. `None` for any other metric, where a
+    /// side is missing, and where the workload parameters differ.
+    ///
+    /// The change is that of the shares over the runs compared, each
+    /// from the sums of its counters, with the effective-count
+    /// approximate interval (`shares::change`). What is compared is what
+    /// `events` counts: the rounds both sides have in a session, each
+    /// one observation whatever its number of runs, and every valid run
+    /// otherwise. An interval needs three observations a side, as it
+    /// needs three rounds anywhere else.
+    pub fn share(&self, baseline: usize, i: usize) -> Option<Share> {
+        event_counters(&self.metric)?;
+        let b = self.cells.get(baseline)?.as_ref()?;
+        let s = self.cells.get(i)?.as_ref()?;
+        if !s.comparable {
+            return None;
+        }
+        if b.pooled.is_none() || s.pooled.is_none() {
+            return Some(Share::NoCounters);
+        }
+        let Some([b_runs, s_runs]) = self.event_runs(baseline, i) else {
+            return Some(Share::NoSharedRounds);
+        };
+        let qualifying = |runs: &[EventRun]| runs.iter().map(|r| r.qualifying).sum::<u64>();
+        if qualifying(&b_runs).min(qualifying(&s_runs)) < MIN_EVENTS {
+            return Some(Share::TooFewEvents);
+        }
+        let Some(found) = crate::shares::change(&b_runs, &s_runs) else {
+            return Some(Share::TooFewEvents);
+        };
+        // The ratio of the shares as a change of this metric, and the
+        // ends of its interval the same way, worse end first.
+        let as_change = |ratio: f64| change(self.better, 1.0, ratio);
+        let ci = found.interval.and_then(|(lo, hi)| {
+            let (a, b) = (as_change(lo)?, as_change(hi)?);
+            Some((a.min(b), a.max(b)))
+        });
+        Some(Share::Scored(Delta {
+            median: as_change(found.ratio)?,
+            ci,
+            ratio: goodness_ratio(self.better, 1.0, found.ratio),
+            // The rounds decide which runs are compared and are not
+            // paired off: what a round shares is in the dispersion.
+            paired_rounds: None,
+            unmatched_rounds: false,
+            paired_spread: None,
+            undefined_rounds: 0,
+            better: self.better,
+        }))
     }
 
     /// The counts behind a share of rare events, the baseline's and
@@ -435,10 +593,10 @@ impl MetricRow {
         Some(format!("{b_events} / {} → {events} / {}", out_of(b_of), out_of(of)))
     }
 
-    /// A share of rare events with under `MIN_EVENTS` of them on both
-    /// sides: shown, with the counts, and not scored.
+    /// A share of counted events with under `MIN_EVENTS` of them on a
+    /// side: shown, with the counts, and not scored.
     pub fn too_few_events(&self, baseline: usize, i: usize) -> bool {
-        self.events(baseline, i).is_some_and(|[b, s]| b.0.max(s.0) < MIN_EVENTS)
+        self.share(baseline, i) == Some(Share::TooFewEvents)
     }
 
     /// Either side is a minor population. Its quantiles then describe a
@@ -650,9 +808,6 @@ pub enum UnclearReason {
     /// The population behind the metric is under `min_share_pct` of the
     /// run's events on one side.
     MinorPopulation,
-    /// A share of rare events with under `MIN_EVENTS` of them on both
-    /// sides (`MetricRow::too_few_events`).
-    TooFewEvents,
     /// The baseline measured zero in some shared rounds, where a
     /// percentage change does not exist.
     UndefinedRounds,
@@ -682,11 +837,8 @@ impl Comparison {
         if r.minor_pair(self.baseline, i) {
             return Some(UnclearReason::MinorPopulation);
         }
-        // Before anything about the change itself: with a handful of
-        // events there is no change to judge, whatever its interval.
-        if r.too_few_events(self.baseline, i) {
-            return Some(UnclearReason::TooFewEvents);
-        }
+        // A share of counted events with too few of them never gets
+        // here: it has no change to judge (`MetricRow::share`).
         if d.undefined_rounds > 0 {
             return Some(UnclearReason::UndefinedRounds);
         }
@@ -709,26 +861,30 @@ impl Comparison {
     }
 
     /// What stands in place of the change of series `i` in row `r` where
-    /// a share has too few events to be scored (`too_few_events`): the
-    /// counts, and that they are too few. `None` for anything else, for
-    /// the baseline itself, and where the workload parameters differ,
-    /// which is what is said then.
-    /// A change of "+100%" with an interval from 100% to 100% next to a
-    /// note that it does not count is still a number that says the
-    /// opposite of the note, so the table and the terminal show this
-    /// and no percentage.
+    /// a share of counted events is not compared (`MetricRow::share`):
+    /// the counts and that they are too few, or what else keeps the two
+    /// from being compared. `None` for a share that is, for any other
+    /// metric, for the baseline itself, and where the workload
+    /// parameters differ, which is what is said then.
     ///
-    /// It does not ask whether there is a change to replace. From a
-    /// baseline of zero there is none (`improvement`), and those are
-    /// the very cases, none against none and none against a few, in
-    /// which the counts are all there is to say.
-    pub fn few_events(&self, r: &MetricRow, i: usize) -> Option<String> {
-        let comparable = r.cells.get(i).and_then(Option::as_ref).is_some_and(|c| c.comparable);
-        if i == self.baseline || !comparable || !r.too_few_events(self.baseline, i) {
+    /// "Too few events" is not "no clear difference": the first is a
+    /// pair that was not admitted to a comparison, the second one that
+    /// was and did not settle it. A change of "+100%" next to a note
+    /// that it does not count would still be read as a number that
+    /// does, so the table and the terminal show this and no percentage.
+    pub fn share_note(&self, r: &MetricRow, i: usize) -> Option<String> {
+        if i == self.baseline {
             return None;
         }
-        // Too few events are counted events: the counts are there.
-        r.event_counts(self.baseline, i).map(|counts| format!("{counts}; too few events to score"))
+        match r.share(self.baseline, i)? {
+            Share::Scored(_) => None,
+            // Too few events are counted events: the counts are there.
+            Share::TooFewEvents => {
+                r.event_counts(self.baseline, i).map(|counts| format!("{counts}; too few events to score"))
+            }
+            Share::NoCounters => Some("no event counters in this result; not scored".into()),
+            Share::NoSharedRounds => Some("no rounds in common; not scored".into()),
+        }
     }
 
     /// The change of series `i` in row `r` is one the report colours and
@@ -990,7 +1146,7 @@ impl Comparison {
                             .filter(|v| v.is_finite())
                             .collect();
                         let events: Vec<EventRun> = event_counters(&metric)
-                            .map(|(events, of)| {
+                            .map(|counters| {
                                 w.runs
                                     .iter()
                                     // The runs the metric's value comes
@@ -1002,12 +1158,26 @@ impl Comparison {
                                     .filter(|r| r.valid && r.metrics.get(&metric).is_some_and(|m| m.value.is_finite()))
                                     .filter_map(|r| {
                                         let count = |name: &str| r.counters.get(name).copied();
-                                        Some(EventRun { round: r.round, events: count(events)?, of: count(of)? })
+                                        let mut events = 0;
+                                        for name in counters.events {
+                                            events += count(name)?;
+                                        }
+                                        Some(EventRun {
+                                            round: r.round,
+                                            events,
+                                            qualifying: count(counters.qualifying)?,
+                                            of: count(counters.of)?,
+                                        })
                                     })
                                     .collect()
                             })
                             .unwrap_or_default();
                         let spread = Spread::of(&values)?;
+                        // Every run with the metric has its counters,
+                        // or the share over all of them is not known.
+                        let (counted, out_of) = events.iter().fold((0, 0), |(e, of), r| (e + r.events, of + r.of));
+                        let pooled = (!events.is_empty() && events.len() == values.len() && out_of > 0)
+                            .then(|| counted as f64 / out_of as f64 * 100.0);
                         Some(Cell {
                             unstable: spread.n >= 2 && spread.rel_iqr_pct() / 2.0 > opts.unstable_spread_pct,
                             spread,
@@ -1018,6 +1188,7 @@ impl Comparison {
                             rounds,
                             share: median(&shares),
                             events,
+                            pooled,
                         })
                     })
                     .collect();
@@ -1647,7 +1818,8 @@ mod tests {
             // Explanations are folded away; each section keeps a one-line caption.
             assert_eq!(html.matches("<details class=help>").count(), html.matches("<p class=cap>").count());
             assert!(
-                !html.contains("<p class=sub>Bars:") && html.contains("<summary>How to read this</summary><p>Median")
+                !html.contains("<p class=sub>Bars:")
+                    && html.contains("<summary>How to read this</summary><p>For most metrics: median")
             );
         }
         let opts = Options { min_share_pct: 0.0, ..Options::default() };
@@ -2437,7 +2609,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                     r.metrics.insert("response_p50".into(), Metric::lower((100.0 + wake) * wobble, "us"));
                     r.metrics.insert("response_p99".into(), Metric::lower(60.0 * wake * wobble, "us"));
                     let missed = if is_cand { 1.0 } else { 10.0 };
-                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(missed * wobble, "%"));
+                    counted(r, "deadline_miss_pct", missed * wobble);
                     r.metrics.insert("on_time_pct".into(), Metric::info(100.0 - missed * wobble, "%"));
                     r.metrics.insert("hog_work_per_s".into(), Metric::info(1e6 * wobble, "units/s"));
                 }
@@ -2454,14 +2626,16 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // wake-up does not.
         assert!(text.contains("• Slow responses (1 in 100), work included: 10% shorter ("), "{text}");
         // Two shares and a factor, not a percentage of a percentage.
-        assert!(text.contains("• Deadlines missed: 10× fewer (11.5% → 1.15% of periods)"), "{text}");
+        // The shares are those over all runs together.
+        assert!(text.contains("• Deadlines missed: 10× fewer (11.7% → 1.16% of periods)"), "{text}");
         assert!(!text.contains("on time"), "informational, and the same fact: {text}");
         assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
         // The typical response moves by under 2%: below the threshold.
         assert!(text.contains("• Of 5 measurements, 4 clearly better and 0 clearly worse"), "{text}");
 
-        // Deadlines missed by neither, and by the candidate only: zero is
-        // a value, and a change from zero is not made up.
+        // Deadlines missed by neither, by the candidate only and by the
+        // baseline only: none is said where there is none, and a side
+        // without events is counts and no change, to none as from none.
         let zeros = |base: f64, cand: f64| {
             let mut files = drifting_session();
             for (f, is_cand) in files.iter_mut().zip([false, true]) {
@@ -2469,8 +2643,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                 for r in f.workloads[0].runs.iter_mut() {
                     r.metrics.clear();
                     r.metrics.insert("wake_p50".into(), Metric::lower(20.0, "us"));
-                    let missed = if is_cand { cand } else { base };
-                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(missed, "%"));
+                    counted(r, "deadline_miss_pct", if is_cand { cand } else { base });
                 }
             }
             crate::simple::text(&Comparison::build(files, 0))
@@ -2478,16 +2651,19 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(zeros(0.0, 0.0).contains("• Deadlines missed: none in any run under either\n"), "{}", zeros(0.0, 0.0));
         let from_zero = zeros(0.0, 2.5);
         assert!(
-            from_zero.contains(
-                "• Deadlines missed: a median of 2.50% of periods, and a median of 0% under base (no run missed any); a \
-                 change from zero is not scored"
-            ),
+            from_zero.contains("• Deadlines missed: 0 / 240.0k → 6000 / 240.0k periods; too few events to score\n"),
             "{from_zero}"
         );
+        let to_zero = zeros(2.5, 0.0);
+        assert!(
+            to_zero.contains("• Deadlines missed: 6000 / 240.0k → 0 / 240.0k periods; too few events to score\n"),
+            "{to_zero}"
+        );
+        assert!(!to_zero.contains("fewer") && !from_zero.contains("more"), "{to_zero}{from_zero}");
 
-        // A median of zero is not "none". Five runs a side: three clean,
-        // two with misses. Both medians are 0%, and both sides did miss
-        // deadlines; the line must say median, and what single runs did.
+        // A few misses are not "none", whatever the median of the runs
+        // is. Five runs a side: three clean, two with misses. The counts
+        // say what there was, and that it is too little to compare.
         let rare = |base: [f64; 5], cand: [f64; 5]| {
             let mk = |label: &str, missed: [f64; 5]| {
                 let mut f = file(label, &[1.0; 5], 1);
@@ -2495,7 +2671,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                 for (r, m) in f.workloads[0].runs.iter_mut().zip(missed) {
                     r.metrics.clear();
                     r.metrics.insert("wake_p50".into(), Metric::lower(20.0, "us"));
-                    r.metrics.insert("deadline_miss_pct".into(), Metric::lower(m, "%"));
+                    counted(r, "deadline_miss_pct", m);
                 }
                 f
             };
@@ -2503,28 +2679,22 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         };
         let said = rare([0.0, 0.0, 0.0, 0.02, 0.05], [0.0, 0.0, 0.0, 0.04, 0.08]);
         assert!(
-            said.contains(
-                "• Deadlines missed: a median of 0% of periods under both (base: single runs missed up to 0.05%; here: \
-                 single runs missed up to 0.08%)"
-            ),
+            said.contains("• Deadlines missed: 14 / 100.0k → 24 / 100.0k periods; too few events to score\n"),
             "{said}"
         );
-        assert!(!said.contains("none") && !said.contains("no run missed"), "{said}");
-        // A baseline with a median of zero that did miss some.
+        assert!(!said.contains("none") && !said.contains("median"), "{said}");
+        // Many on one side do not make up for a handful on the other.
         let said = rare([0.0, 0.0, 0.0, 0.02, 0.05], [2.0, 2.5, 3.0, 2.5, 2.5]);
         assert!(
-            said.contains(
-                "• Deadlines missed: a median of 2.50% of periods, and a median of 0% under base (single runs missed \
-                 up to 0.05%); a change from zero is not scored"
-            ),
+            said.contains("• Deadlines missed: 14 / 100.0k → 2500 / 100.0k periods; too few events to score\n"),
             "{said}"
         );
         // One side clean throughout, the other with rare misses.
         let said = rare([0.0; 5], [0.0, 0.0, 0.0, 0.04, 0.08]);
-        assert!(said.contains("under both (base: no run missed any; here: single runs missed up to 0.08%)"), "{said}");
-        // To zero: fewer, without a factor that would be infinite.
-        let to_zero = zeros(2.5, 0.0);
-        assert!(to_zero.contains("• Deadlines missed: fewer (2.50% → 0.00% of periods)"), "{to_zero}");
+        assert!(
+            said.contains("• Deadlines missed: 0 / 100.0k → 24 / 100.0k periods; too few events to score\n"),
+            "{said}"
+        );
         assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_PERIODIC)), "{text}");
         assert!(!text.contains("pairs of tasks"), "{text}");
         assert!(crate::simple::text(&session("periodic-wake")).contains("  Tasks on a timer, idle system: BETTER"));
@@ -2565,7 +2735,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                     r.metrics.insert("all_done_p50".into(), Metric::lower(200.0 + 120.0 * k, "us"));
                     r.metrics.insert("all_done_p99".into(), Metric::lower(200.0 + 800.0 * k, "us"));
                     let lost = if is_cand { overrun.1 } else { overrun.0 };
-                    r.metrics.insert("overrun_pct".into(), Metric::lower(lost * wobble, "%"));
+                    counted(r, "overrun_pct", lost * wobble);
                     r.metrics.insert("bursts_per_s".into(), Metric::info(if is_cand { 498.0 } else { 393.0 }, "1/s"));
                     let overrun = (lost * 10.0) as u64;
                     for (name, n) in [
@@ -2595,7 +2765,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // A share of the wake-ups, not of periods, and no percentage of a
         // percentage.
         assert!(
-            text.contains("• Wake-ups lost because the task was still busy: 4.0× fewer (4.59% → 1.15% of wake-ups)"),
+            text.contains("• Wake-ups lost because the task was still busy: 4.0× fewer (4.00% → 1.00% of wake-ups)"),
             "{text}"
         );
         // How much work each side was asked for, said and not scored.
@@ -2617,13 +2787,8 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             );
         }
         let from_zero = crate::simple::text(&session("wake-burst/full", (0.0, 2.0)));
-        assert!(
-            from_zero.contains(
-                "• Wake-ups lost because the task was still busy: a median of 2.30% of wake-ups, and a median of \
-                 0% under base (no run lost any); a change from zero is not scored"
-            ),
-            "{from_zero}"
-        );
+        let line = from_zero.lines().find(|l| l.contains("Wake-ups lost")).unwrap();
+        assert!(line.contains("still busy: 0 / ") && line.ends_with(" wake-ups; too few events to score"), "{line}");
         // The report explains the populations and counters it shows.
         let html = crate::html::report(&c);
         assert!(html.contains(&crate::esc(crate::simple::WHAT_BURST)), "{html}");
@@ -2702,8 +2867,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             for (f, is_cand) in files.iter_mut().zip([false, true]) {
                 f.workloads[0].name = "wake-pingpong/loaded".into();
                 for r in f.workloads[0].runs.iter_mut() {
-                    let pct = if is_cand { slow.1 } else { slow.0 };
-                    r.metrics.insert("rtt_blocked_slow_pct".into(), Metric::lower(pct, "%"));
+                    counted(r, "rtt_blocked_slow_pct", if is_cand { slow.1 } else { slow.0 });
                 }
             }
             crate::simple::text(&Comparison::build(files, 0))
@@ -2721,20 +2885,42 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let from_zero = session((0.0, 0.5));
         assert!(
             from_zero.contains(
-                "• Round trips of a millisecond or more: a median of 0.50% of the round trips that needed a wake-up, \
-                 and a median of 0% under base (no run had any); a change from zero is not scored"
+                "• Round trips of a millisecond or more: 0 / 24.00M → 120000 / 24.00M blocked round trips; too few \
+                 events to score\n"
             ),
             "{from_zero}"
         );
+        // A result without the counters, as older versions wrote them:
+        // not compared, and said so; the runs' own shares are not taken
+        // in their place.
+        let mut files = drifting_session();
+        for (f, pct) in files.iter_mut().zip([0.12, 0.03]) {
+            f.workloads[0].name = "wake-pingpong/loaded".into();
+            for r in f.workloads[0].runs.iter_mut() {
+                r.metrics.insert("rtt_blocked_slow_pct".into(), Metric::lower(pct, "%"));
+            }
+        }
+        let c = Comparison::build(files, 0);
+        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
+        assert_eq!(row.share(0, 1), Some(Share::NoCounters));
+        assert_eq!(row.improvement(0, 1), None);
+        let old = crate::simple::text(&c);
+        assert!(
+            old.contains("• Round trips of a millisecond or more: no event counters in this result; not scored\n"),
+            "{old}"
+        );
+        assert!(crate::html::text_table(&c).contains("(no event counters in this result; not scored)"));
     }
 
-    /// A share of rare events is scored only where one side has enough
-    /// of them. The case that showed it: 9 slow round trips in 33.6
-    /// million against none counted as "100% fewer, clearly better" and
-    /// turned a workload that was worse in everything else into "mixed",
-    /// in the plain view, the summary and on the card alike.
+    /// A share of counted events is compared from its counters, and only
+    /// where both sides have twenty events. The case that showed the
+    /// need: 9 slow round trips in 33.6 million against none counted as
+    /// "100% fewer, clearly better" and turned a workload that was worse
+    /// in everything else into "mixed". Then simulation: none against
+    /// many is found in most comparisons of two equal sides when the
+    /// events of the side with none come rarely and many at a time.
     #[test]
-    fn a_share_of_rare_events_needs_events_to_be_scored() {
+    fn a_share_of_counted_events_needs_events_on_both_sides() {
         // Slow round trips of the baseline and of the candidate, summed
         // over the 12 runs of a side, each of 2.8 million blocked round
         // trips. The other metric of the workload is clearly worse.
@@ -2756,22 +2942,30 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             }
             files
         };
-        // Why the share is not scored, or `None` where it is.
-        let reason = |c: &Comparison| {
-            let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-            c.unclear_reason(row, 1, &row.improvement(0, 1).unwrap())
-        };
+        fn slow(c: &Comparison) -> &MetricRow {
+            c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap()
+        }
+        let scored = |c: &Comparison| matches!(slow(c).share(0, 1), Some(Share::Scored(_)));
         let verdict = |c: &Comparison| crate::simple::briefs(c)[0].verdict;
         let build = |slow| Comparison::build(session(slow), 0);
+        let line_of = |text: &str| text.lines().find(|l| l.contains("rtt_blocked_slow_pct")).unwrap().to_string();
+        // The row of the table of all metrics, not the summary's.
+        let html_line = |c: &Comparison| {
+            let html = crate::html::report(c).replace("</tr>", "</tr>\n");
+            html.lines().find(|l| l.contains(" · rtt_blocked_slow_pct ")).unwrap().to_string()
+        };
+        let terminal_line = |c: &Comparison| line_of(&crate::html::text_table(c));
 
-        // The report that showed it. Not scored, and the workload is
+        // The report that showed it. Not compared, and the workload is
         // worse and not mixed: in the briefs, which the plain view and
         // the card are made of, and in the summary's counts.
         let c = build((9, 0));
-        assert_eq!(reason(&c), Some(UnclearReason::TooFewEvents));
+        let row = slow(&c);
+        assert_eq!(row.share(0, 1), Some(Share::TooFewEvents));
+        assert!(row.too_few_events(0, 1) && row.improvement(0, 1).is_none() && !row.chartable(0, 1));
         assert_eq!(verdict(&c), Verdict::Worse);
         let summary = &c.summary()[0];
-        assert_eq!((summary.better, summary.worse, summary.verdict()), (0, 1, Verdict::Worse));
+        assert_eq!((summary.compared, summary.better, summary.worse, summary.verdict()), (1, 0, 1, Verdict::Worse));
         let card = crate::card::svg(&c).unwrap();
         // In its cell, and twice in the legend, as the sample cell and
         // as its meaning; "mixed" only as the legend's sample cell.
@@ -2787,176 +2981,276 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             ),
             "{text}"
         );
-        assert!(!text.contains("0.00% → 0.00%"), "{text}");
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
         assert_eq!(row.events(0, 1), Some([(9, 12 * BLOCKED), (0, 12 * BLOCKED)]));
-        assert!(row.too_few_events(0, 1) && !row.chartable(0, 1));
-        // The table and the terminal give the counts where the change
-        // would stand, in the same words, and no percentage or interval:
-        // "+100.0% [+100.0% … +100.0%]" next to a note that it does not
-        // count is still a number that says it does.
+        // The table and the terminal give the counts where a change
+        // would stand, in the same words, and no percentage or interval.
         let counts = "9 / 33.60M → 0 / 33.60M";
         assert_eq!(row.event_counts(0, 1).as_deref(), Some(counts));
-        assert_eq!(c.few_events(row, 1), Some(format!("{counts}; too few events to score")));
-        let line_of = |text: &str| text.lines().find(|l| l.contains("rtt_blocked_slow_pct")).unwrap().to_string();
-        let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
+        assert_eq!(c.share_note(row, 1), Some(format!("{counts}; too few events to score")));
+        assert_eq!(c.share_note(row, 0), None);
+        let (html, terminal) = (html_line(&c), terminal_line(&c));
         assert!(html.contains(&format!(">{counts}; too few events to score</span>")), "{html}");
-        assert!(!html.contains("+100") && !html.contains(" … "), "{html}");
-        let terminal = line_of(&crate::html::text_table(&c));
         assert!(terminal.contains(&format!("({counts}; too few events to score)")), "{terminal}");
-        assert!(!terminal.contains("+100") && !terminal.contains("[+"), "{terminal}");
-        // The values themselves are still there, as medians.
-        assert!(html.contains("0.00") && terminal.contains("0.00"), "{html}\n{terminal}");
+        for line in [&html, &terminal] {
+            assert!(!["+100", "-100", "inf", "NaN", " … ", "[+", "[-"].iter().any(|n| line.contains(n)), "{line}");
+        }
+        // A cell shows the share over all its runs, and what it is made
+        // of in place of a spread of the runs.
+        assert!(html.contains(">9 / 33.60M</span>") && html.contains(">0 / 33.60M</span>"), "{html}");
+        assert!(!html.contains('±') && !html.contains("unstable"), "{html}");
         // The other metric is untouched by all this: its change and its
         // interval are shown as they were, and it has no counts.
-        let terminal = crate::html::text_table(&c);
-        let p99 = terminal.lines().find(|l| l.contains("·p99 ")).unwrap();
+        let table = crate::html::text_table(&c);
+        let p99 = table.lines().find(|l| l.contains("·p99 ")).unwrap();
         assert!(p99.contains("%*)") && !p99.contains("too few events"), "{p99}");
-        // In the whole report the reason stands with this one share's
-        // counts and nowhere else.
         assert_eq!(crate::html::report(&c).matches("too few events to score</span>").count(), 1);
         let other = c.rows.iter().find(|r| r.metric == "p99").unwrap();
-        assert_eq!(other.event_counts(0, 1), None);
-        assert_eq!(c.few_events(other, 1), None);
-        assert_eq!(other.events(0, 1), None);
-        assert!(!other.too_few_events(0, 1));
+        assert_eq!((other.share(0, 1), other.event_counts(0, 1), other.events(0, 1)), (None, None, None));
+        assert_eq!(c.share_note(other, 1), None);
+        assert!(!other.too_few_events(0, 1) && other.cells[0].as_ref().unwrap().pooled.is_none());
         assert_eq!(c.unclear_reason(other, 1, &other.improvement(0, 1).unwrap()), None);
 
-        // The line is drawn at twenty on one side. Nineteen: not scored.
-        // Twenty: admitted, and here scored, since every round agrees.
-        assert_eq!(reason(&build((19, 0))), Some(UnclearReason::TooFewEvents));
-        assert_eq!(verdict(&build((19, 0))), Verdict::Worse);
-        let c = build((20, 0));
-        assert_eq!(reason(&c), None);
+        // The line is drawn at twenty on both sides. None against many
+        // is what an improvement looks like, and is what two equal sides
+        // look like where one has its events rarely and many at a time:
+        // it is counts, and no change.
+        for (events, compared) in [
+            ((19, 19), false),
+            ((19, 20), false),
+            ((20, 19), false),
+            ((20, 20), true),
+            ((20, 0), false),
+            ((0, 20), false),
+            ((0, 0), false),
+            ((32_475, 0), false),
+            ((32_475, 1), false),
+            ((1, 32_475), false),
+            ((32_475, 19), false),
+            ((32_475, 20), true),
+            ((20, 32_475), true),
+        ] {
+            let c = build(events);
+            assert_eq!(scored(&c), compared, "{events:?}");
+            assert_eq!(slow(&c).improvement(0, 1).is_some(), compared, "{events:?}");
+            assert_eq!(c.share_note(slow(&c), 1).is_none(), compared, "{events:?}");
+            // Not compared: the other metric alone decides.
+            if !compared {
+                assert_eq!(verdict(&c), Verdict::Worse, "{events:?}");
+                assert_eq!(slow(&c).share(0, 1), Some(Share::TooFewEvents), "{events:?}");
+            }
+        }
+        let c = build((32_475, 0));
+        let (html, terminal) = (html_line(&c), terminal_line(&c));
+        let note = "32475 / 33.60M → 0 / 33.60M; too few events to score";
+        assert!(html.contains(note) && terminal.contains(note), "{html}\n{terminal}");
+        assert!(!html.contains("+100") && !terminal.contains("+100"), "{html}\n{terminal}");
+        assert!(crate::simple::text(&c).contains("32475 / 33.60M → 0 / 33.60M blocked round trips; too few events"));
+
+        // Enough on both sides: compared, from the sums. Ten times
+        // fewer in every run is clear, and the workload is mixed.
+        let c = build((240, 24));
+        let row = slow(&c);
+        let d = row.improvement(0, 1).unwrap();
+        assert!((d.median - 90.0).abs() < 1e-9 && (d.ratio - 10.0).abs() < 1e-9, "{d:?}");
+        // The rounds choose the runs; the change is not one of rounds
+        // paired off, and is not said to be.
+        assert_eq!((d.paired_rounds, d.undefined_rounds, d.paired_spread), (None, 0, None));
+        let (lo, hi) = d.ci.unwrap();
+        assert!(60.0 < lo && lo < 90.0 && 90.0 < hi && hi < 100.0, "{d:?}");
+        assert_eq!(c.unclear_reason(row, 1, &d), None);
         assert_eq!(verdict(&c), Verdict::Mixed);
-        // A share that went to nothing is better and has no size to
-        // give: "100%" whatever it was before. It is among the largest
-        // clear changes of the summary and not what the card would put
-        // next to a mark, and a mixed cell with one size only shows
-        // none, so this card has no number at all.
-        let summary = &c.summary()[0];
-        assert!(summary.top.iter().any(|(m, d)| m == "rtt_blocked_slow_pct" && d.ratio.is_infinite()));
-        assert_eq!(summary.largest.map(|d| d.map(|d| d.median.round())), [None, Some(-35.0)]);
-        let card = crate::card::svg(&c).unwrap();
-        assert!(card.contains(">mixed<") && !card.contains(r#"font-size="13""#), "{card}");
-        // A share that is scored is shown as a change, as before.
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-        assert_eq!(c.few_events(row, 1), None);
-        let html = crate::html::report(&c).replace("</tr>", "</tr>\n");
-        let line = html.lines().find(|l| l.contains("rtt_blocked_slow_pct")).unwrap();
-        assert!(line.contains("+100.0%") && !line.contains("too few events"), "{line}");
-        // Many against one: scored, as before.
-        let c = build((32_475, 1));
-        assert_eq!(reason(&c), None);
-        assert_eq!(verdict(&c), Verdict::Mixed);
-        // Enough on the candidate's side alone is enough to be admitted.
-        // What stops this one is the baseline of zero, from which there
-        // is no change to take, as before, and not the number of events.
-        let c = build((0, 30));
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-        assert!(!row.too_few_events(0, 1) && row.improvement(0, 1).is_none());
-        assert!(crate::simple::text(&c).contains("a change from zero is not scored"));
-        // That is not a matter of events, and is not called one.
-        assert_eq!(c.few_events(row, 1), None);
-        assert!(!crate::html::report(&c).contains("too few events to score</span>"));
+        let (html, terminal) = (html_line(&c), terminal_line(&c));
+        assert!(html.contains("10× better") && html.contains(">240 / 33.60M</span>"), "{html}");
+        assert!(terminal.contains("(10× better*)") && !terminal.contains("too few"), "{terminal}");
+        let text = crate::simple::text(&c);
+        assert!(text.contains("• Round trips of a millisecond or more: 10× fewer ("), "{text}");
+        // A round is one observation, whatever its number of runs: this
+        // session has six rounds of two runs, and the interval is that
+        // of six sums, not of twelve runs.
+        let rounds = |events: u64| -> Vec<EventRun> {
+            (0..6).map(|r| EventRun { round: Some(r), events, qualifying: events, of: 2 * BLOCKED }).collect()
+        };
+        let six = crate::shares::change(&rounds(40), &rounds(4)).unwrap().interval.unwrap();
+        assert!(
+            (lo - (1.0 - six.1) * 100.0).abs() < 1e-9 && (hi - (1.0 - six.0) * 100.0).abs() < 1e-9,
+            "{six:?} {d:?}"
+        );
+        let twelve: Vec<EventRun> = rounds(20).into_iter().chain(rounds(20)).collect();
+        let cand: Vec<EventRun> = rounds(2).into_iter().chain(rounds(2)).collect();
+        let runs = crate::shares::change(&twelve, &cand).unwrap().interval.unwrap();
+        assert!(runs != six, "{runs:?}");
+        // Two rounds of two runs are four runs and two observations:
+        // a change, and no interval, so nothing clear. Three rounds
+        // have one.
+        let first = |n: u32| {
+            let mut files = session((2400, 240));
+            for f in files.iter_mut() {
+                f.workloads[0].runs.retain(|r| r.round.is_some_and(|round| round < n));
+            }
+            Comparison::build(files, 0)
+        };
+        let c2 = first(2);
+        assert_eq!(c2.rows[0].cells[0].as_ref().unwrap().values.len(), 4);
+        let d2 = slow(&c2).improvement(0, 1).unwrap();
+        assert!((d2.ratio - 10.0).abs() < 1e-9 && d2.ci.is_none(), "{d2:?}");
+        assert_eq!(c2.unclear_reason(slow(&c2), 1, &d2), Some(UnclearReason::TooFewRounds));
+        assert!(slow(&first(3)).improvement(0, 1).unwrap().ci.is_some());
+        // The other way round it is clearly worse.
+        let c = build((24, 240));
+        let d = slow(&c).improvement(0, 1).unwrap();
+        assert!((d.median + 900.0).abs() < 1e-6 && d.ci.unwrap().1 < 0.0, "{d:?}");
+        assert_eq!(c.unclear_reason(slow(&c), 1, &d), None);
+        // The same on both sides: compared, and not settled. That is
+        // "no clear difference", which too few events are not.
+        let c = build((240, 240));
+        let d = slow(&c).improvement(0, 1).unwrap();
+        assert_eq!(d.median, 0.0);
+        assert_eq!(c.unclear_reason(slow(&c), 1, &d), Some(UnclearReason::IntervalIncludesNoChange));
+        assert_eq!(c.share_note(slow(&c), 1), None);
+
         // None on either side is none, said as such.
         let c = build((0, 0));
-        assert!(c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap().too_few_events(0, 1));
         let text = crate::simple::text(&c);
         assert!(text.contains("• Round trips of a millisecond or more: none in any run under either\n"), "{text}");
-
-        // From a baseline of zero there is no change at all, and the
-        // table and the terminal say about the events what they say
-        // above: the counts and the reason, which do not hang on there
-        // being a percentage to replace. No percentage is made up from
-        // the zero either.
-        for (slow, counts) in [((0, 0), "0 / 33.60M → 0 / 33.60M"), ((0, 9), "0 / 33.60M → 9 / 33.60M")] {
-            let c = build(slow);
-            let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-            assert!(row.improvement(0, 1).is_none() && row.too_few_events(0, 1), "{slow:?}");
-            assert_eq!(c.few_events(row, 1), Some(format!("{counts}; too few events to score")), "{slow:?}");
-            let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
-            assert!(html.contains(&format!(">{counts}; too few events to score</span>")), "{html}");
-            let terminal = line_of(&crate::html::text_table(&c));
-            assert!(terminal.contains(&format!("({counts}; too few events to score)")), "{terminal}");
-            for line in [&html, &terminal] {
-                assert!(!["+100", "-100", "inf", "NaN"].iter().any(|n| line.contains(n)), "{line}");
-                assert!(!line.contains(" … ") && !line.contains("[+") && !line.contains("[-"), "{line}");
-            }
-            // Once in the report, and not for the baseline's own cell.
+        // The tables give the counts for it, and for none against a few.
+        for (events, counts) in [((0, 0), "0 / 33.60M → 0 / 33.60M"), ((0, 9), "0 / 33.60M → 9 / 33.60M")] {
+            let c = build(events);
+            assert_eq!(c.share_note(slow(&c), 1), Some(format!("{counts}; too few events to score")), "{events:?}");
+            assert!(html_line(&c).contains(&format!(">{counts}; too few events to score</span>")));
+            assert!(terminal_line(&c).contains(&format!("({counts}; too few events to score)")));
             assert_eq!(crate::html::report(&c).matches("too few events to score</span>").count(), 1);
-            assert_eq!(c.few_events(row, 0), None);
-            // Scored as before: the other metric alone decides.
-            assert_eq!(verdict(&c), Verdict::Worse, "{slow:?}");
         }
         // Where the parameters differ nothing is compared, events
         // included, and that is what is said.
-        let mut files = session((0, 9));
+        let mut files = session((240, 24));
         files[1].workloads[0].params = serde_json::json!({ "pairs": 3 });
         let c = Comparison::build(files, 0);
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-        assert_eq!(c.few_events(row, 1), None);
-        let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
-        assert!(html.contains("params differ") && !html.contains("too few events"), "{html}");
-        let terminal = line_of(&crate::html::text_table(&c));
-        assert!(terminal.contains("(params differ)") && !terminal.contains("too few events"), "{terminal}");
+        assert_eq!((slow(&c).share(0, 1), c.share_note(slow(&c), 1)), (None, None));
+        assert!(html_line(&c).contains("params differ") && !html_line(&c).contains("too few events"));
+        assert!(terminal_line(&c).contains("(params differ)") && !terminal_line(&c).contains("too few events"));
 
-        // The events are those of the rounds both sides have, as the
-        // change is: 24 in the baseline, 2 a run. With a round missing
-        // on the other side 20 are left, with two rounds missing 16.
+        // The events are those of the rounds both sides have: 24 a
+        // side, 2 a run. With a round missing on one side 20 are left
+        // on both, with two rounds missing 16.
         let lacking = |rounds: u32| {
-            let mut files = session((24, 0));
+            let mut files = session((24, 24));
             files[1].workloads[0].runs.retain(|r| r.round.is_some_and(|round| round >= rounds));
             Comparison::build(files, 0)
         };
-        let events = |c: &Comparison| {
-            c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap().events(0, 1).unwrap()[0].0
-        };
-        assert_eq!((events(&lacking(0)), events(&lacking(1)), events(&lacking(2))), (24, 20, 16));
-        assert_eq!(reason(&lacking(1)), None);
-        assert_eq!(reason(&lacking(2)), Some(UnclearReason::TooFewEvents));
+        let events = |c: &Comparison| slow(c).events(0, 1).unwrap().map(|(events, _)| events);
+        assert_eq!((events(&lacking(0)), events(&lacking(1)), events(&lacking(2))), ([24, 24], [20, 20], [16, 16]));
+        assert!(scored(&lacking(1)) && !scored(&lacking(2)));
         // A run can have the counters and not the metric, which is only
         // given from 10000 blocked round trips on. Its events are behind
-        // nothing that is compared and are not counted: 19 in all, one
-        // of them in a run that now has 30 and no metric, leave 18, and
+        // nothing that is compared and are not counted: 20 in all, one
+        // of them in a run that now has 30 and no metric, leave 19, and
         // the 30 do not carry the share over the line.
-        let mut files = session((19, 0));
+        let mut files = session((20, 20));
         let short = files[0].workloads[0].runs.last_mut().unwrap();
         assert_eq!(short.counters["roundtrips_slow"], 1);
         short.metrics.remove("rtt_blocked_slow_pct");
         short.counters.insert("roundtrips_slow".into(), 30);
         short.counters.insert("roundtrips_blocked".into(), 5_000);
         let c = Comparison::build(files, 0);
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-        assert_eq!(row.events(0, 1), Some([(18, 11 * BLOCKED), (0, 12 * BLOCKED)]));
-        assert_eq!(reason(&c), Some(UnclearReason::TooFewEvents));
+        // Its round has the other run of the baseline left, so all six
+        // rounds are shared and the candidate's runs all count.
+        assert_eq!(slow(&c).events(0, 1), Some([(19, 11 * BLOCKED), (20, 12 * BLOCKED)]));
+        assert_eq!(slow(&c).share(0, 1), Some(Share::TooFewEvents));
         // One session whose two sides share no round: no paired
-        // comparison, so no counts that would pass for one, and the
-        // share is held back for want of rounds as it was before.
-        let mut files = session((24, 0));
+        // comparison, so no counts that would pass for one, and nothing
+        // is compared.
+        let mut files = session((240, 24));
         files[1].workloads[0].runs.iter_mut().for_each(|r| r.round = r.round.map(|round| round + 100));
         let c = Comparison::build(files, 0);
-        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
-        assert_eq!(row.events(0, 1), None);
-        assert!(!row.too_few_events(0, 1));
-        assert_eq!(reason(&c), Some(UnclearReason::TooFewRounds));
-        assert!(!crate::simple::text(&c).contains("blocked round trips; too few events"));
+        assert_eq!((slow(&c).events(0, 1), slow(&c).share(0, 1)), (None, Some(Share::NoSharedRounds)));
+        assert!(!slow(&c).too_few_events(0, 1) && slow(&c).improvement(0, 1).is_none());
+        assert_eq!(c.share_note(slow(&c), 1).as_deref(), Some("no rounds in common; not scored"));
+        assert!(crate::simple::text(&c).contains("a millisecond or more: no rounds in common; not scored\n"));
         // Results that are not one session: every valid run of a side.
-        let mut files = session((24, 0));
+        let mut files = session((240, 24));
         files[1].design = None;
         files[1].workloads[0].runs.truncate(4);
-        assert_eq!(events(&Comparison::build(files, 0)), 24);
-        // A file without the counters, which no version with this metric
-        // wrote, is left as it was: nothing to count, nothing withheld.
-        // Twelve events, one in every run, would be too few.
-        assert_eq!(reason(&build((12, 0))), Some(UnclearReason::TooFewEvents));
-        let mut files = session((12, 0));
+        let c = Comparison::build(files, 0);
+        assert_eq!(events(&c), [240, 8]);
+        assert_eq!(slow(&c).share(0, 1), Some(Share::TooFewEvents));
+        // Two runs a side have a change and no interval, as two rounds
+        // have anywhere else, and that is not clear.
+        let mut files = session((2400, 240));
         for f in files.iter_mut() {
-            f.workloads[0].runs.iter_mut().for_each(|r| r.counters.clear());
+            f.design = None;
+            f.workloads[0].runs.truncate(2);
         }
         let c = Comparison::build(files, 0);
-        assert_eq!(c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap().events(0, 1), None);
-        assert_eq!(reason(&c), None);
+        let d = slow(&c).improvement(0, 1).unwrap();
+        assert_eq!((d.ci, d.paired_rounds), (None, None));
+        assert_eq!(c.unclear_reason(slow(&c), 1, &d), Some(UnclearReason::TooFewRounds));
+
+        // A result without the counters, as older versions wrote them,
+        // is not compared, and neither is one where a single run lacks
+        // them: the runs' own shares are not taken in their place.
+        for missing in [12, 1] {
+            let mut files = session((240, 24));
+            files[1].workloads[0].runs.iter_mut().take(missing).for_each(|r| r.counters.clear());
+            let c = Comparison::build(files, 0);
+            assert_eq!(slow(&c).share(0, 1), Some(Share::NoCounters), "{missing}");
+            assert_eq!(slow(&c).improvement(0, 1), None, "{missing}");
+            assert_eq!(c.share_note(slow(&c), 1).as_deref(), Some("no event counters in this result; not scored"));
+            assert_eq!(verdict(&c), Verdict::Worse, "{missing}");
+            // The cell falls back to what it has, the median of the
+            // runs, and says nothing of counts.
+            let cell = slow(&c).cells[1].as_ref().unwrap();
+            assert_eq!((cell.pooled, cell.counted()), (None, None));
+            assert!(html_line(&c).contains("no event counters in this result; not scored"));
+        }
+    }
+
+    /// Missed deadlines come in pairs, a late period and the one skipped
+    /// for it. The share is of both; what admits it to a comparison is
+    /// twenty late ones a side. And how much a share's runs differ is in
+    /// its interval, so a side whose runs differ a lot is not "unstable".
+    #[test]
+    fn missed_deadlines_qualify_by_the_late_ones() {
+        let side = |label: &str, late: [u64; 5]| {
+            let mut f = file(label, &[1.0; 5], 1);
+            f.workloads[0].name = "periodic-wake/loaded".into();
+            for (r, late) in f.workloads[0].runs.iter_mut().zip(late) {
+                r.metrics.clear();
+                r.counters.insert("periods_late".into(), late);
+                r.counters.insert("periods_skipped".into(), late);
+                r.counters.insert("periods_due".into(), 20_000);
+                r.metrics.insert("deadline_miss_pct".into(), Metric::lower(2.0 * late as f64 / 200.0, "%"));
+            }
+            f
+        };
+        let build = |base, cand| Comparison::build(vec![side("base", base), side("cand", cand)], 0);
+        // 19 late and 19 skipped are 38 events and 19 times it went wrong.
+        let c = build([300; 5], [4, 4, 4, 4, 3]);
+        let row = &c.rows[0];
+        assert_eq!(row.events(0, 1), Some([(3000, 100_000), (38, 100_000)]));
+        assert_eq!(row.share(0, 1), Some(Share::TooFewEvents));
+        assert_eq!(c.share_note(row, 1).as_deref(), Some("3000 / 100.0k → 38 / 100.0k; too few events to score"));
+        // Twenty are enough, and the change is that of all events.
+        let c = build([300; 5], [4; 5]);
+        let d = c.rows[0].improvement(0, 1).unwrap();
+        assert!((d.ratio - 75.0).abs() < 1e-9 && d.ci.is_some_and(|(lo, _)| lo > 0.0), "{d:?}");
+        assert_eq!(c.rows[0].cells[0].as_ref().unwrap().pooled, Some(3.0));
+        // Runs that differ a lot: the cell is not marked, the pair is
+        // not unstable, and the interval is the wider for it.
+        let even = d.ci.unwrap();
+        let c = build([360, 240, 360, 240, 300], [4; 5]);
+        let row = &c.rows[0];
+        assert!(row.cells[0].as_ref().unwrap().unstable && !row.unstable_pair(0, 1));
+        let d = row.improvement(0, 1).unwrap();
+        let uneven = d.ci.unwrap();
+        assert!(uneven.0 < even.0 && c.unclear_reason(row, 1, &d).is_none(), "{uneven:?} {even:?}");
+        assert!(!crate::html::report(&c).contains(">unstable<"));
+        // Wake-ups lost to overrun are counted the same way.
+        assert_eq!(
+            event_counters("overrun_pct"),
+            Some(EventCounters { events: &["wakeups_overrun"], qualifying: "wakeups_overrun", of: "wakeups_due" })
+        );
+        assert_eq!(event_counters("deadline_miss_pct").unwrap().qualifying, "periods_late");
+        assert_eq!(event_counters("on_time_pct"), None);
     }
 
     /// A burst with more tasks than CPUs has no median of the start
@@ -3144,6 +3438,21 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         ));
         assert_eq!(sizes(&card).len(), 84);
         inside(&card);
+    }
+
+    /// A share of counted events in a run, with the counters it is made
+    /// of: `pct` percent of 20 000 periods or wake-ups, or of two million
+    /// blocked round trips. A missed deadline is a late period and a
+    /// skipped one, half each.
+    fn counted(r: &mut RunResult, metric: &str, pct: f64) {
+        let counters = event_counters(metric).unwrap();
+        let of: u64 = if metric == "rtt_blocked_slow_pct" { 2_000_000 } else { 20_000 };
+        let events = (pct / 100.0 * of as f64).round() as u64;
+        r.counters.insert(counters.of.into(), of);
+        for name in counters.events {
+            r.counters.insert((*name).into(), events / counters.events.len() as u64);
+        }
+        r.metrics.insert(metric.into(), Metric::lower(pct, "%"));
     }
 
     /// The card says what the plain view's headings say, for every

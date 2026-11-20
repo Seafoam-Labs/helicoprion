@@ -184,41 +184,15 @@ round trips there were without a step to fall off, and is reported from
 10000 blocked round trips on; `roundtrips_slow` is their number. The
 percentile stays, and is unstable wherever the share is near 0.1%.
 
-A share of rare events is only as good as the number of events behind it,
-which the share does not show. In one comparison the kernel's scheduler had
-9 slow round trips in 33.6 million and two others had none: "100% fewer",
-with an interval from 100% to 100% because every round agreed, counted as a
-clear improvement, and enough to turn a workload that was clearly worse in
-five other metrics into "better in some ways, worse in others". Nine events
-are not a difference between schedulers.
-
-So `rtt_blocked_slow_pct` is scored only when one side at least has 20 slow
-round trips, counted from `roundtrips_slow` over the runs the comparison
-rests on: the rounds both sides have in a session, every valid run
-otherwise. One side is enough, because none where the other has many is
-what an improvement looks like. Below that the share stays in the report
-with the counts next to it, as in "9 / 33.6M → 0 / 26.2M blocked round
-trips; too few events to score", and is left out of every verdict: the plain
-view, the summary, the table's colours, the change chart and the card all
-ask the same rule. The table of all metrics and the terminal's table give
-those counts where the change would stand, and no percentage or interval:
-"+100%" from 100% to 100% beside a note that it does not count would still
-be read as a number that does. They give them from a baseline of no events
-too, none against none and none against a few, where there is no percentage
-to begin with and the counts are all there is.
-
-Twenty is where a quantile starts to be reported as well, and it is a
-condition for being scored at all, not a test of the change: the interval,
-the minimum effect and the evenness of the rounds still have to hold. It
-does not make the interval of such a share a good one. With no events on one
-side in every round the interval has no width whatever the counts, and a
-proper one would come from the counts themselves, which is not done yet.
-
-The rule applies to this metric alone, the one a misleading verdict was seen
-for. The other shares that are scored, missed deadlines and wake-ups lost to
-overrun, can rest on few events too (a handful of missed periods in a run of
-nearly twenty thousand) and are candidates for the same rule; they are left
-as they were until a case shows what it should be for them.
+A share of counted events is only as good as the number of events behind
+it, which the share does not show. In one comparison the kernel's scheduler
+had 9 slow round trips in 33.6 million and two others had none: "100%
+fewer", with an interval from 100% to 100% because every round agreed,
+counted as a clear improvement, and enough to turn a workload that was
+clearly worse in five other metrics into "better in some ways, worse in
+others". Nine events are not a difference between schedulers. How this share
+and the two others like it are compared is in "Shares of counted events"
+below.
 
 ### Same CPU and cross CPU
 
@@ -907,7 +881,6 @@ the change chart.
 |---|---|---|
 | The metric is a single-sample extreme (`*_max`) | | |
 | The population is less than a set share of the round trips on either side | `--min-share` (1%) | `°` |
-| The metric is `rtt_blocked_slow_pct` and neither side has 20 slow round trips | | |
 | The baseline measured zero in some rounds | | `?` |
 | There are fewer than 3 rounds, or 3 valid runs per side outside `matrix` | `--rounds`, `--runs` | |
 | The 95% interval includes no change | | |
@@ -938,6 +911,135 @@ the change chart.
   first only shows how CPU time was split between the hogs and the ping-pong
   threads, and the second drops when more replies arrive before the pinger
   sleeps, which is not worse.
+
+### Shares of counted events
+
+Three scored metrics are events out of opportunities, and both numbers are
+counters of the run:
+
+| Metric | Events | Out of |
+|---|---|---|
+| `rtt_blocked_slow_pct` | `roundtrips_slow` | `roundtrips_blocked` |
+| `deadline_miss_pct` | `periods_late` + `periods_skipped` | `periods_due` |
+| `overrun_pct` | `wakeups_overrun` | `wakeups_due` |
+
+They are compared from those counters and in no other way. The rules above
+about unstable sides and uneven rounds are not applied to them; what they
+are for is in the interval described here.
+
+**What is shown and estimated.** The value of a cell is the share over all
+valid runs together, their events out of their opportunities, with the two
+counts next to it. The median of the runs' own shares, which the other
+metrics show, is zero for three runs of five with events and hides them.
+The change is the ratio of the two sides' shares over what is compared:
+the rounds both sides have in a session, every valid run otherwise. A run
+with more opportunities weighs more in it.
+
+**What one observation is.** In a session it is a round, with the counters
+of its runs summed, and not a run: rounds are what a session repeats, and
+two runs of one round are not two samples of it. Two rounds of two runs are
+two observations and give no interval, as two rounds give none for any
+other metric; five rounds of two runs are five. Results that are not one
+session have no rounds in common, and every valid run is an observation.
+
+**Events are not independent.** In one session the kernel's scheduler had
+3613, 4569, 3394, 5844 and 5756 slow round trips in five runs of
+`wake-pingpong/loaded`: about 700 times the variation independent events at
+that share would have. `scx_cosmos` on the same workload had 62, 68, 74, 67
+and 47: 1.6 times. Missed deadlines come in pairs by construction, a period
+that ends late and the next one skipped for it. An interval that takes
+every event for evidence of its own is too narrow by a large factor, and
+by a different one for every scheduler.
+
+**The interval** is the *effective-count approximate interval*. For each
+side, the dispersion is how much the counts of its observations vary against
+what independent events at its share would (Pearson's statistic over its degrees
+of freedom). The larger of the two sides' is taken, not under 1, and
+enlarged for having been estimated from few observations: to the value it
+would exceed with a probability of 20% (times 2.4 with five of them, 1.6
+with twelve). Both sides' counts are divided by it, and the interval is that of
+a binomial split of so many events between the two sides. Only the two
+sides compared enter: the result for a pair does not depend on which other
+schedulers are in the report. The dispersion holds whatever makes runs
+differ, clumps of events and a rate that changes from run to run, and
+grows with the count. It is not a clump size, and is not carried from one
+side to another.
+
+**Twenty events on both sides.** The share is compared only where each side
+has at least 20 events over the runs compared; for missed deadlines, 20
+late periods, since the skipped ones follow from them. With fewer on either
+side the report gives the counts where the change would stand, as in "9 /
+33.6M → 0 / 26.2M; too few events to score", and the metric is left out of
+every verdict, the summary's counts, the change chart and the card. That
+covers a change to none, from none, and to or from a handful.
+
+Both sides, because a side with few events cannot show how its events vary,
+and its zeros are then read as the zeros of independent events. If its
+events come rarely and many at a time, "none against thousands" is what most
+comparisons of two sides with the same share look like. An earlier rule
+asked for 20 events on one side only, reasoning that none where the other
+has many is what an improvement looks like. Simulation of two equal sides
+showed what that costs:
+
+| The side with events that come many at a time | 20 on one side | 20 on both |
+|---|---|---|
+| neither (same on both) | 0.4% called different | 0.1% |
+| the baseline | 4.1% | 1.7% |
+| the candidate | 55% | 1.9% |
+
+(Five rounds; the worst of 9 combinations of dispersion from 1 to 300 and 3
+rates. With twelve rounds: 0.5%, 3.2%, 70% against 0.3%, 1.8%, 2.0%.) No
+events seen is worth reporting, and is not proof of a share of zero. "Too
+few events" is not "no clear difference" either: the first is a pair that
+was not admitted to a comparison, the second a pair that was and did not
+settle it.
+
+The price is that real differences are found less often: in the same
+simulations, about 40% of them with five rounds where a rule of one side
+found about 55%. The loss is almost all in pairs where the better side has
+under 20 events, which is where the false ones came from.
+
+**What the interval was checked against.** It is not exact, and its
+coverage is what simulation found, under the models simulated: events in
+clumps of geometric size (dispersion 1, 10 and 300, the same and different
+on the two sides), 5, 100 and 5000 events a run, ratios of 1, 0.1, 0.01 and
+3, a drift shared by both sides of a round, opportunities that differ by
+±30% between runs, 5 and 12 rounds of one run, 10 000 samples a case, the
+dispersion estimated anew in each. Among pairs with 20 events on both sides
+the nominal 95% interval was to hold the true ratio in at least 94% of
+samples in every case that has enough such pairs to judge it by (at least
+5% of its samples), and did: in each of about 170 cases, the worst at
+96.7% to 96.9% in the runs made. Which cases reach those 5%, and the last
+digit of every number here, depend on the samples drawn, which differ with
+the version of NumPy even at one seed; what is fixed is the criterion. For large shares (1.6% and 26%, beta-binomial,
+dispersion up to 30 and different on the two sides) the worst of 84 cases
+was 98.6%, with at most 0.9% of equal pairs called different. The scripts
+are in `calibration/` and print these numbers; `calibration/README.md` says
+which script gives which, and with which versions they were run.
+
+What that does not show: other shapes of clumps or of drift, dispersion
+above 300, and real hardware, where a comparison of a
+scheduler with itself (below) is the check. Twenty events are not twenty
+independent events, and the coverage is conditional on the pair having been
+admitted.
+
+**Old results.** A result file without the counters, or with a run that
+lacks them, is not compared for these metrics: the report says "no event
+counters in this result; not scored". The runs' own shares are not compared
+in their place, which would make two reports that describe one method use
+two. One session whose two sides share no round says "no rounds in common;
+not scored".
+
+**Tried and not used.** A bootstrap of rounds on the sums has no width
+where a side has none in every round, and held the true ratio in under 94%
+of samples in every case simulated. Taking the events for independent
+called up to 88% of equal pairs different even where the two sides clump
+alike. Borrowing the dispersion of a
+third scheduler of the session made a pair's result depend on that
+scheduler and turned nearly every verdict into "unclear": a real tenfold
+difference found in 98% of samples was found in 0.7% with a third arm of
+independent events and many of them. A change from a baseline without
+events is not scored: its one-sided bound did not hold up.
 
 ### Summary and wording
 

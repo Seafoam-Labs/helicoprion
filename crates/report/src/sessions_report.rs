@@ -121,7 +121,6 @@ pub(crate) fn unclear_words(reason: UnclearReason) -> &'static str {
     match reason {
         UnclearReason::SingleSample => "single sample",
         UnclearReason::MinorPopulation => "minor",
-        UnclearReason::TooFewEvents => "few events",
         UnclearReason::UndefinedRounds => "zero baseline",
         UnclearReason::TooFewRounds => "few rounds",
         UnclearReason::IntervalIncludesNoChange => "incl. no change",
