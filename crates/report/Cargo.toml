@@ -11,9 +11,16 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[features]
+# The result card as a PNG file (`card::png`), for places that show a
+# picture and not a page. Off by default: it brings an SVG renderer and
+# a font stack, which nothing else here needs.
+png = ["dep:resvg"]
+
 [dependencies]
 helicoprion-core.workspace = true
 serde_json.workspace = true
+resvg = { workspace = true, optional = true }
 
 [lints]
 workspace = true

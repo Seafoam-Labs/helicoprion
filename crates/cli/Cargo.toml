@@ -15,6 +15,13 @@ readme = "../../README.md"
 name = "helicoprion"
 path = "src/main.rs"
 
+[features]
+default = ["png"]
+# `compare --png` and the card that `matrix` writes next to its report.
+# On unless asked otherwise (`--no-default-features`): it brings an SVG
+# renderer and a font stack, which a build that only measures can leave out.
+png = ["helicoprion-report/png"]
+
 [dependencies]
 helicoprion-core.workspace = true
 helicoprion-workloads.workspace = true

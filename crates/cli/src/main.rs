@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use helicoprion_core::{MIN_READABLE_SCHEMA, Probe, Protocol, ResultFile, SCHEMA_VERSION, Scheduler, SystemInfo};
-use helicoprion_report::{Comparison, Options, html, svg};
+use helicoprion_report::{Comparison, Options, card, html, svg};
 use helicoprion_workloads::runner::{Event, RunConfig, run_workload};
 use helicoprion_workloads::{PERIODIC_PERIOD, PERIODIC_WORK, SUITES, SuiteOpts, suite};
 
@@ -153,9 +153,16 @@ enum Cmd {
         /// HTML report path.
         #[arg(short, long, default_value = "helicoprion-report.html")]
         output: PathBuf,
-        /// Also write each chart as a standalone .svg into this directory.
+        /// Also write each chart, and the result card, as a standalone
+        /// .svg into this directory.
         #[arg(long)]
         svg_dir: Option<PathBuf>,
+        /// Also write the result card as a PNG picture to this path: for
+        /// every scheduler and workload, whether it did better or worse
+        /// than the baseline. For places that preview pictures and not
+        /// pages; needs a font on the machine.
+        #[arg(long, value_name = "FILE")]
+        png: Option<PathBuf>,
         #[command(flatten)]
         thresholds: Thresholds,
     },
@@ -226,8 +233,8 @@ fn main() -> Result<()> {
             opts: thresholds.options()?,
             simple: thresholds.simple,
         }),
-        Cmd::Compare { files, baseline, output, svg_dir, thresholds } => {
-            compare(&files, baseline, &output, svg_dir, thresholds.options()?, thresholds.simple)
+        Cmd::Compare { files, baseline, output, svg_dir, png, thresholds } => {
+            compare(&files, baseline, &output, svg_dir, png, thresholds.options()?, thresholds.simple)
         }
         Cmd::Sessions { paths, output, scoring } => sessions(&paths, &output, scoring.options()?),
     }
@@ -510,10 +517,18 @@ fn compare(
     baseline: Option<String>,
     output: &Path,
     svg_dir: Option<PathBuf>,
+    png: Option<PathBuf>,
     opts: Options,
     simple: bool,
 ) -> Result<()> {
     const MAX: usize = 8;
+    // Before any work: an option this build cannot honour.
+    if png.is_some() && !card::PNG {
+        bail!(
+            "--png needs a helicoprion built with the `png` feature, which this one was built without \
+             (--no-default-features); --svg-dir writes the same card as card.svg"
+        );
+    }
     if files.len() > MAX {
         bail!("at most {MAX} result files per report (got {}); split into several reports", files.len());
     }
@@ -532,6 +547,12 @@ fn compare(
 
     let c = Comparison::build_with(parsed, base, opts);
     write_report_with(&c, output, simple)?;
+    if let Some(path) = png {
+        match write_card(&c, &path)? {
+            true => eprintln!("wrote {}", path.display()),
+            false => eprintln!("note:    no card: there is nothing to compare in these results"),
+        }
+    }
 
     if let Some(dir) = svg_dir {
         fs::create_dir_all(&dir)?;
@@ -543,6 +564,9 @@ fn compare(
             if let Some(s) = svg::tail_chart(&c, d) {
                 charts.push((format!("quantiles-{}-{}", sanitize(&d.workload), sanitize(&d.population)), s));
             }
+        }
+        if let Some(s) = card::svg(&c) {
+            charts.push(("card".into(), s));
         }
         for (name, s) in charts {
             let p = dir.join(format!("{name}.svg"));
@@ -716,7 +740,37 @@ fn matrix_cmd(a: MatrixArgs) -> Result<()> {
 }
 
 fn write_report(files: Vec<ResultFile>, path: &Path, opts: Options, simple: bool) -> Result<()> {
-    write_report_with(&Comparison::build_with(files, 0, opts), path, simple)
+    let c = Comparison::build_with(files, 0, opts);
+    write_report_with(&c, path, simple)?;
+    // The card next to the report, where this build can draw one. A
+    // session's results are written by now: a card that cannot be drawn
+    // is said and is no reason to fail.
+    if card::PNG {
+        let card = path.with_file_name("card.png");
+        match write_card(&c, &card) {
+            Ok(true) => eprintln!("wrote {}", card.display()),
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: no card: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Draw the result card of `c` to `path` as a PNG picture. `false` where
+/// the results hold nothing to compare, and nothing is written.
+fn write_card(c: &Comparison, path: &Path) -> Result<bool> {
+    let Some(svg) = card::svg(c) else { return Ok(false) };
+    #[cfg(feature = "png")]
+    {
+        let png = card::png(&svg).map_err(anyhow::Error::msg)?;
+        fs::write(path, png).with_context(|| format!("writing {}", path.display()))?;
+        Ok(true)
+    }
+    #[cfg(not(feature = "png"))]
+    {
+        let _ = (svg, path);
+        bail!("this build cannot draw pictures (no `png` feature)")
+    }
 }
 
 fn write_report_with(c: &Comparison, path: &Path, simple: bool) -> Result<()> {

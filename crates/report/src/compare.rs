@@ -2611,6 +2611,46 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(!old.contains("quartile"), "{old}");
     }
 
+    /// The card says what the plain view's headings say, for every
+    /// scheduler and workload, and nothing where there is nothing to say.
+    #[test]
+    fn the_card_holds_the_plain_views_verdicts() {
+        let mut files = drifting_session();
+        // A second workload, named as one the card has a short name for.
+        for f in files.iter_mut() {
+            let mut second = f.workloads[0].clone();
+            second.name = "wake-burst/double".into();
+            f.workloads.push(second);
+        }
+        files[1].label = "a <scheduler> with a very long label".into();
+        let c = Comparison::build(files.clone(), 0);
+        let card = crate::card::svg(&c).expect("a card");
+        assert!(card.starts_with("<svg ") && card.ends_with("</svg>"));
+        assert!(card.contains(r#"viewBox="0 0 1200 630""#) && !card.contains("<style") && !card.contains("<script"));
+        assert!(card.contains(">Schedulers against base<"));
+        // Escaped and cut, not broken markup.
+        assert!(card.contains(">a &lt;scheduler&gt; wi…<"));
+        assert!(card.contains(">burst<") && card.contains(">double<"));
+        // One cell per brief, with the brief's own word.
+        let briefs = crate::simple::briefs(&c);
+        assert_eq!(briefs.len(), 2);
+        for b in &briefs {
+            let word = match b.verdict {
+                Verdict::Better => "better",
+                Verdict::Worse => "worse",
+                Verdict::Mixed => "mixed",
+                Verdict::NoClearDifference => "unclear",
+            };
+            // In a cell, and once more in the legend.
+            assert!(card.matches(&format!(">{word}<")).count() >= 2, "{word}");
+        }
+        // What it leaves out is said on it.
+        assert!(card.contains("are in the report.<"));
+        // A single result has nothing to compare, and no card.
+        let alone = Comparison::build(vec![files.remove(0)], 0);
+        assert!(crate::card::svg(&alone).is_none());
+    }
+
     /// idle-wake in the plain view: the delay, where the task was put,
     /// and whether the machine slept.
     #[test]

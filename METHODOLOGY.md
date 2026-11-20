@@ -1019,3 +1019,24 @@ means that the run could not tell the two apart, not that they are equal.
   behaviour, not a proven cause of a delay.
 - Warnings of the full report, and results from different setups, are also
   mentioned above the folded section and in the terminal.
+
+### The result card
+
+`compare --png FILE` writes a picture of 1200 × 630 pixels, and `matrix`
+writes it as `card.png` next to its report: a row per scheduler, a column
+per workload, and in every cell the verdict of the plain view for that
+pair, as a word, a mark and a colour. The verdicts are taken from the plain
+view, not worked out again, so the card cannot say something the report
+does not. A cell is empty where the two were not compared, which is not the
+same as "unclear", the word for no clear difference.
+
+The card is for places that show a picture and not a page. It holds no
+sizes, no intervals and no warnings, which are what make a verdict worth
+trusting; it says on its face how many warnings the report has, and it is
+not a result to quote without the report.
+
+Drawing it needs a font installed on the machine for the text, and the `png`
+feature, which is on by default and adds an SVG renderer that nothing else
+uses. A build with `--no-default-features` leaves it out: `--png` is refused
+there, `matrix` writes no card, and `--svg-dir` writes the same card as
+`card.svg`.
