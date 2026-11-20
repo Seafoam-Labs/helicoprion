@@ -220,6 +220,14 @@ fn share_of(metric: &str) -> &'static str {
     }
 }
 
+/// What the events behind a share are counted out of, as a plural.
+fn events_of(metric: &str) -> &'static str {
+    match metric {
+        "rtt_blocked_slow_pct" => "blocked round trips",
+        _ => "events",
+    }
+}
+
 /// A share of failures that is scored: periodic-wake's missed deadlines,
 /// wake-burst's wake-ups lost to overrun.
 struct Failures {
@@ -254,6 +262,23 @@ fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<St
         row.cells.get(k).and_then(Option::as_ref).map_or(0.0, |cell| cell.values.iter().copied().fold(0.0, f64::max))
     };
     let (worst_b, worst_v) = (worst(c.baseline), worst(i));
+    // A handful of events on both sides: the counts say what there is,
+    // where two shares that both round to nothing would say "0.00% →
+    // 0.00%", and the reason says why there is no verdict.
+    if let Some([(b_events, b_of), (events, of)]) =
+        row.events(c.baseline, i).filter(|_| row.too_few_events(c.baseline, i))
+    {
+        return Some(if b_events == 0 && events == 0 {
+            format!("{label}: none in any run under either")
+        } else {
+            format!(
+                "{label}: {b_events} / {} → {events} / {} {}; too few events to score",
+                fmt_value(b_of as f64),
+                fmt_value(of as f64),
+                events_of(f.metric)
+            )
+        });
+    }
     let runs = |worst: f64| {
         if worst == 0.0 {
             format!("no run {verb} any")
@@ -420,6 +445,7 @@ fn why(c: &Comparison, d: &Delta, reason: UnclearReason) -> String {
     match reason {
         UnclearReason::SingleSample => "a single extreme value is never scored".into(),
         UnclearReason::MinorPopulation => "too few relevant wake-ups".into(),
+        UnclearReason::TooFewEvents => "too few events to score".into(),
         UnclearReason::UndefinedRounds => "the baseline measured zero in some rounds".into(),
         UnclearReason::TooFewRounds if d.paired_rounds.is_some() || d.unmatched_rounds => {
             "too few paired rounds".into()

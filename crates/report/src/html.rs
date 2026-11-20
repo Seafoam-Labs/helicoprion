@@ -138,7 +138,7 @@ fn summary_section(h: &mut String, c: &Comparison) {
     let base = esc(&c.series[c.baseline].label);
     let _ = write!(
         h,
-        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable or a minor population. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. <em>Unclear</em> counts the rest; those marked <em>uneven</em> would be clear, but the change differs too much from round to round (tagged in the table below). Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse. <code>woken_per_s</code>, the threads actually woken per second, is informational too: it follows the mix of round trips (fewer wake-ups where fewer round trips need a sleep), so it is listed and not counted.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
+        "<h2>Summary</h2><p class=cap>Which result is better than the baseline <strong>{base}</strong>, counting only clear changes.</p><details class=help><summary>How to read this</summary><p>For each scheduler and workload: how many of the compared metrics are clearly better or clearly worse than the baseline's. A change is clear when the table below colours it: its interval excludes zero, it is at least {me}%, and neither side is unstable, a minor population or a share of too few events. <em>Better</em> means some metrics are clearly better and none clearly worse; <em>worse</em> the reverse; <em>mixed</em> both; <em>no clear difference</em> neither, which is not proof that the two are equal. <em>Unclear</em> counts the rest; those marked <em>uneven</em> would be clear, but the change differs too much from round to round (tagged in the table below). Single-sample maxima and informational metrics are not counted. This is a count, not a score: metrics overlap (several describe the same latency distribution) and are not weighed against each other, and the result holds for these workloads on this machine only. Under <code>wake-pingpong/loaded</code>, fewer round trips can be the price of more work done by the CPU hogs (<code>hog_work_per_s</code>, informational): look at both before calling a scheduler worse. <code>woken_per_s</code>, the threads actually woken per second, is informational too: it follows the mix of round trips (fewer wake-ups where fewer round trips need a sleep), so it is listed and not counted.</p></details><table><tr><th>Scheduler</th><th class=l>Workload</th><th class=l>Result vs {base}</th><th>Better</th><th>Worse</th><th>Unclear</th><th class=l>Largest clear changes</th></tr>",
         me = c.opts.min_effect_pct
     );
     for s in &summary {
@@ -617,6 +617,16 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
                     " <span class=bad title=\"this population is {s} of the run's round trips, under the {ms}% threshold: compared, never highlighted or charted\">minor {s}</span>",
                     s = esc(&fmt_share(share)),
                     ms = c.opts.min_share_pct
+                );
+            }
+            if i != c.baseline
+                && let Some([(b_events, b_of), (events, of)]) =
+                    r.events(c.baseline, i).filter(|_| r.too_few_events(c.baseline, i))
+            {
+                let _ = write!(
+                    td,
+                    " <span class=bad title=\"{events} of {of} here against {b_events} of {b_of} for the baseline, over the runs compared: under {} on both sides, so the share is shown and not scored\">few events</span>",
+                    crate::compare::MIN_EVENTS
                 );
             }
             if i != c.baseline {

@@ -184,6 +184,37 @@ round trips there were without a step to fall off, and is reported from
 10000 blocked round trips on; `roundtrips_slow` is their number. The
 percentile stays, and is unstable wherever the share is near 0.1%.
 
+A share of rare events is only as good as the number of events behind it,
+which the share does not show. In one comparison the kernel's scheduler had
+9 slow round trips in 33.6 million and two others had none: "100% fewer",
+with an interval from 100% to 100% because every round agreed, counted as a
+clear improvement, and enough to turn a workload that was clearly worse in
+five other metrics into "better in some ways, worse in others". Nine events
+are not a difference between schedulers.
+
+So `rtt_blocked_slow_pct` is scored only when one side at least has 20 slow
+round trips, counted from `roundtrips_slow` over the runs the comparison
+rests on: the rounds both sides have in a session, every valid run
+otherwise. One side is enough, because none where the other has many is
+what an improvement looks like. Below that the share stays in the report
+with the counts next to it, as in "9 / 33.6M → 0 / 26.2M blocked round
+trips; too few events to score", and is left out of every verdict: the plain
+view, the summary, the table's colours, the change chart and the card all
+ask the same rule.
+
+Twenty is where a quantile starts to be reported as well, and it is a
+condition for being scored at all, not a test of the change: the interval,
+the minimum effect and the evenness of the rounds still have to hold. It
+does not make the interval of such a share a good one. With no events on one
+side in every round the interval has no width whatever the counts, and a
+proper one would come from the counts themselves, which is not done yet.
+
+The rule applies to this metric alone, the one a misleading verdict was seen
+for. The other shares that are scored, missed deadlines and wake-ups lost to
+overrun, can rest on few events too (a handful of missed periods in a run of
+nearly twenty thousand) and are candidates for the same rule; they are left
+as they were until a case shows what it should be for them.
+
 ### Same CPU and cross CPU
 
 The ponger reads its CPU with `sched_getcpu` just before handing the token
@@ -871,6 +902,7 @@ the change chart.
 |---|---|---|
 | The metric is a single-sample extreme (`*_max`) | | |
 | The population is less than a set share of the round trips on either side | `--min-share` (1%) | `°` |
+| The metric is `rtt_blocked_slow_pct` and neither side has 20 slow round trips | | |
 | The baseline measured zero in some rounds | | `?` |
 | There are fewer than 3 rounds, or 3 valid runs per side outside `matrix` | `--rounds`, `--runs` | |
 | The 95% interval includes no change | | |
