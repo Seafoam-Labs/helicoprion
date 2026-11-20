@@ -704,6 +704,67 @@ the hardware and of the kernel's idle governor first. The workload compares
 schedulers on one machine in one session; its delays say little about
 another machine.
 
+#### Initial hardware observations
+
+What the workload found the first time it ran on real hardware, written down
+because it is not what it was built to find. One machine: a Ryzen 7 8845HS
+with 16 logical CPUs, kernel 7.3.4 with a tick of 1000 Hz, the kernel's
+scheduler and four sched_ext schedulers, three sessions of five rounds each
+on one day. All 150 runs were valid, every one sent 1971 or 1970 of its 1971
+wake-ups, and none was left out as not asleep, overrun or mistimed. The
+kernel had the CPUs in their deepest idle state 95-99% of the time in most
+runs, so the machine did sleep with eight pairs at work. The ranges below
+are of the medians of a scheduler in a session unless they say otherwise;
+single runs go further out.
+
+- **`timer_late`.** The wakers typically ran 610-690 µs after their timers
+  (545-710 µs over all single runs) and 1.4-1.8 ms at the 99th percentile,
+  under every scheduler alike:
+  the schedulers' ranges overlap, and only the largest values of one of them
+  stand out. In the two schedulers looked at, about two thirds of the values
+  lay between 0.5 and 0.9 ms and under a tenth below 0.1 ms. This is the
+  larger delay by far, and it is not to be read as the time to leave an
+  idle state: it also holds the timer's own lateness and the time to run the
+  waker.
+- **`wake`.** The woken task ran 36-38 µs after its waker's reading of the
+  clock at the median, the same to half a microsecond from session to
+  session, and the schedulers differ by 2.5 µs at most. At the 99th
+  percentile they are further apart, 57-77 µs for three of them and 76-116 µs
+  for two, and one has largest values of up to 3.7 ms where the others stay
+  at about 0.3 ms or below. The verdicts repeated: the two with the longer tails came out
+  worse than the kernel's scheduler in 11 of 12 comparisons, the other two
+  without a clear difference in 10 of 12.
+- **Where the task ran.** On its waker's CPU in 0.0-0.4% of the wake-ups,
+  and in no single run in more than 0.8%, under every scheduler and in both
+  cases. On the CPU it had last run on in
+  96-99% under four schedulers and 86-93% under one. These are two different
+  things: nearly never the waker's CPU, and not always the previous one. The
+  choice the workload was built around, the waker's awake CPU against a
+  sleeping one, was not made by any of the five.
+- **The two cases.** The typical delay is the same in `handoff` and `busy`.
+  The tails are not quite: under the kernel's scheduler the 99th percentile
+  of `wake` was 57-65 µs in `busy` and 68-77 µs in `handoff`, `timer_late`
+  had a longer tail in `busy` under all, and one scheduler returned the task
+  to its previous CPU less often. The verdicts of the two cases differed in
+  3 of 12 pairs. `busy` adds little here and is kept: one machine is not
+  grounds to remove it.
+
+One possible explanation of the two delays is that the timer-driven waker
+pays much of the cost of the first exit from deep idle before it issues
+`FUTEX_WAKE`. The measured `wake` would then mostly describe how the target
+task is scheduled afterwards, and not the first transition out of deep
+idle. This remains a hypothesis: the workload does not record the idle state
+of the specific CPU at the moment of each wake-up.
+
+As a comparison of schedulers this is mostly a negative result, and a
+useful one: on this machine the dominant delay observed on a sleeping
+machine is the waker's lateness for its timer, which the schedulers share,
+and not the stretch from `FUTEX_WAKE` to the task running, where they differ
+by a few microseconds and in their tails. Nothing was added to the scoring
+on the strength of it. The limits are plain: one platform, one day, no
+second processor to check against, and three sessions are a first look at
+repeatability, not a calibration of false alarms.
+
 ### Scheduler statistics (`--sched-diag`)
 
 The workloads measure what a task experiences, a latency or a share. With
