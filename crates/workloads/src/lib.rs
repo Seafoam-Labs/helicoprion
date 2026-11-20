@@ -7,6 +7,7 @@ mod clock;
 mod futex;
 pub mod hog;
 mod idle;
+pub mod idle_wake;
 pub mod periodic;
 pub mod runner;
 pub mod samples;
@@ -127,15 +128,42 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
             }),
         ]
     };
+    // A task woken on a machine that has gone to sleep, once by a waker
+    // that sleeps again and once by one that goes on working. About
+    // 20 ms between the wake-ups of a pair: long enough for the task's
+    // CPU to reach its deepest idle state, and no whole number of the
+    // usual timer ticks.
+    //
+    // A pair for every two CPUs, eight at most. The period cannot be
+    // shortened without waking the machine it is about, so the samples
+    // come from pairs: 246 wake-ups per pair in five seconds, and a p99
+    // needs a thousand timed ones. Eight pairs give 1968, nearly twice
+    // that, so some wakers running late do not lose it; five are the
+    // fewest that can give it at all. A machine with fewer than ten
+    // CPUs gets a typical delay and no tail from a five-second run, and
+    // has to run longer for one: said in METHODOLOGY.md, not hidden by
+    // asking less of the tail here than everywhere else.
+    let idle = |case: &'static str, waker_work: Duration| -> Box<dyn Workload> {
+        Box::new(idle_wake::IdleWake {
+            case,
+            pairs: (cpus / 2).clamp(1, 8),
+            period: Duration::from_micros(20_300),
+            waker_work,
+            sched_diag: opts.sched_diag,
+        })
+    };
+    let idles = || vec![idle("handoff", Duration::ZERO), idle("busy", Duration::from_micros(200))];
     match name {
         "quick" => Some(vec![pingpong(0), pingpong(cpus)]),
         "periodic" => Some(vec![periodic(0), periodic(cpus)]),
         "bursts" => Some(bursts()),
         "cgroups" => Some(cgroups()),
+        "idle" => Some(idles()),
         "all" => {
             let mut all = vec![pingpong(0), pingpong(cpus), periodic(0), periodic(cpus)];
             all.extend(bursts());
             all.extend(cgroups());
+            all.extend(idles());
             Some(all)
         }
         _ => None,
@@ -145,8 +173,9 @@ pub fn suite(name: &str, cpus: usize, opts: SuiteOpts) -> Option<Vec<Box<dyn Wor
 /// `quick` is what it has always been, so that results stay comparable
 /// with earlier ones; `periodic` is the timer-driven workload alone,
 /// `bursts` the group wake-ups alone, `cgroups` the split between control
-/// groups alone, and `all` runs everything.
-pub const SUITES: &[&str] = &["quick", "periodic", "bursts", "cgroups", "all"];
+/// groups alone, `idle` the wake-ups on a sleeping machine alone, and
+/// `all` runs everything.
+pub const SUITES: &[&str] = &["quick", "periodic", "bursts", "cgroups", "idle", "all"];
 
 #[cfg(test)]
 mod tests {
@@ -162,7 +191,24 @@ mod tests {
         assert_eq!(names("periodic", 16), ["periodic-wake", "periodic-wake/loaded"]);
         assert_eq!(names("bursts", 16), ["wake-burst/half", "wake-burst/full", "wake-burst/double"]);
         assert_eq!(names("cgroups", 16), ["cgroup-fair/equal", "cgroup-fair/weighted"]);
-        assert_eq!(names("all", 16).len(), 9);
+        assert_eq!(names("idle", 16), ["idle-wake/handoff", "idle-wake/busy"]);
+        assert_eq!(names("all", 16).len(), 11);
+        // What was in `all` before keeps its place: new workloads go last.
+        assert_eq!(names("all", 16)[9..], names("idle", 16));
+        // idle-wake gets its samples from pairs, since its period is
+        // what lets the machine sleep. Sixteen CPUs: enough wake-ups in
+        // the usual five seconds for a p99, with room for late wakers;
+        // eight CPUs: not enough, whatever the scheduler does.
+        let wakes = |cpus: usize, secs: u64| -> u64 {
+            let w = &super::suite("idle", cpus, SuiteOpts::default()).unwrap()[0];
+            let (pairs, period) = (w.params()["pairs"].as_u64().unwrap(), w.params()["period_us"].as_u64().unwrap());
+            pairs * (secs * 1_000_000 / period)
+        };
+        let for_p99 = samples::min_samples_for(0.99);
+        assert_eq!((wakes(16, 5), wakes(64, 5)), (1968, 1968));
+        assert!(wakes(16, 5) * 2 >= for_p99 * 3, "less than half again over {for_p99}");
+        assert!(wakes(10, 5) >= for_p99 && wakes(8, 5) < for_p99 && wakes(8, 6) >= for_p99);
+        assert_eq!((wakes(2, 5), wakes(1, 5)), (246, 246));
         assert_eq!(names("all", 16)[..4], [names("quick", 16), names("periodic", 16)].concat());
         // Sizes follow the machine, and a single CPU still has a task.
         let tasks = |cpus: usize| -> Vec<u64> {

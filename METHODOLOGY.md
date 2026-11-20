@@ -133,7 +133,8 @@ something outside it moved it.
 The `quick` suite has two workloads, both with one thread pair for every two
 CPUs. The `periodic` suite has the two timer-driven ones, `bursts` the three
 sizes of a group woken at once, `cgroups` the two cases of a split between
-control groups, and `all` runs all nine. `quick` is the default and stays as
+control groups, `idle` the two cases of a wake-up on a sleeping machine, and
+`all` runs all eleven. `quick` is the default and stays as
 it is, so that its results remain comparable with earlier ones.
 
 | Name | What it does | Metrics |
@@ -147,6 +148,8 @@ it is, so that its results remain comparable with earlier ones.
 | `wake-burst/double` | The same with twice as many tasks as CPUs | The same, with the quartiles of the time until a task runs in place of its median |
 | `cgroup-fair/equal` | Two control groups of busy threads with the same `cpu.weight`, one with as many threads as CPUs and one with three times as many | How closely the split of CPU time follows the weights, the share of all CPU time that was used, the first group's share, and work per second |
 | `cgroup-fair/weighted` | The same with as many threads as CPUs in both groups and three times the weight for the second | The same |
+| `idle-wake/handoff` | Up to eight pairs of threads on an otherwise idle machine: every 20.3 ms one wakes the other and goes back to sleep | How long the woken thread takes to run, where it ran, and how deep the machine slept |
+| `idle-wake/busy` | The same, with the waker working for 200 µs after its call | The same |
 
 ### Blocked and fast round trips
 
@@ -586,6 +589,100 @@ have is invalid. Both reject some set-ups that could be measured with more
 work, which is better than reporting that a scheduler ignores weights it
 follows.
 
+### Wake-ups on a sleeping machine
+
+The workloads above keep the machine awake, and `wake-burst` asks the kernel
+outright to stay out of deep idle states, because the time to leave one
+swamped what it measures. `idle-wake` measures that time, as far as it is
+the scheduler's doing. A CPU that has been idle for a few milliseconds is in
+a state that takes tens or hundreds of microseconds to leave, and a
+scheduler chooses whether a wake-up pays for it: the woken task can run on
+the CPU of the thread that wakes it, which is awake, on the CPU it last ran
+on, which is asleep, or on any other.
+
+There are up to eight pairs of threads, one for every two CPUs. The waker of
+a pair sleeps on a timer for 20.3 ms, reads the clock and wakes its partner
+with one `FUTEX_WAKE`; the partner reads the clock as soon as it runs and
+goes back to sleep. `wake` is the time between the two readings, and its
+quantiles are scored, lower is better. When the waker itself wakes up late
+is not measured, only what happens from its call on. The pairs' phases are
+spread over the period, and the period is no whole number of the usual timer
+ticks, for the reason given under periodic wake-ups.
+
+The long period is what lets the machine sleep, and it makes samples scarce:
+246 wake-ups from each pair in a run of five seconds. The quantiles follow
+the rule of every workload, and a p99 needs a thousand timed wake-ups; the
+rule is not relaxed for this one. So what a run can say depends on the
+machine and on the length of the run:
+
+| CPUs | pairs | wake-ups in 5 s | what a 5 s run has |
+|---|---|---|---|
+| 16 or more | 8 | 1968 | typical delay and p99 |
+| 10 to 15 | 5 to 7 | 1230 to 1722 | typical delay and p99, with less room for late wakers |
+| 8 or 9 | 4 | 984 | typical delay only |
+| 2 to 7 | 1 to 3 | 246 to 738 | typical delay only |
+
+A machine in the lower rows gets the tail from a longer run (`--duration`):
+six seconds with four pairs, twenty-one with one. With eight pairs a wake-up
+comes every 2.5 ms somewhere on the machine, which leaves each task's own
+CPU idle for 20 ms and the machine as a whole for less; how deep it slept is
+what `idle_deepest_pct` reports. The period is not shortened to get more
+samples, since that would wake the machine the workload is about.
+
+The two cases differ in what the waker does next. In `idle-wake/handoff` it
+goes back to sleep at once, as a thread that hands a piece of work on: its
+CPU is free a moment later, and running the woken task there costs little.
+In `idle-wake/busy` it works for 200 µs after the call, as a thread that
+hands out work and goes on with its own: running the woken task on that CPU
+means taking it from the waker or waiting, and sending it elsewhere means
+waking a CPU up.
+
+Three things are shown and not scored, because they say how a scheduler got
+to its delay and not whether the delay is good:
+
+- `same_cpu_pct` is the share of the measured wake-ups that ran the task on
+  the CPU its waker was on when it called, `prev_cpu_pct` the share that ran
+  it on the CPU it had last run on. Both are readings of the CPU at two
+  instants.
+- `idle_pct` and `idle_deepest_pct` are the share of the CPUs' time that
+  the kernel's idle accounting (`cpuidle/state*/time`) has as idle, and as
+  spent in the state that takes longest to leave, read before the first
+  wake-up and after the last. They are the check that a run is what its
+  name says: where the second is small, the machine did not go to sleep
+  (something else kept it busy, or a request for shallow idle was in force),
+  and the wake-ups were not from deep idle. They are absent where the kernel
+  reports no idle states, as in most virtual machines; such results compare
+  schedulers on a machine that cannot sleep deeply. They cover every CPU
+  that reports idle states, also ones the benchmark may not run on: under a
+  cpuset they say how deep the machine slept, not the CPUs of the tasks.
+
+The wake-ups are due at fixed instants, `wakes_planned` of them in the
+window. A waker that comes back from its timer a period late skips what it
+missed, and one that comes back after the end of the window sends nothing
+for it, so that nothing is measured outside the window. `wakes_sent` and
+`wakes_per_s` say what was sent. A scheduler under which the wakers run late
+was asked for less, as with the bursts of `wake-burst`: the rate is shown
+for every scheduler and no limit is drawn.
+
+A wake-up is timed when the task was asleep and was woken by that call
+alone. `wakes_not_asleep` found the task not asleep yet and `wakes_overrun`
+were seen by the task only together with the next one; both are counted and
+left out, and with 20 ms between wake-ups both should be zero. The waker
+writes the time of a wake-up under that wake-up's number, and the task takes
+it only if that number is still the latest when it has read it: a waker that
+is already announcing the next wake-up cannot hand its time to this one. A
+time that would lie after the task's own reading of the clock is not used
+either (`wakes_mistimed`, which should be zero), instead of being counted as
+a delay of nothing. Which idle
+state a CPU was in at the instant of a wake-up is not known to the workload,
+so a delay cannot be put down to a state: the shares above are of the whole
+window.
+
+How deep a machine sleeps, and how long it takes to wake, is a property of
+the hardware and of the kernel's idle governor first. The workload compares
+schedulers on one machine in one session; its delays say little about
+another machine.
+
 ### Scheduler statistics (`--sched-diag`)
 
 The workloads measure what a task experiences, a latency or a share. With
@@ -637,6 +734,7 @@ The readings are taken by the threads that are measured, at these points:
 | `periodic-wake` | The tasks | After the start is fixed, before the first release | After the last period |
 | `wake-burst` | The tasks, not the waker | Before the task reports ready | When the task leaves |
 | `cgroup-fair` | The threads of both groups | When the threads start working | When they stop |
+| `idle-wake` | Wakers and woken tasks | Wakers at their first wake-up, tasks when they start waiting | Wakers after their last wake-up, tasks when told to stop |
 
 Nothing is read inside what is timed, but the readings are not free and
 they add a little that is not the workload: the wait at the start gate in

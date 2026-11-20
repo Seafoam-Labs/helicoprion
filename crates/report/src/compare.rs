@@ -2611,6 +2611,64 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(!old.contains("quartile"), "{old}");
     }
 
+    /// idle-wake in the plain view: the delay, where the task was put,
+    /// and whether the machine slept.
+    #[test]
+    fn idle_wake_is_described_in_plain_words() {
+        // (wake-up delay, share on the waker's CPU, share of deep idle),
+        // baseline then candidate; no idle accounting where `None`.
+        let session = |workload: &str, base: (f64, f64, Option<f64>), cand: (f64, f64, Option<f64>)| {
+            let mut files = drifting_session();
+            for (f, (wake, same, deep)) in files.iter_mut().zip([base, cand]) {
+                f.workloads[0].name = workload.into();
+                for (k, r) in f.workloads[0].runs.iter_mut().enumerate() {
+                    r.metrics.clear();
+                    r.metrics.insert("wake_p50".into(), Metric::lower(wake * (1.0 + 0.01 * k as f64), "us"));
+                    r.metrics.insert("same_cpu_pct".into(), Metric::info(same, "%"));
+                    r.metrics.insert("prev_cpu_pct".into(), Metric::info(100.0 - same, "%"));
+                    r.metrics
+                        .insert("wakes_per_s".into(), Metric::info(if same > 50.0 { 150.5 } else { 197.0 }, "1/s"));
+                    if let Some(deep) = deep {
+                        r.metrics.insert("idle_deepest_pct".into(), Metric::info(deep, "%"));
+                    }
+                }
+            }
+            Comparison::build(files, 0)
+        };
+        let c = session("idle-wake/handoff", (400.0, 2.0, Some(91.0)), (40.0, 97.0, Some(88.0)));
+        let text = crate::simple::text(&c);
+        assert!(text.contains("  A task woken on a sleeping machine, by one that sleeps again: BETTER\n"), "{text}");
+        assert!(text.contains("• Typical wake-up delay: "), "{text}");
+        assert!(
+            text.contains(
+                "• Ran on the CPU of the thread that woke it: 97% of wake-ups (2% under base); the CPUs were in \
+                 their deepest idle state 88% of the time (91% under base) (observed, not scored)"
+            ),
+            "{text}"
+        );
+        // What each side was asked for, where it differs and where not.
+        assert!(
+            text.contains(
+                "• Wake-ups sent: 150 a second, 197 under base (observed, not scored; with fewer a scheduler was \
+                 asked for less)"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!("\n{}\n", crate::simple::WHAT_IDLE)), "{text}");
+        // Where the kernel reports no idle states, nothing is said of them.
+        let text = crate::simple::text(&session("idle-wake/busy", (400.0, 2.0, None), (900.0, 1.0, None)));
+        assert!(text.contains("  A task woken on a sleeping machine, by one that goes on working: WORSE\n"), "{text}");
+        assert!(
+            text.contains(
+                "• Ran on the CPU of the thread that woke it: 1% of wake-ups (2% under base) (observed, not scored)"
+            ),
+            "{text}"
+        );
+        // Where the task ran is not scored: equal delays, no verdict from it.
+        let text = crate::simple::text(&session("idle-wake/busy", (400.0, 2.0, None), (400.0, 98.0, None)));
+        assert!(!text.contains("BETTER") && !text.contains("WORSE"), "{text}");
+    }
+
     /// cgroup-fair in the plain view: the split, what the weights ask
     /// for, and whether the split is the one a scheduler without groups
     /// or without weights gives.

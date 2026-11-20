@@ -28,6 +28,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 const DEVICE: &str = "/dev/cpu_dma_latency";
 const CPUIDLE: &str = "/sys/devices/system/cpu/cpu0/cpuidle";
@@ -62,6 +63,66 @@ pub(crate) fn bound() -> Option<i32> {
         OpenOptions::new().read(true).write(true).open(DEVICE).ok()?;
         shallowest(Path::new(CPUIDLE)).ok()
     })
+}
+
+/// How long the CPUs have been idle since they started, by the kernel's
+/// own accounting (`cpuidle/state*/time`), summed over the CPUs that
+/// have idle states to report.
+pub(crate) struct Residency {
+    at: Instant,
+    cpus: usize,
+    /// In any idle state, microseconds.
+    any_us: u64,
+    /// In each CPU's state that takes longest to leave.
+    deepest_us: u64,
+}
+
+impl Residency {
+    pub(crate) fn read() -> Option<Self> {
+        Self::read_at(Path::new("/sys/devices/system/cpu"))
+    }
+
+    /// `None` where no CPU reports an idle state, as in most virtual
+    /// machines: then there is nothing to say, not zero.
+    fn read_at(root: &Path) -> Option<Self> {
+        let number = |file: &Path| fs::read_to_string(file).ok()?.trim().parse::<u64>().ok();
+        let (mut cpus, mut any_us, mut deepest_us) = (0, 0, 0);
+        for cpu in fs::read_dir(root).ok()?.flatten() {
+            let is_cpu = cpu.file_name().to_str().is_some_and(|n| {
+                n.strip_prefix("cpu").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+            });
+            let Ok(states) = fs::read_dir(cpu.path().join("cpuidle")) else { continue };
+            if !is_cpu {
+                continue;
+            }
+            // (exit latency, time) of every state of this CPU.
+            let states: Vec<(u64, u64)> = states
+                .flatten()
+                .filter_map(|s| Some((number(&s.path().join("latency"))?, number(&s.path().join("time"))?)))
+                .collect();
+            let Some(deepest) = states.iter().max_by_key(|(latency, _)| *latency) else { continue };
+            cpus += 1;
+            any_us += states.iter().map(|(_, time)| time).sum::<u64>();
+            // A CPU whose only state is the idle loop has no deep one.
+            deepest_us += if deepest.0 > 0 { deepest.1 } else { 0 };
+        }
+        (cpus > 0).then(|| Residency { at: Instant::now(), cpus, any_us, deepest_us })
+    }
+
+    /// The share of the CPUs' time between `earlier` and this reading
+    /// that was idle, and that was spent in the deepest state, in
+    /// percent. `None` where the two readings cannot be set against
+    /// each other: another number of CPUs reported (one went offline or
+    /// came online in between), or no time passed. That is no idle time
+    /// known, not none.
+    pub(crate) fn since(&self, earlier: &Residency) -> Option<(f64, f64)> {
+        let whole = self.at.duration_since(earlier.at).as_micros() as f64 * self.cpus as f64;
+        if whole <= 0.0 || self.cpus != earlier.cpus {
+            return None;
+        }
+        let pct = |now: u64, then: u64| now.saturating_sub(then) as f64 / whole * 100.0;
+        Some((pct(self.any_us, earlier.any_us), pct(self.deepest_us, earlier.deepest_us)))
+    }
 }
 
 /// Tests that hold a request, one at a time: each looks at the bound in
@@ -162,6 +223,55 @@ mod tests {
         assert_eq!(in_force(), before);
         // What a run would ask for is one answer, whatever it is.
         assert_eq!(bound(), bound());
+    }
+
+    #[test]
+    fn idle_time_is_summed_over_the_cpus_that_report_it() {
+        let root = std::env::temp_dir().join(format!("helicoprion-residency-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let state = |cpu: &str, state: &str, latency: u64, time: u64| {
+            let dir = root.join(cpu).join("cpuidle").join(state);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("latency"), format!("{latency}\n")).unwrap();
+            fs::write(dir.join("time"), format!("{time}\n")).unwrap();
+        };
+        // Nothing there, and a directory that is no CPU.
+        fs::create_dir_all(root.join("cpufreq")).unwrap();
+        assert!(Residency::read_at(&root).is_none());
+        state("cpuidle", "state0", 5, 999);
+        assert!(Residency::read_at(&root).is_none());
+        // Two CPUs, three states each; the deepest is the one that
+        // takes longest to leave, whatever its number.
+        for cpu in ["cpu0", "cpu1"] {
+            state(cpu, "state0", 0, 100);
+            state(cpu, "state1", 350, 4_000);
+            state(cpu, "state2", 18, 900);
+        }
+        // A CPU without idle states is not counted.
+        fs::create_dir_all(root.join("cpu2")).unwrap();
+        let before = Residency::read_at(&root).unwrap();
+        assert_eq!((before.cpus, before.any_us, before.deepest_us), (2, 10_000, 8_000));
+        // One second later by the clock of the test: half a second of
+        // idle per CPU, most of it deep.
+        for cpu in ["cpu0", "cpu1"] {
+            state(cpu, "state1", 350, 404_000);
+            state(cpu, "state2", 18, 100_900);
+        }
+        let mut after = Residency::read_at(&root).unwrap();
+        after.at = before.at + std::time::Duration::from_secs(1);
+        let (any, deepest) = after.since(&before).unwrap();
+        assert!((any - 50.0).abs() < 1e-9 && (deepest - 40.0).abs() < 1e-9, "{any} {deepest}");
+        // A CPU whose only state is the idle loop has no deep idle.
+        let _ = fs::remove_dir_all(&root);
+        state("cpu0", "state0", 0, 500);
+        let only = Residency::read_at(&root).unwrap();
+        assert_eq!((only.cpus, only.any_us, only.deepest_us), (1, 500, 0));
+        // Readings of another number of CPUs are not set against each
+        // other, and neither are two of the same instant: no share, not
+        // a share of zero.
+        assert_eq!(only.since(&before), None);
+        assert_eq!(before.since(&before), None);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

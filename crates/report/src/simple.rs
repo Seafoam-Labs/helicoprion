@@ -38,6 +38,8 @@ fn title(workload: &str) -> String {
         "wake-burst/double" => "A group of tasks woken at once, twice as many as CPUs".into(),
         "cgroup-fair/equal" => "Two control groups, same weight, one with three times the tasks".into(),
         "cgroup-fair/weighted" => "Two control groups, same tasks, one with three times the weight".into(),
+        "idle-wake/handoff" => "A task woken on a sleeping machine, by one that sleeps again".into(),
+        "idle-wake/busy" => "A task woken on a sleeping machine, by one that goes on working".into(),
         other => other.to_string(),
     }
 }
@@ -292,6 +294,47 @@ fn burst_rate(c: &Comparison, workload: &str, i: usize) -> Option<String> {
     ))
 }
 
+/// Where idle-wake's woken task ran: on the CPU of the thread that woke
+/// it, which is awake, or elsewhere, which may have to be woken up
+/// first. Observed, not scored: it is how a scheduler gets to its delay.
+/// With how deep the machine slept, where the kernel says: a run in
+/// which it did not is not what the part's title says.
+fn placement(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let median = |metric: &str, k: usize| {
+        let row = c.rows.iter().find(|r| r.workload == workload && r.metric == metric)?;
+        row.cells.get(k).and_then(Option::as_ref).map(|c| c.spread.median)
+    };
+    let (base, here) = (c.series[c.baseline].label.as_str(), median("same_cpu_pct", i)?);
+    let mut line = format!("Ran on the CPU of the thread that woke it: {here:.0}% of wake-ups");
+    if let Some(b) = median("same_cpu_pct", c.baseline) {
+        let _ = write!(line, " ({b:.0}% under {base})");
+    }
+    if let Some(deep) = median("idle_deepest_pct", i) {
+        let _ = write!(line, "; the CPUs were in their deepest idle state {deep:.0}% of the time");
+        if let Some(b) = median("idle_deepest_pct", c.baseline) {
+            let _ = write!(line, " ({b:.0}% under {base})");
+        }
+    }
+    line.push_str(" (observed, not scored)");
+    Some(line)
+}
+
+/// How many wake-ups idle-wake's wakers sent under each side. They are
+/// due at fixed instants, so a scheduler under which the wakers come
+/// back from their timers late, or after the end of the window, was
+/// asked for less. Not scored, and no limit is drawn: both rates are
+/// said, as for wake-burst's bursts.
+fn wake_rate(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == "wakes_per_s")?;
+    let (b, v) = medians(row, c.baseline, i)?;
+    Some(format!(
+        "Wake-ups sent: {} a second, {} under {} (observed, not scored; with fewer a scheduler was asked for less)",
+        fmt_value(v),
+        fmt_value(b),
+        c.series[c.baseline].label
+    ))
+}
+
 /// How cgroup-fair's two groups shared the CPU time, next to what their
 /// weights ask for, and under the baseline. Observed, not scored: the
 /// score is in how closely the split follows the weights. Where the
@@ -459,6 +502,10 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                     ("closer", "further"),
                 ),
                 point(c, w, i, "cpu_used_pct", "CPU time used", ("more", "less")),
+                // idle-wake: its delays are `wake_*`, above; here where
+                // the task was put, and whether the machine slept.
+                placement(c, w, i),
+                wake_rate(c, w, i),
                 // Any workload, where it was recorded.
                 mechanism(c, w, i),
                 background(c, w, i),
@@ -620,6 +667,10 @@ thread pool given a batch would, and measures how soon they run and how soon all
 pub const WHAT_CGROUP: &str = "The test runs two control groups of busy tasks that compete for every CPU, and \
 measures whether the CPU time is split between them the way their weights say.";
 
+/// The same for idle-wake.
+pub const WHAT_IDLE: &str = "The test lets the machine go to sleep and has one task wake another, and measures how \
+long the woken one takes to run.";
+
 /// What the workloads of this comparison do, in a sentence each.
 pub fn what(c: &Comparison) -> String {
     let has = |prefix: &str| c.rows.iter().any(|r| r.workload.starts_with(prefix));
@@ -628,6 +679,7 @@ pub fn what(c: &Comparison) -> String {
         ("periodic-wake", WHAT_PERIODIC),
         ("wake-burst", WHAT_BURST),
         ("cgroup-fair", WHAT_CGROUP),
+        ("idle-wake", WHAT_IDLE),
     ]
     .into_iter()
     .filter(|(prefix, _)| has(prefix))
