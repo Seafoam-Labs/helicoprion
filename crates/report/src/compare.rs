@@ -2629,8 +2629,8 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // wake-up does not.
         assert!(text.contains("• Slow responses (1 in 100), work included: 10% shorter ("), "{text}");
         // Two shares and a factor, not a percentage of a percentage.
-        // The shares are those over all runs together.
-        assert!(text.contains("• Deadlines missed: 10× fewer (11.7% → 1.16% of periods)"), "{text}");
+        // The counts over all runs together, which are what is compared.
+        assert!(text.contains("• Deadlines missed: 10× fewer (28000 / 240.0k → 2794 / 240.0k periods)"), "{text}");
         assert!(!text.contains("on time"), "informational, and the same fact: {text}");
         assert!(text.contains("• Background CPU work: about the same (observed, not scored)"), "{text}");
         // The typical response moves by under 2%: below the threshold.
@@ -2768,7 +2768,9 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // A share of the wake-ups, not of periods, and no percentage of a
         // percentage.
         assert!(
-            text.contains("• Wake-ups lost because the task was still busy: 4.0× fewer (4.00% → 1.00% of wake-ups)"),
+            text.contains(
+                "• Wake-ups lost because the task was still busy: 4.0× fewer (480 / 12.0k → 120 / 12.0k wake-ups)"
+            ),
             "{text}"
         );
         // How much work each side was asked for, said and not scored.
@@ -2878,8 +2880,8 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let text = session((0.12, 0.03));
         assert!(
             text.contains(
-                "• Round trips of a millisecond or more: 4.0× fewer (0.12% → 0.03% of the round trips that needed a \
-                 wake-up)"
+                "• Round trips of a millisecond or more: 4.0× fewer (28800 / 24.00M → 7200 / 24.00M blocked round \
+                 trips)"
             ),
             "{text}"
         );

@@ -192,7 +192,13 @@ fn point(c: &Comparison, workload: &str, i: usize, metric: &str, label: &str, wo
     // percentage of a percentage, and read as points. The two shares say
     // it, with the direction, and with the factor where it is a multiple.
     if row.unit == "%" {
-        let values = format!("{}% → {}% {}", fmt_value(b), fmt_value(v), share_of(metric));
+        // A share of counted events is given by its counts: "0.10% →
+        // 0.00%" next to "526× fewer" is two numbers of which one has
+        // been rounded away, and the counts are what was compared.
+        let values = match row.event_counts(c.baseline, i) {
+            Some(counts) => format!("{counts} {}", events_of(metric)),
+            None => format!("{}% → {}% {}", fmt_value(b), fmt_value(v), share_of(metric)),
+        };
         let factor = d.ratio.max(1.0 / d.ratio);
         let size = if factor.is_finite() && factor >= 2.0 { format!("{}× ", times(factor)) } else { String::new() };
         return Some(match c.unclear_reason(row, i, &d) {
