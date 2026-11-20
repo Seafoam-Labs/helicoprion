@@ -718,27 +718,39 @@ mod tests {
         let out = waker(&pair, now - 3_000_000, now - 1_000_000, 1_000_000, 0).unwrap();
         assert_eq!((out.planned, out.sent, out.timer_late.count()), (2, 0, 0));
         assert_eq!(pair.word.load(Ordering::Acquire), 0);
-        // One that ends in a moment gets what is due before then.
+        // One that ends in a while gets what is due before then: three
+        // wake-ups 100 ms apart, of which a waker kept from its CPU for
+        // some of that time, on a busy test machine, sends fewer.
         let now = now_ns();
-        let out = waker(&pair, now + 1_000_000, now + 3_500_000, 1_000_000, 0).unwrap();
+        let out = waker(&pair, now + 5_000_000, now + 250_000_000, 100_000_000, 0).unwrap();
         assert_eq!(out.planned, 3);
         assert!((1..=3).contains(&out.sent) && out.woke_nobody == out.sent, "{} sent", out.sent);
         assert_eq!(out.timer_late.count(), out.sent);
         // Lateness is against the instant the wake-up was due. One due
-        // 2 ms ago, the only one of its window: sent at once, and late
-        // by those 2 ms and whatever getting here took, not by nothing
-        // and not by a period.
-        let now = now_ns();
-        let out = waker(&pair, now - 2_000_000, now + 50_000_000, 1_000_000_000, 0).unwrap();
+        // 2 ms ago, the only one of a long window: sent at once, and
+        // late by those 2 ms and whatever getting to the clock took.
+        // That is bounded by the clock itself, read before and after,
+        // and not by a guess at how busy the machine is: the waker read
+        // its clock between the two readings here.
+        const DUE_AGO: u64 = 2_000_000;
+        let (window, period) = (10_000_000_000, 100_000_000_000);
+        let before = now_ns();
+        let out = waker(&pair, before - DUE_AGO, before + window, period, 0).unwrap();
+        let after = now_ns();
         assert_eq!((out.planned, out.sent, out.timer_late.count()), (1, 1, 1));
         let late = out.timer_late.max().unwrap();
-        assert!((2_000_000..50_000_000).contains(&late), "{late} ns");
+        assert!((DUE_AGO..=after - before + DUE_AGO).contains(&late), "{late} ns");
         // With work after the call, the lateness is still the one read
-        // before it: the work is not in it.
-        let now = now_ns();
-        let out = waker(&pair, now - 2_000_000, now + 50_000_000, 1_000_000_000, 20_000_000).unwrap();
+        // before it. The work takes its 20 ms of CPU time at least, so
+        // the waker's reading lay that much before the second one here:
+        // lateness that held the work would be over this bound.
+        const WORK: u64 = 20_000_000;
+        let before = now_ns();
+        let out = waker(&pair, before - DUE_AGO, before + window, period, WORK).unwrap();
+        let after = now_ns();
+        assert!(after - before >= WORK, "worked for {} ns", after - before);
         let late = out.timer_late.max().unwrap();
-        assert!((2_000_000..20_000_000).contains(&late), "{late} ns");
+        assert!((DUE_AGO..=after - before - WORK + DUE_AGO).contains(&late), "{late} ns of {}", after - before);
     }
 
     /// The same with a task that really sleeps. The test waits for what

@@ -888,21 +888,39 @@ mod tests {
     /// would lose exactly the wake-ups the benchmark is after.
     #[test]
     fn a_wakeup_acted_on_after_the_run_is_over_is_measured() {
-        let w = quick(2);
         // A few bursts in 6 ms; the first task runs 30 ms after it was
         // woken by the first of them.
         let hooks = Hooks { slow_task: Some((0, Duration::from_millis(30))), ..Default::default() };
-        let r = run(&w, Duration::from_millis(6), &hooks);
+
+        // Alone, so that every number is that task's and none depends
+        // on how busy the machine is: woken once, by the first burst,
+        // and every burst after that found it waiting for its CPU.
+        let r = run(&quick(1), Duration::from_millis(6), &hooks);
+        assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);
+        let c = &r.counters;
+        assert!(c["bursts"] >= 2 && c["wakeups_due"] == c["bursts"], "{c:?}");
+        accounted(&r);
+        assert_eq!((c["wakeups_ran"], c["wakeups_not_asleep"]), (1, 0), "{c:?}");
+        assert_eq!(c["wakeups_overrun"], c["bursts"] - 1, "{c:?}");
+        // Its 30 ms are in the results.
+        assert!(r.metrics["start_max"].value >= 30_000.0, "{:?}", r.metrics["start_max"]);
+
+        // With a second task, for the group's time. What that one does
+        // is the machine's to say: a burst finds it asleep, or, where
+        // it did not get a CPU in the 2 ms since the last one, still
+        // busy, which is an overrun of its own. So the slow task's
+        // numbers are the least there is, and no more is asked.
+        let r = run(&quick(2), Duration::from_millis(6), &hooks);
         assert_eq!(hooks.alive.load(Ordering::SeqCst), 0);
         let c = &r.counters;
         assert!(c["bursts"] >= 2 && c["wakeups_due"] == c["bursts"] * 2, "{c:?}");
         accounted(&r);
-        // The slow one: woken once, and the bursts that came while it
-        // waited for its CPU found it busy. The other: woken by each,
-        // unless one found it between its work and its sleep.
-        assert_eq!(c["wakeups_overrun"], c["bursts"] - 1, "{c:?}");
-        assert_eq!(c["wakeups_ran"] + c["wakeups_not_asleep"], c["bursts"] + 1, "{c:?}");
-        // Its 30 ms are in the results, for the task and for its group.
+        // The slow one: once. The other: by the first burst at least,
+        // unless that found it between its work and its sleep.
+        assert!(c["wakeups_ran"] + c["wakeups_not_asleep"] >= 2, "{c:?}");
+        assert!((c["bursts"] - 1..=2 * (c["bursts"] - 1)).contains(&c["wakeups_overrun"]), "{c:?}");
+        // The first burst had both, and the group was running when the
+        // slow one was: its 30 ms are the group's too.
         assert!(r.metrics["start_max"].value >= 30_000.0, "{:?}", r.metrics["start_max"]);
         assert!(c["bursts_complete"] >= 1 && r.metrics["all_running_max"].value >= 30_000.0, "{c:?}");
     }
