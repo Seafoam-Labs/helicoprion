@@ -135,6 +135,8 @@ pub struct Calibration {
     /// In how many rounds the first arm was visited before its twin, and
     /// in how many after (`session_led`).
     pub session: (usize, usize),
+    /// The rounds the session was to have, where its design says.
+    pub rounds: Option<u32>,
 }
 
 impl Calibration {
@@ -183,10 +185,23 @@ impl Calibration {
     /// session or in some of its metrics, and which of the two.
     pub fn balance_warning(&self) -> Option<String> {
         if let Some((before, after)) = self.unbalanced() {
+            // What to do about it depends on why. A session that was to
+            // have an even number of rounds and has a valid run of both
+            // arms in fewer was not planned wrong: a run failed, or the
+            // session was cut short, and "run an even number of rounds"
+            // is what was done.
+            let paired = before + after;
+            let advice = match self.rounds {
+                Some(rounds) if rounds.is_multiple_of(2) && paired < rounds as usize => format!(
+                    "only {paired} of the session's {rounds} rounds have a valid run of both arms, so the even \
+                     number of rounds did not balance it; see which runs are missing or not valid"
+                ),
+                _ => "run an even number of rounds".to_string(),
+            };
             return Some(format!(
                 "A/A: {} was visited before {} in {before} rounds and after it in {after}. The order is not \
                  balanced, so an effect of position within a round is part of the change between the two arms; \
-                 run an even number of rounds",
+                 {advice}",
                 self.first, self.twin
             ));
         }
@@ -328,7 +343,8 @@ pub fn calibrate(c: &Comparison) -> Vec<Calibration> {
                     })
                 })
                 .collect();
-            Calibration { pair, first: a.label.clone(), twin: b.label.clone(), metrics, session }
+            let rounds = a.file.design.as_ref().map(|d| d.rounds);
+            Calibration { pair, first: a.label.clone(), twin: b.label.clone(), metrics, session, rounds }
         })
         .collect()
 }
@@ -575,6 +591,19 @@ pub(crate) mod tests {
         let mut cut = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
         cut[1].workloads[0].runs.iter_mut().filter(|r| r.round == Some(5)).for_each(|r| r.valid = false);
         assert_eq!(session_led(&cut[0], &cut[1]), (3, 2));
+        // Such a session ran an even number of rounds and is not told
+        // to: it is told what is missing.
+        let c = Comparison::build(cut, 0);
+        let cal = calibrate(&c).remove(0);
+        assert_eq!((cal.session, cal.rounds), ((3, 2), Some(6)));
+        assert_eq!(
+            cal.balance_warning().unwrap(),
+            "A/A: scx_lavd was visited before scx_lavd #2 in 3 rounds and after it in 2. The order is not balanced, \
+             so an effect of position within a round is part of the change between the two arms; only 5 of the \
+             session's 6 rounds have a valid run of both arms, so the even number of rounds did not balance it; \
+             see which runs are missing or not valid"
+        );
+        assert!(!c.warnings.iter().any(|w| w.contains("run an even number of rounds")), "{:?}", c.warnings);
         // Without recorded visits nothing is known, and nothing said.
         let mut blind = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
         blind.iter_mut().flat_map(|f| f.workloads[0].runs.iter_mut()).for_each(|r| r.visit = None);
