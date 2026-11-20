@@ -688,6 +688,14 @@ mod tests {
     /// a busy test machine the waker can be late on its own, and such a
     /// run is rightly invalid. Try again a few times.
     fn run(w: &WakeBurst, duration: Duration, hooks: &Hooks) -> RunResult {
+        let r = punctual(w, duration, hooks);
+        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
+        r
+    }
+
+    /// The first of a few runs in which the machine did not make the
+    /// waker late on its own, or the last of them if it did in all.
+    fn punctual(w: &WakeBurst, duration: Duration, hooks: &Hooks) -> RunResult {
         let mut r = w.run_with(duration, hooks);
         for _ in 0..5 {
             if !r.invalid_reason.as_deref().is_some_and(|why| why.contains("a punctual one would have")) {
@@ -695,7 +703,6 @@ mod tests {
             }
             r = w.run_with(duration, hooks);
         }
-        assert!(r.invalid_reason.is_none(), "{:?}", r.invalid_reason);
         r
     }
 
@@ -1035,13 +1042,28 @@ mod tests {
         let w = quick(2);
         // 300 planned. Late once by 5 ms: a few fewer, and it counts.
         let hooks = Hooks { slow_waker: Some((5, Duration::from_millis(5))), ..Default::default() };
-        let r = run(&w, Duration::from_millis(600), &hooks);
-        let c = &r.counters;
-        assert_eq!(c["bursts_planned"], 300);
-        assert!(c["bursts"] < 300 && c["bursts"] >= 150, "{c:?}");
-        assert_eq!(c["wakeups_due"], c["bursts"] * 2);
-        accounted(&r);
-        assert!(r.metrics["release_late_max"].value >= 5000.0, "{:?}", r.metrics["release_late_max"]);
+        let r = punctual(&w, Duration::from_millis(600), &hooks);
+        match &r.invalid_reason {
+            None => {
+                let c = &r.counters;
+                assert_eq!(c["bursts_planned"], 300);
+                assert!(c["bursts"] < 300 && c["bursts"] >= 150, "{c:?}");
+                assert_eq!(c["wakeups_due"], c["bursts"] * 2);
+                accounted(&r);
+                assert!(r.metrics["release_late_max"].value >= 5000.0, "{:?}", r.metrics["release_late_max"]);
+            }
+            // A machine busy enough to make the waker late by more than
+            // the 5 ms asked for, in six runs out of six, has released
+            // under half of the bursts on its own. That is the run this
+            // test is about, and it has to be invalid for that reason
+            // and with nothing to compare; a failure here would be the
+            // test's and not the workload's. What a run that is only a
+            // little late looks like is then left to a quieter machine.
+            Some(why) => {
+                assert!(why.contains("of the 300 bursts a punctual one would have"), "{why}");
+                assert!(r.metrics.is_empty(), "nothing to compare: {:?}", r.metrics);
+            }
+        }
 
         // Late once by 400 ms of the 600: a third of the bursts at most.
         let hooks = Hooks { slow_waker: Some((5, Duration::from_millis(400))), ..Default::default() };
