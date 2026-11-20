@@ -10,6 +10,7 @@ url="https://github.com/Seafoam-Labs/helicoprion"
 license=('MIT OR Apache-2.0')
 depends=('glibc' 'gcc-libs')
 makedepends=('git' 'cargo')
+optdepends=('ttf-font: text on the result card (compare --png, card.png of matrix)')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
 source=("git+$url.git")
