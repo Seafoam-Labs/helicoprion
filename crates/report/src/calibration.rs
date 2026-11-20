@@ -264,6 +264,17 @@ pub fn pairs(c: &Comparison) -> Vec<Pair> {
         .collect()
 }
 
+/// The series of `c` that are the scheduler of series `of` measured
+/// again in the same session: its twins, the arm it is a twin of, and
+/// the other twins of that arm. A change between any two of them is
+/// not a change between schedulers.
+pub fn same_as(c: &Comparison, of: usize) -> Vec<usize> {
+    let pairs = pairs(c);
+    // The arm every arm of one scheduler goes back to.
+    let first = |i: usize| pairs.iter().find(|p| p.twin == i).map_or(i, |p| p.first);
+    (0..c.series.len()).filter(|i| *i != of && first(*i) == first(of)).collect()
+}
+
 /// The position of each round's visit of `f` on `workload` in the
 /// session: the lowest visit number among that round's runs.
 fn visit_of(f: &ResultFile, workload: &str, round: u32) -> Option<u32> {
@@ -468,6 +479,73 @@ pub(crate) mod tests {
     /// times. With a later visit that is 10% slower, two identical arms
     /// then differ by 10%; over six rounds they do not. The scoring is the
     /// same in both; the report says which session is unbalanced.
+    /// A card is passed around without its report. Where a row is the
+    /// baseline's own scheduler measured again, a cell that says better
+    /// is noise, and the card says so itself: under the row's name, and
+    /// in its head where there is nothing else on it.
+    #[test]
+    fn the_card_says_which_rows_are_the_baseline_again() {
+        // The later visit is faster: a clear "better" between twins.
+        let value = |label: &str, _: u32, _: usize| if label.contains('#') { 80.0 } else { 100.0 };
+        let files = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2", "scx_lavd #3"], 6, value));
+        let c = Comparison::build(files.clone(), 0);
+        assert_eq!(same_as(&c, 0), [1, 2]);
+        assert_eq!((same_as(&c, 1), same_as(&c, 2)), (vec![0, 2], vec![0, 1]));
+        let card = crate::card::svg(&c).unwrap();
+        assert!(card.contains(">better<"), "{card}");
+        assert!(
+            card.contains(">scx_lavd compared with itself<") && !card.contains("Schedulers compared with"),
+            "{card}"
+        );
+        assert!(
+            card.contains(">A/A check: the same scheduler in every row; differences are measurement noise.<"),
+            "{card}"
+        );
+        assert_eq!(card.matches(">the baseline again: noise<").count(), 2);
+        // With a twin as the baseline the others are still itself.
+        let card = crate::card::svg(&Comparison::build(files, 2)).unwrap();
+        assert!(card.contains(">scx_lavd #3 compared with itself<"), "{card}");
+        assert_eq!(card.matches(">the baseline again: noise<").count(), 2);
+
+        // Among other schedulers the card is a comparison, headed as one,
+        // and the one row that is the baseline again is marked.
+        let files = only(aa_session("aa", 1000, &["default", "scx_a", "default #2"], 6, value));
+        let c = Comparison::build(files.clone(), 0);
+        assert_eq!((same_as(&c, 0), same_as(&c, 1)), (vec![2], vec![]));
+        let card = crate::card::svg(&c).unwrap();
+        assert!(card.contains(">Schedulers compared with default<") && card.contains(">The baseline"), "{card}");
+        assert_eq!(card.matches(">the baseline again: noise<").count(), 1);
+        // Against the other scheduler neither arm of "default" is the
+        // baseline again, and nothing is marked.
+        let card = crate::card::svg(&Comparison::build(files, 1)).unwrap();
+        assert!(card.contains(">Schedulers compared with scx_a<") && !card.contains("the baseline again"), "{card}");
+        // More rows than the card has room for: seven repeats are shown
+        // and an eighth row, another scheduler, is not. The session is
+        // not one of a scheduler against itself, and the card is not
+        // headed as one for what happens to fit on it.
+        let many = ["scx_lavd", "scx_lavd", "scx_lavd", "scx_lavd", "scx_lavd", "scx_lavd", "scx_lavd", "scx_lavd"];
+        let mut labels: Vec<String> = many
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i == 0 { s.to_string() } else { format!("{s} #{}", i + 1) })
+            .collect();
+        labels.push("scx_other".into());
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let files = only(aa_session("aa", 1000, &labels, 6, value));
+        let c = Comparison::build(files, 0);
+        assert_eq!(same_as(&c, 0), [1, 2, 3, 4, 5, 6, 7]);
+        let card = crate::card::svg(&c).unwrap();
+        assert!(card.contains(">Schedulers compared with scx_lavd<") && card.contains(">The baseline is"), "{card}");
+        assert!(!card.contains("compared with itself") && !card.contains("A/A check"), "{card}");
+        assert!(card.contains(">Not shown: 1 more scheduler."), "{card}");
+        assert!(!card.contains(">scx_other<"), "{card}");
+        assert_eq!(card.matches(">the baseline again: noise<").count(), 7);
+        // No twins, no mark: the card of a plain session is as it was.
+        let plain = only(aa_session("aa", 1000, &["default", "scx_a"], 6, value));
+        let card = crate::card::svg(&Comparison::build(plain, 0)).unwrap();
+        assert!(card.contains(">Schedulers compared with default<") && !card.contains("the baseline again"));
+    }
+
     /// A session of six rounds is balanced, three and three. A metric
     /// that both arms have in three of the rounds only can be two and
     /// one, and that is said of the metric and not of the session: the

@@ -1306,6 +1306,15 @@ that has any: on a card with many workloads the two of a mixed cell go one
 above the other, and with many schedulers as well they are left out, for
 all mixed cells of that card alike.
 
+A row that is the baseline's own scheduler measured again, as a session
+with a repeated scheduler has, says so under its name: "the baseline again:
+noise". A cell of such a row that reads better or worse is what the method
+finds where there is nothing to find, which the report says in its A/A
+section and a card passed around alone has to say itself. Where every row
+is one, the card is headed as what it is, "scx_lavd compared with itself",
+an A/A check, and not as a comparison of schedulers. The cells are not
+changed for it: they show what was found.
+
 The card is for places that show a picture and not a page. It holds one
 size per direction, no intervals and no warnings, and those are what make
 a verdict worth trusting; it says on its face how many warnings the report

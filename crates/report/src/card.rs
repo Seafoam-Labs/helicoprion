@@ -130,6 +130,12 @@ struct Sizes {
     list: Vec<Size>,
     stacked: bool,
 }
+/// The line under the title of a card that is an A/A check. A fixed
+/// sentence: the scheduler is named in the title above it, and a name
+/// in here would make its length the name's.
+const CHECK: &str = "A/A check: the same scheduler in every row; differences are measurement noise.";
+/// Under the name of a row that is the baseline's scheduler again.
+const AGAIN: &str = "the baseline again: noise";
 /// A mark and the size after it, and the space between two of them.
 const MARK_W: f64 = 12.0;
 const MARK_GAP: f64 = 5.0;
@@ -314,17 +320,35 @@ pub fn svg(c: &Comparison) -> Option<String> {
     if workloads.is_empty() || rows.is_empty() {
         return None;
     }
+    // Rows that are the baseline's own scheduler measured again, and
+    // whether the comparison has nothing else: asked of every row there
+    // is, before those that do not fit are dropped. A card that shows
+    // seven repeats and leaves an eighth, other scheduler out is not a
+    // card of a scheduler against itself.
+    let again = crate::calibration::same_as(c, c.baseline);
+    let check = rows.iter().all(|r| again.contains(r));
     let (more_rows, more_columns) = (rows.len().saturating_sub(MAX_ROWS), workloads.len().saturating_sub(MAX_COLUMNS));
     rows.truncate(MAX_ROWS);
     workloads.truncate(MAX_COLUMNS);
 
     let base = &c.series[c.baseline];
+    // A cell of a row that is the baseline again and says better or
+    // worse is the method's noise, which the report says in its
+    // warnings and a card passed around alone has to say itself. Where
+    // every row is one, the card is an A/A check and not a comparison
+    // of schedulers, and is headed so.
+    let title = if check {
+        format!("{} compared with itself", fit(&base.label, 22))
+    } else {
+        format!("Schedulers compared with {}", fit(&base.label, 22))
+    };
+    let about = if check { CHECK.to_string() } else { baseline(&base.label, &base.file.scheduler) };
     let w = f64::from(WIDTH);
     let mut out = String::new();
     let _ = write!(
         out,
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH} {HEIGHT}" width="{WIDTH}" height="{HEIGHT}" role="img" aria-label="{}"><rect width="{WIDTH}" height="{HEIGHT}" fill="{PAGE}"/>"#,
-        esc(&format!("Schedulers compared with {}: {}", base.label, baseline(&base.label, &base.file.scheduler)))
+        esc(&format!("{title}: {about}"))
     );
 
     // Head: what this is, against what, on what. The baseline is named
@@ -338,10 +362,10 @@ pub fn svg(c: &Comparison) -> Option<String> {
         INK,
         r#" font-weight="bold""#,
         // Short enough to end before the name at the right, in bold.
-        &format!("Schedulers compared with {}", fit(&base.label, 22)),
+        &title,
     );
     text(&mut out, w - MARGIN, 70.0, 20, MUTED, r#" text-anchor="end""#, "helicoprion");
-    text(&mut out, MARGIN, 102.0, 20, INK_2, "", &baseline(&base.label, &base.file.scheduler));
+    text(&mut out, MARGIN, 102.0, 20, INK_2, "", &about);
     let sys = &base.file.system;
     let machine = [
         sys.cpu_model.as_deref().map(|m| fit(m, 44)),
@@ -367,7 +391,15 @@ pub fn svg(c: &Comparison) -> Option<String> {
     let mut numbers = false;
     for (j, series) in rows.iter().enumerate() {
         let y = GRID_TOP + row_h * j as f64;
-        text(&mut out, MARGIN, y + row_h / 2.0 + 7.0, 21, INK, "", &fit(&c.series[*series].label, 17));
+        // A row of the baseline's own scheduler says so under its name,
+        // in a card of other schedulers too.
+        let name = fit(&c.series[*series].label, 17);
+        if again.contains(series) {
+            text(&mut out, MARGIN, y + row_h / 2.0 + 1.0, 21, INK, "", &name);
+            text(&mut out, MARGIN, y + row_h / 2.0 + 17.0, 13, MUTED, "", AGAIN);
+        } else {
+            text(&mut out, MARGIN, y + row_h / 2.0 + 7.0, 21, INK, "", &name);
+        }
         for (k, workload) in workloads.iter().enumerate() {
             // No verdict where the two were not compared: the cell
             // stays empty, which is not "no clear difference".
@@ -600,6 +632,20 @@ mod tests {
         assert!(layout(&[one(">999×"), one("100%"), one("5.3%")], narrowest, 44.0).0);
         // Nothing to draw is nothing to refuse.
         assert_eq!(layout(&[], 81.0, 44.0), (true, Some(false)));
+    }
+
+    /// The line of an A/A check has no name in it, so that its width is
+    /// not a name's: it fits the card in the widest font the card is
+    /// likely to be drawn in, and so does the note under a row's name.
+    #[test]
+    fn the_lines_of_an_a_a_check_fit_whatever_the_names_are() {
+        // On the wide side: a sentence in DejaVu Sans, the widest of
+        // the likely fonts, averages about 0.5 em a character.
+        let width = |text: &str, px: f64| text.chars().count() as f64 * px * 0.62;
+        assert!(!CHECK.contains('{'));
+        let room = f64::from(WIDTH) - 2.0 * MARGIN;
+        assert!(width(CHECK, 20.0) <= room, "{}", width(CHECK, 20.0));
+        assert!(width(AGAIN, 13.0) <= NAMES, "{}", width(AGAIN, 13.0));
     }
 
     /// A PNG file of the card's size, where this build draws pictures
