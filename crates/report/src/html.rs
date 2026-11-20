@@ -454,6 +454,17 @@ fn aa_section(h: &mut String, c: &Comparison) {
                 esc(&cal.twin)
             );
         }
+        // A session that is balanced can have metrics that are not.
+        let uneven = cal.unbalanced_metrics();
+        if let Some(named) = crate::calibration::named_uneven(&uneven) {
+            let _ = write!(
+                line,
+                ". <strong>Not balanced for {}</strong>, which both arms have in some rounds only: {}; an effect of position is part of {} change, and of no other",
+                if uneven.len() == 1 { "one metric".to_string() } else { format!("{} metrics", uneven.len()) },
+                esc(&named),
+                if uneven.len() == 1 { "its" } else { "their" }
+            );
+        }
         let _ = write!(
             h,
             "<p class=cap>{line}.</p><div class=wide><table><tr><th class=l>Workload · metric</th><th>Change</th><th class=l>Scored</th><th>Later against earlier</th></tr>"

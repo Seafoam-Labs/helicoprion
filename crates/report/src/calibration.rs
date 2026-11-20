@@ -44,6 +44,9 @@ pub struct Noise {
     /// and in which after it. Equal numbers balance an effect of
     /// position; otherwise it is part of `delta`.
     pub led: (usize, usize),
+    /// The same for the session the metric is from, whatever its
+    /// metrics (`session_led`): the order the two arms were visited in.
+    pub session: (usize, usize),
 }
 
 /// The effect of being visited later in a round.
@@ -68,6 +71,52 @@ impl Noise {
     }
 }
 
+/// The order of the two arms over a session: in how many rounds `a` was
+/// visited before `b`, and in how many after. From the visits themselves,
+/// every round counted once, in which each arm has a valid run with its
+/// place in the session recorded, on any workload. Which metrics those
+/// runs have does not enter: a metric that both arms have in fewer rounds
+/// has an order of its own (`Noise::led`) and does not speak for the
+/// session, and neither does the best covered of them.
+pub fn session_led(a: &ResultFile, b: &ResultFile) -> (usize, usize) {
+    let visits = |f: &ResultFile| {
+        let mut first: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for r in f.workloads.iter().flat_map(|w| &w.runs).filter(|r| r.valid) {
+            if let (Some(round), Some(visit)) = (r.round, r.visit) {
+                first.entry(round).and_modify(|v| *v = (*v).min(visit)).or_insert(visit);
+            }
+        }
+        first
+    };
+    let (a, b) = (visits(a), visits(b));
+    let mut led = (0, 0);
+    for (round, at) in &a {
+        match b.get(round) {
+            Some(other) if at < other => led.0 += 1,
+            Some(_) => led.1 += 1,
+            None => {}
+        }
+    }
+    led
+}
+
+/// Up to three unevenly ordered metrics by name, each with its order,
+/// and how many more there are. `None` for none.
+pub fn named_uneven(uneven: &[&Noise]) -> Option<String> {
+    if uneven.is_empty() {
+        return None;
+    }
+    let mut named: Vec<String> = uneven
+        .iter()
+        .take(3)
+        .map(|m| format!("{} · {} (before in {}, after in {})", m.workload, m.metric, m.led.0, m.led.1))
+        .collect();
+    if uneven.len() > 3 {
+        named.push(format!("and {} more", uneven.len() - 3));
+    }
+    Some(named.join(", "))
+}
+
 /// A `--min-effect` to name as one that lies above `change`: rounded up
 /// at the digit shown, so that it does lie above.
 pub fn above(change: f64) -> String {
@@ -83,6 +132,9 @@ pub struct Calibration {
     pub twin: String,
     /// Every scored metric both arms have, in the report's order.
     pub metrics: Vec<Noise>,
+    /// In how many rounds the first arm was visited before its twin, and
+    /// in how many after (`session_led`).
+    pub session: (usize, usize),
 }
 
 impl Calibration {
@@ -103,22 +155,51 @@ impl Calibration {
         self.metrics.iter().max_by(|a, b| a.delta.median.abs().total_cmp(&b.delta.median.abs()))
     }
 
-    /// How often the first arm was visited before its twin and after it,
-    /// when the two numbers differ for some metric: the session did not
-    /// balance an effect of position (an odd number of rounds, or a
-    /// session cut short).
+    /// How often the first arm was visited before its twin and after it
+    /// over the session, when the two numbers differ: the session did
+    /// not balance an effect of position (an odd number of rounds, or a
+    /// session cut short). The session's own order (`session_led`), from
+    /// its visits, and not that of any metric: every metric of a session
+    /// that is three and three can be short of a round and be three and
+    /// two.
     pub fn unbalanced(&self) -> Option<(usize, usize)> {
-        self.metrics.iter().find(|m| !m.balanced()).map(|m| m.led)
+        Some(self.session).filter(|(before, after)| before != after)
     }
 
-    /// For the report's warnings: that the pair is unbalanced.
+    /// The metrics that are not balanced in a session that is: both arms
+    /// have them in some of the rounds only (a metric that is given from
+    /// a number of samples on, a run that failed), and in those the
+    /// first arm did not lead as often as it followed. Their change has
+    /// an effect of position in it that the rest do not. Empty where the
+    /// session itself is unbalanced, which says it of all of them.
+    pub fn unbalanced_metrics(&self) -> Vec<&Noise> {
+        if self.unbalanced().is_some() {
+            return Vec::new();
+        }
+        self.metrics.iter().filter(|m| !m.balanced()).collect()
+    }
+
+    /// For the report's warnings: that the pair is unbalanced, as a
+    /// session or in some of its metrics, and which of the two.
     pub fn balance_warning(&self) -> Option<String> {
-        let (before, after) = self.unbalanced()?;
+        if let Some((before, after)) = self.unbalanced() {
+            return Some(format!(
+                "A/A: {} was visited before {} in {before} rounds and after it in {after}. The order is not \
+                 balanced, so an effect of position within a round is part of the change between the two arms; \
+                 run an even number of rounds",
+                self.first, self.twin
+            ));
+        }
+        let uneven = self.unbalanced_metrics();
+        let named = named_uneven(&uneven)?;
         Some(format!(
-            "A/A: {} was visited before {} in {before} rounds and after it in {after}. The order is not balanced, \
-             so an effect of position within a round is part of the change between the two arms; run an even \
-             number of rounds",
-            self.first, self.twin
+            "A/A: {} and {} swapped places evenly over the session, but both have {} in some of its rounds only, \
+             and there unevenly: {named}. An effect of position within a round is part of the change of {} \
+             between the two arms, and of no other",
+            self.first,
+            self.twin,
+            if uneven.len() == 1 { "one metric".to_string() } else { format!("{} metrics", uneven.len()) },
+            if uneven.len() == 1 { "that metric" } else { "those metrics" },
         ))
     }
 
@@ -200,6 +281,7 @@ pub fn calibrate(c: &Comparison) -> Vec<Calibration> {
         .map(|pair| {
             let (a, b) = (&c.series[pair.first], &c.series[pair.twin]);
             let two = Comparison::build_core(vec![a.file.clone(), b.file.clone()], 0, c.opts);
+            let session = session_led(&a.file, &b.file);
             let metrics = two
                 .rows
                 .iter()
@@ -242,10 +324,11 @@ pub fn calibrate(c: &Comparison) -> Vec<Calibration> {
                         delta,
                         order,
                         led,
+                        session,
                     })
                 })
                 .collect();
-            Calibration { pair, first: a.label.clone(), twin: b.label.clone(), metrics }
+            Calibration { pair, first: a.label.clone(), twin: b.label.clone(), metrics, session }
         })
         .collect()
 }
@@ -368,6 +451,136 @@ pub(crate) mod tests {
     /// times. With a later visit that is 10% slower, two identical arms
     /// then differ by 10%; over six rounds they do not. The scoring is the
     /// same in both; the report says which session is unbalanced.
+    /// A session of six rounds is balanced, three and three. A metric
+    /// that both arms have in three of the rounds only can be two and
+    /// one, and that is said of the metric and not of the session: the
+    /// session is not called unbalanced and nobody is told to run an
+    /// even number of rounds who did.
+    #[test]
+    fn a_metric_short_of_rounds_does_not_speak_for_the_session() {
+        let position = |_: &str, _: u32, _: usize| 100.0;
+        let mut files = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
+        // A second metric, which the first arm lacks in round 2 and its
+        // twin in rounds 1 and 3: both have it in rounds 0, 4 and 5.
+        for (f, lacking) in files.iter_mut().zip([&[2][..], &[1, 3][..]]) {
+            for r in f.workloads[0].runs.iter_mut() {
+                let p99 = r.metrics["p99"].clone();
+                if !lacking.contains(&r.round.unwrap()) {
+                    r.metrics.insert("tail".into(), p99);
+                }
+            }
+        }
+        let c = Comparison::build(files.clone(), 0);
+        let cal = calibrate(&c).remove(0);
+        let led = |metric: &str| cal.metrics.iter().find(|m| m.metric == metric).unwrap().led;
+        assert_eq!((led("p99"), led("tail")), ((3, 3), (2, 1)));
+        assert_eq!((cal.session, session_led(&files[0], &files[1])), ((3, 3), (3, 3)));
+        assert_eq!(cal.unbalanced(), None);
+        let uneven = cal.unbalanced_metrics();
+        assert_eq!(uneven.iter().map(|m| m.metric.as_str()).collect::<Vec<_>>(), ["tail"]);
+        let workload = &uneven[0].workload;
+        let warning = cal.balance_warning().unwrap();
+        assert_eq!(
+            warning,
+            format!(
+                "A/A: scx_lavd and scx_lavd #2 swapped places evenly over the session, but both have one metric in \
+                 some of its rounds only, and there unevenly: {workload} · tail (before in 2, after in 1). An effect \
+                 of position within a round is part of the change of that metric between the two arms, and of no \
+                 other"
+            )
+        );
+        assert!(c.warnings.contains(&warning), "{:?}", c.warnings);
+        assert!(!c.warnings.iter().any(|w| w.contains("run an even number of rounds")), "{:?}", c.warnings);
+        let html = crate::html::report(&c);
+        assert!(
+            html.contains(&format!(
+                "<strong>Not balanced for one metric</strong>, which both arms have in some rounds only: {workload} \
+                 · tail (before in 2, after in 1); an effect of position is part of its change, and of no other"
+            )),
+            "{}",
+            &html[html.find("A/A check").unwrap()..][..1500]
+        );
+        assert!(!html.contains("<strong>Not balanced</strong>"));
+        // Across sessions it is not counted as a session that did not
+        // balance its order: with a second session that is whole, none
+        // of the two is. Sessions of five rounds are, both.
+        let across = |one: &[ResultFile], rounds: u32| {
+            let other = only(aa_session("bb", 2000, &["scx_lavd", "scx_lavd #2"], rounds, position));
+            let files: Vec<(String, ResultFile)> =
+                one.iter().cloned().chain(other).enumerate().map(|(i, f)| (format!("{i}.json"), f)).collect();
+            let cover =
+                crate::sessions::analyse(files, crate::compare::Options::default()).unwrap().coverage("scx_lavd #2");
+            (cover.measured, cover.unbalanced)
+        };
+        assert_eq!(across(&files, 6), (2, 0));
+        let five = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 5, position));
+        assert_eq!(across(&five, 5), (2, 2));
+        // With the metric in every round there is nothing to say.
+        let whole = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
+        let cal = calibrate(&Comparison::build(whole, 0)).remove(0);
+        assert_eq!((cal.unbalanced(), cal.unbalanced_metrics().len(), cal.balance_warning()), (None, 0, None));
+    }
+
+    /// No metric has to cover the session for the session to be known:
+    /// six rounds, three and three, in which the only two metrics both
+    /// miss a round, one being three and two and the other two and
+    /// three. The best covered metric would call the session unbalanced
+    /// either way. The session's order is that of its visits.
+    #[test]
+    fn the_order_of_a_session_is_that_of_its_visits_not_of_a_metric() {
+        let position = |_: &str, _: u32, _: usize| 100.0;
+        let mut files = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
+        // "p99" is not measured by the twin in round 5, and "tail" not
+        // by the first arm in round 4: neither is in all six rounds.
+        for (i, f) in files.iter_mut().enumerate() {
+            for r in f.workloads[0].runs.iter_mut() {
+                let (round, p99) = (r.round.unwrap(), r.metrics["p99"].clone());
+                if !(i == 0 && round == 4) {
+                    r.metrics.insert("tail".into(), p99);
+                }
+                if i == 1 && round == 5 {
+                    r.metrics.remove("p99");
+                }
+            }
+        }
+        let c = Comparison::build(files.clone(), 0);
+        let cal = calibrate(&c).remove(0);
+        let led = |metric: &str| cal.metrics.iter().find(|m| m.metric == metric).unwrap().led;
+        // The first arm leads in rounds 0, 2 and 4.
+        assert_eq!((led("p99"), led("tail")), ((3, 2), (2, 3)));
+        assert_eq!((cal.session, cal.unbalanced()), ((3, 3), None));
+        assert!(cal.metrics.iter().all(|m| m.session == (3, 3)));
+        // Both metrics are named, each with its own order, and nobody
+        // is told to run an even number of rounds.
+        let uneven: Vec<_> = cal.unbalanced_metrics().iter().map(|m| (m.metric.as_str(), m.led)).collect();
+        assert_eq!(uneven, [("p99", (3, 2)), ("tail", (2, 3))]);
+        let warning = cal.balance_warning().unwrap();
+        assert!(
+            warning.contains("swapped places evenly over the session, but both have 2 metrics in some"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("· p99 (before in 3, after in 2)") && warning.contains("· tail (before in 2, after in 3)")
+        );
+        assert!(warning.ends_with("of those metrics between the two arms, and of no other"), "{warning}");
+        assert!(!c.warnings.iter().any(|w| w.contains("run an even number of rounds")), "{:?}", c.warnings);
+        let html = crate::html::report(&c);
+        assert!(
+            html.contains("<strong>Not balanced for 2 metrics</strong>")
+                && !html.contains("<strong>Not balanced</strong>")
+        );
+        // A run that is not valid is not a visit: with the twin's run
+        // of round 5 failed, five rounds are left, three and two, and
+        // that is the session's.
+        let mut cut = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
+        cut[1].workloads[0].runs.iter_mut().filter(|r| r.round == Some(5)).for_each(|r| r.valid = false);
+        assert_eq!(session_led(&cut[0], &cut[1]), (3, 2));
+        // Without recorded visits nothing is known, and nothing said.
+        let mut blind = only(aa_session("aa", 1000, &["scx_lavd", "scx_lavd #2"], 6, position));
+        blind.iter_mut().flat_map(|f| f.workloads[0].runs.iter_mut()).for_each(|r| r.visit = None);
+        assert_eq!(session_led(&blind[0], &blind[1]), (0, 0));
+    }
+
     #[test]
     fn an_odd_number_of_rounds_leaves_the_position_effect_in_the_change() {
         let position = |_: &str, _: u32, position: usize| if position == 0 { 100.0 } else { 110.0 };
@@ -384,6 +597,8 @@ pub(crate) mod tests {
         // −10, +9.1, −10, +9.1, −10: the median is the position effect.
         assert!((p99.delta.median + 10.0).abs() < 0.5, "{:?}", p99.delta);
         assert_eq!(five.unbalanced(), Some((3, 2)));
+        // The session says it of every metric; none is singled out.
+        assert!(five.unbalanced_metrics().is_empty());
         assert_eq!(
             warnings,
             [

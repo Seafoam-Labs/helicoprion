@@ -1117,7 +1117,11 @@ The report's A/A check lists every scored metric of the pair:
   swap places every round, so over an even number of rounds an effect of
   position, such as a machine that
   is warmer for whichever arm comes second, cancels in the change and shows
-  here.
+  here. That is so for a metric both arms have in every round. One that is
+  given only from a number of samples on can be missing from some rounds of
+  an arm, and over the rounds both have it the order need not be even: two
+  and one in a session that is three and three. The report says so of that
+  metric, and does not call the session unbalanced for it.
 
 One A/A session is one observation of the noise. Lay several side by side
 with `sessions` before settling on a threshold. Nothing here changes a

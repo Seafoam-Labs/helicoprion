@@ -510,7 +510,9 @@ pub struct Coverage {
     /// the missing interval is.
     pub with_interval: usize,
     /// Of the measured: sessions where the order of the arms was not
-    /// balanced (`Noise::balanced`).
+    /// balanced over the session (`Noise::session`, from its visits). A
+    /// balanced session whose metrics both arms have in some rounds
+    /// only is not one of them.
     pub unbalanced: usize,
 }
 
@@ -524,7 +526,7 @@ impl Analysis {
             sessions: self.sessions.len(),
             measured: count(&|i| in_session(i).next().is_some()),
             with_interval: count(&|i| in_session(i).any(|n| n.delta.ci.is_some())),
-            unbalanced: count(&|i| in_session(i).any(|n| !n.balanced())),
+            unbalanced: count(&|i| in_session(i).next().is_some_and(|n| n.session.0 != n.session.1)),
         }
     }
 
