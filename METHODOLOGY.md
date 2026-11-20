@@ -1262,15 +1262,14 @@ one of the changes the verdict counts and is written as the report writes
 it, a multiple from 2× up and a percentage below, without the sign and
 without the metric's name, for which a cell has no room. It is the most
 that was found and not what is typical of the workload, and the card says
-so in its head: a cell with "63×" can stand for one metric of a dozen. Two
-things are left without a size. A clear change to nothing, a share that
-went from some to none, is counted in the verdict and has a direction but
-no size, since it reads "100%" whatever it was before; a cell that rests on
-such changes alone has its mark and its word only, and where there are
-others the size is the largest of those, which the card's head says in
-"changes to zero aside". And a mixed cell shows
-both of its sizes or neither, since one of them alone would be read as all
-there is. Sizes are drawn where the card has room for them in every cell
+so in its head: a cell with "63×" can stand for one metric of a dozen. A
+share of counted events that went from some to none is not among those
+changes: with events on one side only it is not compared at all ("Shares of
+counted events"), so it is not in the verdict and cannot be the size next
+to it. Should any other clear change be one to nothing, which reads "100%"
+whatever it was before, it is passed over for the next largest. A mixed
+cell shows both of its sizes or neither, since one of them alone would be
+read as all there is. Sizes are drawn where the card has room for them in every cell
 that has any: on a card with many workloads the two of a mixed cell go one
 above the other, and with many schedulers as well they are left out, for
 all mixed cells of that card alike.

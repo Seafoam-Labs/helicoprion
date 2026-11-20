@@ -769,9 +769,11 @@ pub struct Summary {
     pub top: Vec<(String, Delta)>,
     /// The largest clear change for the better and the largest for the
     /// worse, of all of them and not of `top` alone: what the card puts
-    /// next to a verdict. A change to nothing, where one side's median
-    /// is zero, is clear and counted but is not given here: it has a
-    /// direction and no size ("+100%" whatever the baseline was).
+    /// next to a verdict. A change to nothing, where one side's value is
+    /// zero, is not given here: it has a direction and no size ("+100%"
+    /// whatever the baseline was). A share of counted events cannot be
+    /// one, being compared only with events on both sides; this is for
+    /// whatever else might.
     pub largest: [Option<Delta>; 2],
 }
 
@@ -3411,7 +3413,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // One above the other: the two of a cell share their x.
         assert!(drawn.chunks(2).all(|two| two[0].0 == two[1].0 && two[0].1 < two[1].1), "{drawn:?}");
         inside(&card);
-        assert!(card.contains("Numbers: the largest clear change in that direction (changes to zero aside)<"));
+        assert!(card.contains("Numbers: the largest clear change in that direction<"));
 
         // Seven schedulers on twelve workloads: no room for two sizes in
         // any mixed cell, and none in any; the line says nothing of
@@ -3507,7 +3509,7 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert_eq!(briefs.iter().map(|b| b.verdict).collect::<Vec<_>>(), [Verdict::Better; 2]);
         assert_eq!(card.matches(r##"font-size="13" fill="#0b0b0b">10%</text>"##).count(), 2, "{card}");
         assert!(card.contains(
-            ">Rows: schedulers  ·  Columns: workloads  ·  Numbers: the largest clear change in that direction (changes to zero aside)<"
+            ">Rows: schedulers  ·  Columns: workloads  ·  Numbers: the largest clear change in that direction<"
         ));
         // The legend's sample cells have none.
         assert_eq!(card.matches(r#"font-size="13""#).count(), 2);

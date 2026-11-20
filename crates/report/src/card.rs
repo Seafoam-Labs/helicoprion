@@ -406,11 +406,9 @@ pub fn svg(c: &Comparison) -> Option<String> {
     // both from the left. Side by side they ran into each other once
     // the second had rows or columns to name as missing.
     // What a number is, where the card has any: the most, not the
-    // typical, which is the one thing about it a reader has to know,
-    // and the most of those that have a size: a change to zero can be
-    // the larger one and is not what stands there.
+    // typical, which is the one thing about it a reader has to know.
     let reading = if numbers {
-        "Rows: schedulers  ·  Columns: workloads  ·  Numbers: the largest clear change in that direction (changes to zero aside)"
+        "Rows: schedulers  ·  Columns: workloads  ·  Numbers: the largest clear change in that direction"
     } else {
         "Rows: schedulers  ·  Columns: workloads  ·  Compared with the baseline"
     };
