@@ -120,9 +120,11 @@ helicoprion compare default.json lavd.json -o report.html --svg-dir charts/
 
 `--png card.png` writes the result card: one picture with a cell for every
 scheduler and workload that says whether the scheduler did better than the
-baseline, worse, both, or neither clearly. It is for places that preview a
-picture and not a page, such as a chat, and it leaves out how large and how
-certain a difference is, so it goes with the report and not instead of it.
+baseline, worse, both, or neither clearly, with the largest clear change in
+that direction next to it. It is for places that preview a picture and not
+a page, such as a chat. The number is the most that was found, not what is
+typical, and the card leaves out every other change and how certain each
+is, so it goes with the report and not instead of it.
 `matrix` writes it as `card.png` next to `report.html`. Drawing it needs a
 font on the machine. A build without pictures (`cargo install helicoprion
 --no-default-features`) is smaller and leaves the card out; `--svg-dir`

@@ -24,6 +24,9 @@ pub struct Brief {
     /// What changes how the points should be read: the two schedulers did
     /// not produce the same mix of round trips.
     pub note: Option<String>,
+    /// The largest clear change for the better and for the worse, of
+    /// those the verdict counts (`Summary::largest`).
+    pub largest: [Option<crate::compare::Delta>; 2],
 }
 
 /// What a workload measures, for someone who has not read the README.
@@ -572,7 +575,15 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 (Some(a), Some(m)) => Some(format!("{a} {m}")),
                 (a, m) => a.or(m),
             };
-            Brief { series: i, workload: s.workload.clone(), title: title(w), verdict: s.verdict(), points, note }
+            Brief {
+                series: i,
+                workload: s.workload.clone(),
+                title: title(w),
+                verdict: s.verdict(),
+                points,
+                note,
+                largest: s.largest,
+            }
         })
         .collect()
 }
@@ -798,6 +809,7 @@ mod tests {
             verdict: Verdict::NoClearDifference,
             points: Vec::new(),
             note: None,
+            largest: [None, None],
         }
     }
 

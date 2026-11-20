@@ -55,7 +55,7 @@ fn text_w(s: &str) -> f64 {
 
 /// Whether a goodness ratio is shown as a multiple: `Some(true)` for "N×
 /// better" (2× or more), `Some(false)` for "N× worse", `None` for a percentage.
-fn multiple(r: f64) -> Option<bool> {
+pub(crate) fn multiple(r: f64) -> Option<bool> {
     if r.is_finite() && r >= 2.0 {
         Some(true)
     } else if r > 0.0 && r <= 0.5 {

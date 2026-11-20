@@ -609,6 +609,12 @@ pub struct Summary {
     pub uneven: usize,
     /// The largest clear changes (up to three), largest first.
     pub top: Vec<(String, Delta)>,
+    /// The largest clear change for the better and the largest for the
+    /// worse, of all of them and not of `top` alone: what the card puts
+    /// next to a verdict. A change to nothing, where one side's median
+    /// is zero, is clear and counted but is not given here: it has a
+    /// direction and no size ("+100%" whatever the baseline was).
+    pub largest: [Option<Delta>; 2],
 }
 
 impl Summary {
@@ -768,6 +774,7 @@ impl Comparison {
                     worse: 0,
                     uneven: 0,
                     top: Vec::new(),
+                    largest: [None, None],
                 };
                 for r in self.rows.iter().filter(|r| r.workload == *w && !r.extreme) {
                     let Some(d) = r.improvement(self.baseline, i) else { continue };
@@ -800,6 +807,13 @@ impl Comparison {
                     let (a, b) = (size(&a.1), size(&b.1));
                     b.0.cmp(&a.0).then(b.1.total_cmp(&a.1))
                 });
+                // The first of each direction, before the list is cut:
+                // its three can all point one way.
+                let sized = |d: &&Delta| d.ratio.is_finite() && d.ratio > 0.0;
+                let first = |better: bool| {
+                    s.top.iter().map(|(_, d)| d).filter(sized).find(|d| (d.median > 0.0) == better).copied()
+                };
+                s.largest = [first(true), first(false)];
                 s.top.truncate(3);
                 if s.compared > 0 {
                     out.push(s);
@@ -2762,6 +2776,9 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         // In its cell, and twice in the legend, as the sample cell and
         // as its meaning; "mixed" only as the legend's sample cell.
         assert_eq!((card.matches(">worse<").count(), card.matches(">mixed<").count()), (3, 1));
+        // With the size of what is worse: p99, 35% above the baseline's.
+        assert_eq!(summary.largest.map(|d| d.map(|d| d.median.round())), [None, Some(-35.0)]);
+        assert!(card.contains(">35%</text>"), "{card}");
         let text = crate::simple::text(&c);
         assert!(
             text.contains(
@@ -2812,6 +2829,16 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let c = build((20, 0));
         assert_eq!(reason(&c), None);
         assert_eq!(verdict(&c), Verdict::Mixed);
+        // A share that went to nothing is better and has no size to
+        // give: "100%" whatever it was before. It is among the largest
+        // clear changes of the summary and not what the card would put
+        // next to a mark, and a mixed cell with one size only shows
+        // none, so this card has no number at all.
+        let summary = &c.summary()[0];
+        assert!(summary.top.iter().any(|(m, d)| m == "rtt_blocked_slow_pct" && d.ratio.is_infinite()));
+        assert_eq!(summary.largest.map(|d| d.map(|d| d.median.round())), [None, Some(-35.0)]);
+        let card = crate::card::svg(&c).unwrap();
+        assert!(card.contains(">mixed<") && !card.contains(r#"font-size="13""#), "{card}");
         // A share that is scored is shown as a change, as before.
         let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
         assert_eq!(c.few_events(row, 1), None);
@@ -2963,6 +2990,162 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         assert!(!old.contains("quartile"), "{old}");
     }
 
+    /// A session of `schedulers` candidates against "base" on `workloads`
+    /// workloads, every metric of `metrics` (name, the candidate's value
+    /// as a multiple of the baseline's) lower-is-better and the same in
+    /// every round but for the drift both sides share.
+    fn card_session(schedulers: usize, workloads: usize, metrics: &[(&str, f64)]) -> Vec<ResultFile> {
+        let pair = drifting_session();
+        let mut files = vec![pair[0].clone()];
+        files.extend((0..schedulers).map(|k| {
+            let mut f = pair[1].clone();
+            f.label = format!("scx_{k}");
+            f
+        }));
+        for (k, f) in files.iter_mut().enumerate() {
+            for r in f.workloads[0].runs.iter_mut() {
+                let drifted = r.metrics.remove("p99").unwrap().value / if k == 0 { 1.0 } else { 0.9 };
+                for (name, factor) in metrics {
+                    let factor = if k == 0 { 1.0 } else { *factor };
+                    r.metrics.insert((*name).into(), Metric::lower(drifted * factor, "us"));
+                }
+            }
+            let first = f.workloads[0].clone();
+            f.workloads = (0..workloads)
+                .map(|w| {
+                    let mut one = first.clone();
+                    one.name = format!("load-{w}/case");
+                    one
+                })
+                .collect();
+        }
+        files
+    }
+
+    /// The size next to a mark is the largest clear change that way of
+    /// all of them, not of the three the summary lists: those can all
+    /// point one way, and a mixed cell would lose the other.
+    #[test]
+    fn the_largest_change_each_way_is_not_limited_to_the_listed_three() {
+        let files = card_session(1, 1, &[("a", 8.0), ("b", 6.0), ("c", 4.0), ("d", 1.0 / 3.0)]);
+        let c = Comparison::build(files, 0);
+        let s = &c.summary()[0];
+        assert_eq!((s.better, s.worse, s.verdict()), (1, 3, Verdict::Mixed));
+        let top: Vec<(&str, String)> = s.top.iter().map(|(m, d)| (m.as_str(), crate::svg::fmt_delta(d))).collect();
+        assert_eq!(
+            top,
+            [("a", "8.0× worse".to_string()), ("b", "6.0× worse".to_string()), ("c", "4.0× worse".to_string())]
+        );
+        let [better, worse] = s.largest.map(|d| d.map(|d| crate::svg::fmt_delta(&d)));
+        assert_eq!((better.as_deref(), worse.as_deref()), (Some("3.0× better"), Some("8.0× worse")));
+        // And the card has both, side by side in a card this small.
+        let card = crate::card::svg(&c).unwrap();
+        assert!(card.contains(">3.0×</text>") && card.contains(">8.0×</text>"), "{card}");
+        // One direction only: the other has none, and is not made up.
+        let c = Comparison::build(card_session(1, 1, &[("a", 8.0), ("b", 6.0)]), 0);
+        assert_eq!(c.summary()[0].largest.map(|d| d.is_some()), [false, true]);
+    }
+
+    /// The card at its limits, as markup: every size inside its own
+    /// cell by the widths the card reckons with, and the rule on which
+    /// sizes are drawn the same for every cell of a card.
+    #[test]
+    fn a_full_card_keeps_its_sizes_inside_their_cells() {
+        // (x, y, text) of every size on a card, and its cells' boxes.
+        let sizes = |card: &str| -> Vec<(f64, f64, String)> {
+            card.split("<text ")
+                .skip(1)
+                .filter(|t| t.contains(r#"font-size="13""#))
+                .map(|t| {
+                    let attr = |name: &str| -> f64 {
+                        let from = t.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+                        t[from..from + t[from..].find('"').unwrap()].parse().unwrap()
+                    };
+                    let body = &t[t.find('>').unwrap() + 1..t.find("</text>").unwrap()];
+                    (attr("x"), attr("y"), body.to_string())
+                })
+                .collect()
+        };
+        let boxes = |card: &str| -> Vec<[f64; 4]> {
+            card.split("<rect ")
+                .skip(2)
+                .map(|t| {
+                    // Its own attributes come first, the first of them
+                    // at the very start.
+                    let t = format!(" {t}");
+                    let attr = |name: &str| -> f64 {
+                        let from = t.find(&format!(" {name}=\"")).unwrap() + name.len() + 3;
+                        t[from..from + t[from..].find('"').unwrap()].parse().unwrap()
+                    };
+                    [attr("x"), attr("y"), attr("width"), attr("height")]
+                })
+                .collect()
+        };
+        // Widths as the card estimates them, for the widest font.
+        let width = |s: &str| -> f64 {
+            s.chars()
+                .map(|c| match c {
+                    '.' => 4.2,
+                    '%' => 12.4,
+                    '×' | '&' => 10.9,
+                    _ => 8.3,
+                })
+                .sum()
+        };
+        let inside = |card: &str| {
+            let boxes = boxes(card);
+            for (x, y, s) in sizes(card) {
+                let s = s.replace("&gt;", "&");
+                let (right, top) = (x + width(&s), y - 10.0);
+                assert!(
+                    boxes
+                        .iter()
+                        .any(|[bx, by, w, h]| *bx <= x - 17.0 && right <= bx + w && *by <= top && y + 3.0 <= by + h),
+                    "{s} at {x}, {y}"
+                );
+            }
+        };
+        let mixed = [("fast", 1.0 / 63.2), ("slow", 2.9)];
+
+        // Twelve workloads, five schedulers, every cell mixed: the two
+        // sizes one above the other, in all sixty cells.
+        let card = crate::card::svg(&Comparison::build(card_session(5, 12, &mixed), 0)).unwrap();
+        let drawn = sizes(&card);
+        assert_eq!(drawn.len(), 120);
+        assert_eq!(drawn.iter().filter(|(_, _, s)| s == "63×").count(), 60);
+        assert_eq!(drawn.iter().filter(|(_, _, s)| s == "2.9×").count(), 60);
+        // One above the other: the two of a cell share their x.
+        assert!(drawn.chunks(2).all(|two| two[0].0 == two[1].0 && two[0].1 < two[1].1), "{drawn:?}");
+        inside(&card);
+        assert!(card.contains("Numbers: the largest clear change in that direction (changes to zero aside)<"));
+
+        // Seven schedulers on twelve workloads: no room for two sizes in
+        // any mixed cell, and none in any; the line says nothing of
+        // numbers, since there are none.
+        let card = crate::card::svg(&Comparison::build(card_session(7, 12, &mixed), 0)).unwrap();
+        assert_eq!(card.matches(">mixed<").count(), 84 + 1);
+        assert!(sizes(&card).is_empty());
+        assert!(card.contains("Compared with the baseline<"));
+
+        // The same grid with one direction only, and the widest size
+        // there is: single sizes fit the narrowest column the card has.
+        let worse = [("slow", 3377.0)];
+        let card = crate::card::svg(&Comparison::build(card_session(7, 12, &worse), 0)).unwrap();
+        let drawn = sizes(&card);
+        assert_eq!(drawn.len(), 84);
+        assert!(drawn.iter().all(|(_, _, s)| s == "&gt;999×"), "{drawn:?}");
+        inside(&card);
+
+        // More than fits: what is missing is said, and the sizes of what
+        // is drawn stay.
+        let card = crate::card::svg(&Comparison::build(card_session(8, 13, &worse), 0)).unwrap();
+        assert!(card.contains(
+            ">Not shown: 1 more scheduler and 1 more workload. Every change and its certainty are in the report.<"
+        ));
+        assert_eq!(sizes(&card).len(), 84);
+        inside(&card);
+    }
+
     /// The card says what the plain view's headings say, for every
     /// scheduler and workload, and nothing where there is nothing to say.
     #[test]
@@ -3002,14 +3185,30 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         }
         // The line on how to read it and the one on what it leaves out
         // do not share a height, however long the second gets.
-        for (line, y) in [("Rows: schedulers", crate::card::READING), ("Sizes, certainty", crate::card::CAVEAT)] {
+        for (line, y) in [("Rows: schedulers", crate::card::READING), ("Every change", crate::card::CAVEAT)] {
             assert!(
                 card.contains(&format!(r#"x="48.0" y="{y:.1}" font-family="sans-serif" font-size="15""#)),
                 "{line}"
             );
             assert_eq!(card.matches(&format!(r#" y="{y:.1}""#)).count(), 1, "{line}");
         }
-        assert!(card.contains(">Rows: schedulers  ·  Columns: workloads  ·  Compared with the baseline<"));
+        // The candidate is 10% better in both, and the cells say so
+        // next to their marks, in the ink of the text; the line on how
+        // to read the card says what the number is.
+        assert_eq!(briefs.iter().map(|b| b.verdict).collect::<Vec<_>>(), [Verdict::Better; 2]);
+        assert_eq!(card.matches(r##"font-size="13" fill="#0b0b0b">10%</text>"##).count(), 2, "{card}");
+        assert!(card.contains(
+            ">Rows: schedulers  ·  Columns: workloads  ·  Numbers: the largest clear change in that direction (changes to zero aside)<"
+        ));
+        // The legend's sample cells have none.
+        assert_eq!(card.matches(r#"font-size="13""#).count(), 2);
+        // Where no cell has a number the line does not speak of any.
+        let mut same = files.clone();
+        same[1] = same[0].clone();
+        same[1].label = "cand".into();
+        let none = crate::card::svg(&Comparison::build(same, 0)).unwrap();
+        assert!(!none.contains(r#"font-size="13""#) && none.contains(">unclear<"), "{none}");
+        assert!(none.contains(">Rows: schedulers  ·  Columns: workloads  ·  Compared with the baseline<"));
         // What it leaves out is said on it.
         assert!(card.contains("are in the report.<"));
         // A single result has nothing to compare, and no card.
