@@ -193,8 +193,9 @@ impl Calibration {
             let paired = before + after;
             let advice = match self.rounds {
                 Some(rounds) if rounds.is_multiple_of(2) && paired < rounds as usize => format!(
-                    "only {paired} of the session's {rounds} rounds have a valid run of both arms, so the even \
-                     number of rounds did not balance it; see which runs are missing or not valid"
+                    "only {paired} of the session's {rounds} rounds have a valid run of both arms with its place \
+                     in the session recorded, so the even number of rounds did not balance it; see which runs are \
+                     missing, not valid or without their visit"
                 ),
                 _ => "run an even number of rounds".to_string(),
             };
@@ -600,8 +601,8 @@ pub(crate) mod tests {
             cal.balance_warning().unwrap(),
             "A/A: scx_lavd was visited before scx_lavd #2 in 3 rounds and after it in 2. The order is not balanced, \
              so an effect of position within a round is part of the change between the two arms; only 5 of the \
-             session's 6 rounds have a valid run of both arms, so the even number of rounds did not balance it; \
-             see which runs are missing or not valid"
+             session's 6 rounds have a valid run of both arms with its place in the session recorded, so the even \
+             number of rounds did not balance it; see which runs are missing, not valid or without their visit"
         );
         assert!(!c.warnings.iter().any(|w| w.contains("run an even number of rounds")), "{:?}", c.warnings);
         // Without recorded visits nothing is known, and nothing said.
