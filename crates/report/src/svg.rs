@@ -105,20 +105,54 @@ pub fn fmt_delta(d: &crate::compare::Delta) -> String {
 /// end, and both ends of an interval across no change, are rounded.
 ///
 /// Representation only: the ends are the ones given.
+/// From here on the far end of an interval is given as `FAR_END`.
+const FAR: f64 = 999.5;
+const FAR_END: &str = ">999×";
+
 pub fn fmt_interval(d: &crate::compare::Delta, lo: f64, hi: f64) -> String {
     // `Some(true)`: the estimate is "N× better"; `Some(false)`: "N× worse".
     let estimate = multiple(d.ratio);
+    // What a far end on the estimate's side is cut short to: beyond
+    // three digits, and never short of the cautious end next to it.
+    // "2000× … >999×" would name the far end with the smaller number;
+    // it is "2000× … >2000×".
+    let beyond = estimate
+        .and_then(|better| {
+            let cautious = if lo > 0.0 {
+                lo
+            } else if hi < 0.0 {
+                hi
+            } else {
+                return None;
+            };
+            let r = d.ratio_of(cautious);
+            Some(if better { r } else { 1.0 / r }).filter(|x| x.is_finite() && *x >= FAR)
+        })
+        .map_or(FAR_END.to_string(), |x| format!(">{}×", times_cut(x)));
     let end = |c: f64, cautious: bool| {
         let times = |x: f64| if cautious { times_cut(x) } else { times(x) };
         let r = d.ratio_of(c);
+        // The far end of an interval can be any distance off: that of
+        // a share of counted events ends at "60354213× better" where
+        // the other side is left with a fraction of an effective event.
+        // Past three digits the number says only that the end is far,
+        // and is given as that. The cautious end is the one that is
+        // read, and is never cut short. An end without a finite ratio,
+        // a value of zero, stays the percentage it is, as below.
+        let far = |x: f64| !cautious && x.is_finite() && x >= FAR;
         // On the estimate's side, as a bare multiple even below 2×.
         if let Some(better) = estimate {
             let x = if better { r } else { 1.0 / r };
+            if far(x) {
+                return (beyond.clone(), true);
+            }
             if x.is_finite() && x >= 1.0 {
                 return (format!("{}×", times(x)), true);
             }
         }
         let text = match multiple(r) {
+            Some(true) if far(r) => format!("{FAR_END} better"),
+            Some(false) if far(1.0 / r) => format!("{FAR_END} worse"),
             Some(true) => format!("{}× better", times(r)),
             Some(false) if (1.0 / r).is_finite() => format!("{}× worse", times(1.0 / r)),
             _ if cautious => pct_cut(c),
@@ -665,6 +699,31 @@ mod tests {
         assert_eq!(fmt_interval(&d(-200.0, 1.0 / 3.0, Better::Lower), -500.0, 10.0), "+10.0% … 6.0× worse");
         // The same for a better estimate: the small end first.
         assert_eq!(fmt_interval(&d(66.7, 3.0, Better::Lower), -10.0, 83.3), "\u{2212}10.0% … 6.0× better");
+        // A far end past three digits says only that it is far: the
+        // intervals of shares of counted events end at "60354213×". An
+        // end at a share of zero has no ratio and stays "+100.0%".
+        let fifty = d(98.0, 50.0, Better::Lower);
+        assert_eq!(fmt_interval(&fifty, 62.0, 99.999_998_3), "2.6× … >999×");
+        assert_eq!(fmt_interval(&fifty, 62.0, 100.0), "2.6× better … +100.0%");
+        assert_eq!(fmt_interval(&fifty, 62.0, 99.89), "2.6× … 909×");
+        let worse = d(-14_900.0, 1.0 / 150.0, Better::Lower);
+        assert_eq!(fmt_interval(&worse, -9_999_900.0, -4400.0), "45× … >999×");
+        assert_eq!(fmt_interval(&worse, -93_700.0, -4400.0), "45× … 938×");
+        // An estimate in percent with a far end in multiples.
+        assert_eq!(fmt_interval(&d(40.0, 1.67, Better::Lower), -10.0, 99.9999), "\u{2212}10.0% … >999× better");
+        assert_eq!(fmt_interval(&d(-40.0, 0.714, Better::Lower), -200_000.0, 10.0), ">999× worse … +10.0%");
+        // The cautious end is never cut short, however large.
+        // And the far end is never named with a smaller number than
+        // the cautious one: beyond it, not beyond 999.
+        let huge = d(99.97, 3377.0, Better::Lower);
+        assert_eq!(fmt_interval(&huge, 99.95, 99.999), "2000× … >2000×");
+        // That holds for a far end only a little further out, too: one
+        // rule, and past three digits no end is spelt out but the
+        // cautious one.
+        assert_eq!(fmt_interval(&huge, 99.95, 99.96), "2000× … >2000×");
+        assert_eq!(fmt_interval(&huge, 99.0, 99.999), "100× … >999×");
+        let far_worse = d(-299_900.0, 1.0 / 3000.0, Better::Lower);
+        assert_eq!(fmt_interval(&far_worse, -9_999_900.0, -150_670.0), "1507× … >1507×");
         // No multiple, no conversion.
         assert_eq!(fmt_interval(&d(-11.4, 0.886, Better::Higher), -12.2, -9.3), "\u{2212}12.2% … \u{2212}9.3%");
         // Both sides of no change, both ends far: seen in one matrix.
