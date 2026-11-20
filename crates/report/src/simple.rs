@@ -335,6 +335,21 @@ fn wake_rate(c: &Comparison, workload: &str, i: usize) -> Option<String> {
     ))
 }
 
+/// How late idle-wake's wakers were for their timers: the other wake-up
+/// of each round, on the same sleeping machine. Not scored: how much of
+/// it is the scheduler's is not known, and it is said so that a reader
+/// does not take the task's delay for the whole of waking up.
+fn timer_late(c: &Comparison, workload: &str, i: usize) -> Option<String> {
+    let row = c.rows.iter().find(|r| r.workload == workload && r.metric == "timer_late_p50")?;
+    let (b, v) = medians(row, c.baseline, i)?;
+    Some(format!(
+        "The waking thread itself ran {} µs after its timer, typically ({} µs under {}; observed, not scored)",
+        fmt_value(v),
+        fmt_value(b),
+        c.series[c.baseline].label
+    ))
+}
+
 /// How cgroup-fair's two groups shared the CPU time, next to what their
 /// weights ask for, and under the baseline. Observed, not scored: the
 /// score is in how closely the split follows the weights. Where the
@@ -505,6 +520,7 @@ pub fn briefs(c: &Comparison) -> Vec<Brief> {
                 // idle-wake: its delays are `wake_*`, above; here where
                 // the task was put, and whether the machine slept.
                 placement(c, w, i),
+                timer_late(c, w, i),
                 wake_rate(c, w, i),
                 // Any workload, where it was recorded.
                 mechanism(c, w, i),

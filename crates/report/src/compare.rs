@@ -2668,6 +2668,8 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
                     r.metrics.insert("prev_cpu_pct".into(), Metric::info(100.0 - same, "%"));
                     r.metrics
                         .insert("wakes_per_s".into(), Metric::info(if same > 50.0 { 150.5 } else { 197.0 }, "1/s"));
+                    let late = if same > 50.0 { 12.0 } else { 640.0 };
+                    r.metrics.insert("timer_late_p50".into(), Metric::info(late, "us"));
                     if let Some(deep) = deep {
                         r.metrics.insert("idle_deepest_pct".into(), Metric::info(deep, "%"));
                     }
@@ -2683,6 +2685,14 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
             text.contains(
                 "• Ran on the CPU of the thread that woke it: 97% of wake-ups (2% under base); the CPUs were in \
                  their deepest idle state 88% of the time (91% under base) (observed, not scored)"
+            ),
+            "{text}"
+        );
+        // The waker's own wake-up is said next to the task's, unscored.
+        assert!(
+            text.contains(
+                "• The waking thread itself ran 12.0 µs after its timer, typically (640 µs under base; observed, not \
+                 scored)"
             ),
             "{text}"
         );

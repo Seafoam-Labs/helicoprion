@@ -20,6 +20,18 @@
 //!
 //! * `wake`: from the waker's reading of the clock, right before its
 //!   call, to the woken task running. Scored, lower is better.
+//! * `timer_late`: how long after the instant its timer was set for the
+//!   waker read the clock, for every wake-up it sent. This is the other
+//!   wake-up of each round, by a timer and not by a thread, on a machine
+//!   just as asleep, and where it was seen before (the waker of
+//!   wake-burst) it was the larger of the two by far. Informational: it
+//!   holds the timer's own lateness, the time to leave the idle state,
+//!   the scheduler's time to run the waker and a few instructions of
+//!   this workload, and how much of that a scheduler decides is not
+//!   known. It is a population of its own. Its quantiles and those of
+//!   `wake` are not to be added: the slowest of one need not come with
+//!   the slowest of the other, and a sum of two p99 is no p99 of
+//!   anything.
 //! * `same_cpu_pct`: of the wake-ups measured, how many ran the task on
 //!   the CPU its waker was on when it called. `prev_cpu_pct`: how many
 //!   ran it on the CPU it had last run on. Informational: where a
@@ -32,7 +44,12 @@
 //!   and the check that the run is what it says: with a small share in
 //!   the deepest state, the machine did not go to sleep and the wake-ups
 //!   were not from deep idle. Absent where the kernel has no idle states
-//!   to report, as in most virtual machines. Read before the first
+//!   to report, as in most virtual machines. The kernel adds a stay in
+//!   an idle state to its count when the stay ends, so one that began
+//!   before the window is counted whole and one still going on is not
+//!   counted: the shares are rough, can come out a little over 100%,
+//!   and say that the machine slept, not for exactly how long. Read
+//!   before the first
 //!   wake-up and after the last, so the half-idle moments of starting
 //!   and stopping are in it, and nothing is read in between. It covers
 //!   every CPU that reports idle states, also ones the benchmark may
@@ -96,10 +113,11 @@ use crate::Workload;
 use crate::clock::{Alive, TIMER_SLACK_NS, burn, now_ns, ns, set_timer_slack, sleep_until};
 use crate::futex::{self, Wait};
 use crate::idle::Residency;
-use crate::samples::population;
+use crate::samples::{min_samples_for, population};
 use crate::schedstat::{self, Collector};
 
 pub const POP_WAKE: &str = "wake";
+pub const POP_TIMER_LATE: &str = "timer_late";
 
 /// Start not fixed yet.
 const NOT_STARTED: u64 = 0;
@@ -224,6 +242,9 @@ struct WakerOut {
     sent: u64,
     /// `FUTEX_WAKE` woke nobody: the task was not waiting.
     woke_nobody: u64,
+    /// How long after the instant its timer was set for the waker read
+    /// the clock, for every wake-up it sent.
+    timer_late: Recorder,
 }
 
 #[derive(Default)]
@@ -269,6 +290,7 @@ fn waker(pair: &Pair, first: u64, end: u64, period: u64, work: u64) -> Result<Wa
         if now >= end {
             return Ok(out);
         }
+        let late = now.saturating_sub(release);
         pair.release(now, cpu);
         let woken = futex::wake(&pair.word, 1).map_err(|e| format!("futex wake: {e}"))?;
         out.sent += 1;
@@ -276,6 +298,13 @@ fn waker(pair: &Pair, first: u64, end: u64, period: u64, work: u64) -> Result<Wa
         if work > 0 {
             burn(work);
         }
+        // Noted down here and not where it was read: between the
+        // reading of the clock and the call lies the time `wake`
+        // measures, and before the work the time a busy waker's CPU is
+        // free, and neither is to be longer for this bookkeeping. For
+        // the wake-ups that are sent, and only those: one that was
+        // skipped or fell past the end did not happen and has no time.
+        out.timer_late.record(late);
         // A waker that was late by a period or more skips what it missed.
         k = (now_ns().saturating_sub(first) / period).max(k) + 1;
     }
@@ -497,6 +526,23 @@ fn summarize(wakers: &[WakerOut], tasks: &[TaskOut], duration: Duration, idle: O
     // does not send at all. Shown, so that two sides can be seen to have
     // been given the same thing to do; no limit is drawn.
     r.metrics.insert("wakes_per_s".into(), Metric::info(sent as f64 / duration.as_secs_f64(), "1/s"));
+    // The other wake-up of every round: the waker's own, by its timer,
+    // on a machine just as asleep. Shown and not scored: how much of it
+    // is a scheduler's doing is what the numbers are collected to find
+    // out.
+    let mut timer_late = Recorder::default();
+    for w in wakers {
+        timer_late.merge(&w.timer_late);
+    }
+    for (q, suffix) in [(0.5, "p50"), (0.99, "p99")] {
+        if timer_late.count() >= min_samples_for(q) {
+            let us = timer_late.quantile(q).unwrap_or(0.0) / 1000.0;
+            r.metrics.insert(format!("{POP_TIMER_LATE}_{suffix}"), Metric::info(us, "us"));
+        }
+    }
+    if let Some(max) = timer_late.max() {
+        r.metrics.insert(format!("{POP_TIMER_LATE}_max"), Metric::info(max as f64 / 1000.0, "us"));
+    }
     if let Some((any, deepest)) = idle {
         r.metrics.insert("idle_pct".into(), Metric::info(any, "%"));
         r.metrics.insert("idle_deepest_pct".into(), Metric::info(deepest, "%"));
@@ -512,6 +558,9 @@ fn summarize(wakers: &[WakerOut], tasks: &[TaskOut], duration: Duration, idle: O
     c.insert("wakes_prev_cpu".into(), prev_cpu);
     c.insert("wake_calls_woke_nobody".into(), woke_nobody);
     r.latency_histograms.insert(POP_WAKE.into(), wake.to_histogram("ns"));
+    if timer_late.count() > 0 {
+        r.latency_histograms.insert(POP_TIMER_LATE.into(), timer_late.to_histogram("ns"));
+    }
     if !curve.is_empty() {
         r.quantile_curves.insert(POP_WAKE.into(), curve);
     }
@@ -548,6 +597,15 @@ mod tests {
             let rate = &r.metrics["wakes_per_s"];
             assert!((rate.value - c["wakes_sent"] as f64 / 0.3).abs() < 1e-6 && rate.better == Better::Neither);
             assert_eq!(c["wakes_mistimed"], 0);
+            // One reading of the waker's lateness for every wake-up
+            // sent, none for one that was not; shown and not scored.
+            assert_eq!(r.latency_histograms[POP_TIMER_LATE].count, c["wakes_sent"]);
+            for name in ["timer_late_p50", "timer_late_max"] {
+                let m = &r.metrics[name];
+                assert!(m.better == Better::Neither && m.unit == "us" && m.value >= 0.0, "{name} {m:?}");
+            }
+            assert!(!r.metrics.contains_key("timer_late_p99"));
+            assert!(r.metrics["timer_late_max"].value >= r.metrics["timer_late_p50"].value);
             // Every one is measured or accounted for; a wake-up the
             // task had not acted on when the run ended is neither.
             let accounted = c["wakes_measured"] + c["wakes_not_asleep"] + c["wakes_overrun"];
@@ -658,13 +716,29 @@ mod tests {
         let pair = Pair::default();
         let now = now_ns();
         let out = waker(&pair, now - 3_000_000, now - 1_000_000, 1_000_000, 0).unwrap();
-        assert_eq!((out.planned, out.sent), (2, 0));
+        assert_eq!((out.planned, out.sent, out.timer_late.count()), (2, 0, 0));
         assert_eq!(pair.word.load(Ordering::Acquire), 0);
         // One that ends in a moment gets what is due before then.
         let now = now_ns();
         let out = waker(&pair, now + 1_000_000, now + 3_500_000, 1_000_000, 0).unwrap();
         assert_eq!(out.planned, 3);
         assert!((1..=3).contains(&out.sent) && out.woke_nobody == out.sent, "{} sent", out.sent);
+        assert_eq!(out.timer_late.count(), out.sent);
+        // Lateness is against the instant the wake-up was due. One due
+        // 2 ms ago, the only one of its window: sent at once, and late
+        // by those 2 ms and whatever getting here took, not by nothing
+        // and not by a period.
+        let now = now_ns();
+        let out = waker(&pair, now - 2_000_000, now + 50_000_000, 1_000_000_000, 0).unwrap();
+        assert_eq!((out.planned, out.sent, out.timer_late.count()), (1, 1, 1));
+        let late = out.timer_late.max().unwrap();
+        assert!((2_000_000..50_000_000).contains(&late), "{late} ns");
+        // With work after the call, the lateness is still the one read
+        // before it: the work is not in it.
+        let now = now_ns();
+        let out = waker(&pair, now - 2_000_000, now + 50_000_000, 1_000_000_000, 20_000_000).unwrap();
+        let late = out.timer_late.max().unwrap();
+        assert!((2_000_000..20_000_000).contains(&late), "{late} ns");
     }
 
     /// The same with a task that really sleeps. The test waits for what

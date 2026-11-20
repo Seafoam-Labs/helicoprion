@@ -637,8 +637,24 @@ hands out work and goes on with its own: running the woken task on that CPU
 means taking it from the waker or waiting, and sending it elsewhere means
 waking a CPU up.
 
-Three things are shown and not scored, because they say how a scheduler got
+Four things are shown and not scored, because they say how a scheduler got
 to its delay and not whether the delay is good:
+
+- `timer_late` is how long after the instant its timer was set for a waker
+  read the clock, for every wake-up it sent. It is the other wake-up of each
+  round, by a timer and not by a thread, on a machine just as asleep. On the
+  machine these workloads were tried on, a thread woken by another ran about
+  36 µs later under every scheduler, while the timer-woken waker of
+  `wake-burst` had been late by several hundred: the larger part of waking
+  up from idle may lie here, and `wake` does not see it. It is not scored
+  because it holds the timer's own lateness, the time to leave the idle
+  state, the scheduler's time to run the waker and a few instructions of the
+  workload, and how much of that a scheduler decides is not known. It is a
+  population of its own, with its own distribution in the report. Its
+  quantiles are not to be added to those of `wake`: the slowest of one need
+  not come with the slowest of the other, and the sum of two p99 is no p99
+  of anything. The time from a timer to the task running would have to be
+  taken for each wake-up, which is not done.
 
 - `same_cpu_pct` is the share of the measured wake-ups that ran the task on
   the CPU its waker was on when it called, `prev_cpu_pct` the share that ran
@@ -654,7 +670,12 @@ to its delay and not whether the delay is good:
   reports no idle states, as in most virtual machines; such results compare
   schedulers on a machine that cannot sleep deeply. They cover every CPU
   that reports idle states, also ones the benchmark may not run on: under a
-  cpuset they say how deep the machine slept, not the CPUs of the tasks.
+  cpuset they say how deep the machine slept, not the CPUs of the tasks. The
+  kernel adds a stay in an idle state to its count when the stay ends, so a
+  stay that began before the window is counted whole and one still going on
+  is not counted at all. The shares are rough for that reason and have come
+  out up to two points over 100%: they say that a machine slept, not for
+  exactly how long, and are no measure of energy.
 
 The wake-ups are due at fixed instants, `wakes_planned` of them in the
 window. A waker that comes back from its timer a period late skips what it
