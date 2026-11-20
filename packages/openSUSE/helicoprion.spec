@@ -1,7 +1,7 @@
 %define _disable_source_fetch 0
 
 Name:           helicoprion
-Version:        0.6.0
+Version:        0.7.0
 Release:        1
 Summary:        Scheduler-focused CPU benchmark for EEVDF and sched-ext
 
@@ -10,6 +10,10 @@ URL:            https://github.com/Seafoam-Labs/helicoprion
 Source0:        %{URL}/archive/refs/tags/%{version}.tar.gz
 
 BuildRequires:  rust+cargo >= 1.91
+# The text on the result card (compare --png, card.png of matrix) is
+# written in a font of the machine. Without one the card is refused with
+# a message and everything else works.
+Recommends:     dejavu-fonts
 
 %description
 Scheduler-focused CPU benchmark: detects whether EEVDF or a sched-ext
