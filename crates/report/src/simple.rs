@@ -265,18 +265,14 @@ fn failures(c: &Comparison, workload: &str, i: usize, f: &Failures) -> Option<St
     // A handful of events on both sides: the counts say what there is,
     // where two shares that both round to nothing would say "0.00% →
     // 0.00%", and the reason says why there is no verdict.
-    if let Some([(b_events, b_of), (events, of)]) =
-        row.events(c.baseline, i).filter(|_| row.too_few_events(c.baseline, i))
+    if let Some([(b_events, _), (events, _)]) = row.events(c.baseline, i).filter(|_| row.too_few_events(c.baseline, i))
     {
         return Some(if b_events == 0 && events == 0 {
             format!("{label}: none in any run under either")
         } else {
-            format!(
-                "{label}: {b_events} / {} → {events} / {} {}; too few events to score",
-                fmt_value(b_of as f64),
-                fmt_value(of as f64),
-                events_of(f.metric)
-            )
+            // The counts as the table and the terminal give them.
+            let counts = row.event_counts(c.baseline, i)?;
+            format!("{label}: {counts} {}; too few events to score", events_of(f.metric))
         });
     }
     let runs = |worst: f64| {

@@ -424,6 +424,17 @@ impl MetricRow {
         Some([total(b), total(s)])
     }
 
+    /// The counts behind a share of rare events, the baseline's and
+    /// then those of series `i`, each with what it is out of: "9 /
+    /// 33.62M → 0 / 26.19M". The one wording of them, for the plain
+    /// view, the table and the terminal. `None` where there are no
+    /// counts to give (`events`): nothing is put in their place.
+    pub fn event_counts(&self, baseline: usize, i: usize) -> Option<String> {
+        let [(b_events, b_of), (events, of)] = self.events(baseline, i)?;
+        let out_of = |n: u64| crate::svg::fmt_value(n as f64);
+        Some(format!("{b_events} / {} → {events} / {}", out_of(b_of), out_of(of)))
+    }
+
     /// A share of rare events with under `MIN_EVENTS` of them on both
     /// sides: shown, with the counts, and not scored.
     pub fn too_few_events(&self, baseline: usize, i: usize) -> bool {
@@ -689,6 +700,29 @@ impl Comparison {
             });
         }
         None
+    }
+
+    /// What stands in place of the change of series `i` in row `r` where
+    /// a share has too few events to be scored (`too_few_events`): the
+    /// counts, and that they are too few. `None` for anything else, for
+    /// the baseline itself, and where the workload parameters differ,
+    /// which is what is said then.
+    /// A change of "+100%" with an interval from 100% to 100% next to a
+    /// note that it does not count is still a number that says the
+    /// opposite of the note, so the table and the terminal show this
+    /// and no percentage.
+    ///
+    /// It does not ask whether there is a change to replace. From a
+    /// baseline of zero there is none (`improvement`), and those are
+    /// the very cases, none against none and none against a few, in
+    /// which the counts are all there is to say.
+    pub fn few_events(&self, r: &MetricRow, i: usize) -> Option<String> {
+        let comparable = r.cells.get(i).and_then(Option::as_ref).is_some_and(|c| c.comparable);
+        if i == self.baseline || !comparable || !r.too_few_events(self.baseline, i) {
+            return None;
+        }
+        // Too few events are counted events: the counts are there.
+        r.event_counts(self.baseline, i).map(|counts| format!("{counts}; too few events to score"))
     }
 
     /// The change of series `i` in row `r` is one the report colours and
@@ -2740,8 +2774,33 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
         assert_eq!(row.events(0, 1), Some([(9, 12 * BLOCKED), (0, 12 * BLOCKED)]));
         assert!(row.too_few_events(0, 1) && !row.chartable(0, 1));
-        // The other metric is untouched by all this.
+        // The table and the terminal give the counts where the change
+        // would stand, in the same words, and no percentage or interval:
+        // "+100.0% [+100.0% … +100.0%]" next to a note that it does not
+        // count is still a number that says it does.
+        let counts = "9 / 33.60M → 0 / 33.60M";
+        assert_eq!(row.event_counts(0, 1).as_deref(), Some(counts));
+        assert_eq!(c.few_events(row, 1), Some(format!("{counts}; too few events to score")));
+        let line_of = |text: &str| text.lines().find(|l| l.contains("rtt_blocked_slow_pct")).unwrap().to_string();
+        let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
+        assert!(html.contains(&format!(">{counts}; too few events to score</span>")), "{html}");
+        assert!(!html.contains("+100") && !html.contains(" … "), "{html}");
+        let terminal = line_of(&crate::html::text_table(&c));
+        assert!(terminal.contains(&format!("({counts}; too few events to score)")), "{terminal}");
+        assert!(!terminal.contains("+100") && !terminal.contains("[+"), "{terminal}");
+        // The values themselves are still there, as medians.
+        assert!(html.contains("0.00") && terminal.contains("0.00"), "{html}\n{terminal}");
+        // The other metric is untouched by all this: its change and its
+        // interval are shown as they were, and it has no counts.
+        let terminal = crate::html::text_table(&c);
+        let p99 = terminal.lines().find(|l| l.contains("·p99 ")).unwrap();
+        assert!(p99.contains("%*)") && !p99.contains("too few events"), "{p99}");
+        // In the whole report the reason stands with this one share's
+        // counts and nowhere else.
+        assert_eq!(crate::html::report(&c).matches("too few events to score</span>").count(), 1);
         let other = c.rows.iter().find(|r| r.metric == "p99").unwrap();
+        assert_eq!(other.event_counts(0, 1), None);
+        assert_eq!(c.few_events(other, 1), None);
         assert_eq!(other.events(0, 1), None);
         assert!(!other.too_few_events(0, 1));
         assert_eq!(c.unclear_reason(other, 1, &other.improvement(0, 1).unwrap()), None);
@@ -2753,6 +2812,12 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let c = build((20, 0));
         assert_eq!(reason(&c), None);
         assert_eq!(verdict(&c), Verdict::Mixed);
+        // A share that is scored is shown as a change, as before.
+        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
+        assert_eq!(c.few_events(row, 1), None);
+        let html = crate::html::report(&c).replace("</tr>", "</tr>\n");
+        let line = html.lines().find(|l| l.contains("rtt_blocked_slow_pct")).unwrap();
+        assert!(line.contains("+100.0%") && !line.contains("too few events"), "{line}");
         // Many against one: scored, as before.
         let c = build((32_475, 1));
         assert_eq!(reason(&c), None);
@@ -2764,11 +2829,50 @@ wake-up delays here cover wake-ups on one CPU and across CPUs together, in diffe
         let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
         assert!(!row.too_few_events(0, 1) && row.improvement(0, 1).is_none());
         assert!(crate::simple::text(&c).contains("a change from zero is not scored"));
+        // That is not a matter of events, and is not called one.
+        assert_eq!(c.few_events(row, 1), None);
+        assert!(!crate::html::report(&c).contains("too few events to score</span>"));
         // None on either side is none, said as such.
         let c = build((0, 0));
         assert!(c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap().too_few_events(0, 1));
         let text = crate::simple::text(&c);
         assert!(text.contains("• Round trips of a millisecond or more: none in any run under either\n"), "{text}");
+
+        // From a baseline of zero there is no change at all, and the
+        // table and the terminal say about the events what they say
+        // above: the counts and the reason, which do not hang on there
+        // being a percentage to replace. No percentage is made up from
+        // the zero either.
+        for (slow, counts) in [((0, 0), "0 / 33.60M → 0 / 33.60M"), ((0, 9), "0 / 33.60M → 9 / 33.60M")] {
+            let c = build(slow);
+            let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
+            assert!(row.improvement(0, 1).is_none() && row.too_few_events(0, 1), "{slow:?}");
+            assert_eq!(c.few_events(row, 1), Some(format!("{counts}; too few events to score")), "{slow:?}");
+            let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
+            assert!(html.contains(&format!(">{counts}; too few events to score</span>")), "{html}");
+            let terminal = line_of(&crate::html::text_table(&c));
+            assert!(terminal.contains(&format!("({counts}; too few events to score)")), "{terminal}");
+            for line in [&html, &terminal] {
+                assert!(!["+100", "-100", "inf", "NaN"].iter().any(|n| line.contains(n)), "{line}");
+                assert!(!line.contains(" … ") && !line.contains("[+") && !line.contains("[-"), "{line}");
+            }
+            // Once in the report, and not for the baseline's own cell.
+            assert_eq!(crate::html::report(&c).matches("too few events to score</span>").count(), 1);
+            assert_eq!(c.few_events(row, 0), None);
+            // Scored as before: the other metric alone decides.
+            assert_eq!(verdict(&c), Verdict::Worse, "{slow:?}");
+        }
+        // Where the parameters differ nothing is compared, events
+        // included, and that is what is said.
+        let mut files = session((0, 9));
+        files[1].workloads[0].params = serde_json::json!({ "pairs": 3 });
+        let c = Comparison::build(files, 0);
+        let row = c.rows.iter().find(|r| r.metric == "rtt_blocked_slow_pct").unwrap();
+        assert_eq!(c.few_events(row, 1), None);
+        let html = line_of(&crate::html::report(&c).replace("</tr>", "</tr>\n"));
+        assert!(html.contains("params differ") && !html.contains("too few events"), "{html}");
+        let terminal = line_of(&crate::html::text_table(&c));
+        assert!(terminal.contains("(params differ)") && !terminal.contains("too few events"), "{terminal}");
 
         // The events are those of the rounds both sides have, as the
         // change is: 24 in the baseline, 2 a run. With a round missing

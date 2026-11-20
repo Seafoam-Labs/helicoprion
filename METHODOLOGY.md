@@ -200,7 +200,12 @@ what an improvement looks like. Below that the share stays in the report
 with the counts next to it, as in "9 / 33.6M → 0 / 26.2M blocked round
 trips; too few events to score", and is left out of every verdict: the plain
 view, the summary, the table's colours, the change chart and the card all
-ask the same rule.
+ask the same rule. The table of all metrics and the terminal's table give
+those counts where the change would stand, and no percentage or interval:
+"+100%" from 100% to 100% beside a note that it does not count would still
+be read as a number that does. They give them from a baseline of no events
+too, none against none and none against a few, where there is no percentage
+to begin with and the counts are all there is.
 
 Twenty is where a quantile starts to be reported as well, and it is a
 condition for being scored at all, not a test of the change: the interval,

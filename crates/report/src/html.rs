@@ -619,29 +619,33 @@ pub fn report_with(c: &Comparison, simple: bool) -> String {
                     ms = c.opts.min_share_pct
                 );
             }
-            if i != c.baseline
-                && let Some([(b_events, b_of), (events, of)]) =
-                    r.events(c.baseline, i).filter(|_| r.too_few_events(c.baseline, i))
-            {
-                let _ = write!(
-                    td,
-                    " <span class=bad title=\"{events} of {of} here against {b_events} of {b_of} for the baseline, over the runs compared: under {} on both sides, so the share is shown and not scored\">few events</span>",
-                    crate::compare::MIN_EVENTS
-                );
-            }
             if i != c.baseline {
-                match r.improvement(c.baseline, i) {
-                    Some(d) => {
-                        let (text, cls) = delta_cell(
-                            &d,
-                            highlighted(c, r, i, &d),
-                            c.held_back_by_unevenness(r, i, &d),
-                            c.opts.unstable_spread_pct,
-                        );
-                        let _ = write!(td, "<br><span class={cls}>{text}</span>");
+                // Too few events to judge the share by: the counts
+                // stand where the change would, and no percentage or
+                // interval is shown that could be read as one. Asked
+                // before the change is, since from a baseline of zero
+                // there is no change and the counts are still due.
+                if let Some(counts) = c.few_events(r, i) {
+                    let _ = write!(
+                        td,
+                        "<br><span class=m title=\"events and what they are out of, baseline → here, over the runs compared: under {} on both sides, so no change is given for this share\">{}</span>",
+                        crate::compare::MIN_EVENTS,
+                        esc(&counts)
+                    );
+                } else {
+                    match r.improvement(c.baseline, i) {
+                        Some(d) => {
+                            let (text, cls) = delta_cell(
+                                &d,
+                                highlighted(c, r, i, &d),
+                                c.held_back_by_unevenness(r, i, &d),
+                                c.opts.unstable_spread_pct,
+                            );
+                            let _ = write!(td, "<br><span class={cls}>{text}</span>");
+                        }
+                        None if !cell.comparable => td.push_str("<br><span class=m>params differ</span>"),
+                        None => {}
                     }
-                    None if !cell.comparable => td.push_str("<br><span class=m>params differ</span>"),
-                    None => {}
                 }
             }
             let _ = write!(h, "<td>{td}</td>");
@@ -778,7 +782,12 @@ pub fn text_table(c: &Comparison) -> String {
                     if r.minor(i) {
                         s.push('°');
                     }
-                    if i != c.baseline {
+                    // The counts in place of a change, as in the HTML
+                    // table and in the same words, whether or not there
+                    // is a change to take their place.
+                    if let Some(counts) = c.few_events(r, i) {
+                        s.push_str(&format!(" ({counts})"));
+                    } else if i != c.baseline {
                         match r.improvement(c.baseline, i) {
                             Some(d) => {
                                 let mark = if highlighted(c, r, i, &d) {
